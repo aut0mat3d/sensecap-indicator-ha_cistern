@@ -1,0 +1,18 @@
+{
+  "folders": [
+    {
+      "name": "ESP32-S3 Firmware (ESP-IDF)",
+      "path": "."
+    },
+    {
+      "name": "RP2040 Firmware (PlatformIO)",
+      "path": "rp2040"
+    }
+  ],
+  "settings": {
+    "clangd.arguments": [
+      "--background-index",
+      "--completion-style=detailed"
+    ]
+  }
+}

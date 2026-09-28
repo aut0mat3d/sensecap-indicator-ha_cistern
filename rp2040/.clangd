@@ -1,0 +1,10 @@
+CompileFlags:
+  CompilationDatabase: "."
+
+Diagnostics:
+  Suppress:
+    - "drv_unknown_argument"
+    - "pp_file_not_found"
+    - "unknown_typename"
+    - "undeclared_var_use"
+    - "typecheck_member_reference_struct_union"
