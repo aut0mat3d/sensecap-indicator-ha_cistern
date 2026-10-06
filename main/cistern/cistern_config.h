@@ -1,0 +1,4 @@
+#ifndef CISTERN_CONFIG_H
+#define CISTERN_CONFIG_H
+
+#endif /* CISTERN_CONFIG_H */

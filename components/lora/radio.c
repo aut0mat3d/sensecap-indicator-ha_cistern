@@ -800,7 +800,7 @@ void RadioSetTxConfig( RadioModems_t modem, int8_t power, uint32_t fdev,
             RadioStandby( );
             RadioSetModem( ( SX126x.ModulationParams.PacketType == PACKET_TYPE_GFSK ) ? MODEM_FSK : MODEM_LORA );
             SX126xSetModulationParams( &SX126x.ModulationParams );
-            SX126xSetPacketParams( &SX126x.PacketParams );
+            SX126xSetPacketParams( &SX126x.PacketParams );            
             SX126xSetSyncWord( ( uint8_t[] ){ 0xC1, 0x94, 0xC1, 0x00, 0x00, 0x00, 0x00, 0x00 } );
             SX126xSetWhiteningSeed( 0x01FF );
             break;
@@ -849,6 +849,12 @@ void RadioSetTxConfig( RadioModems_t modem, int8_t power, uint32_t fdev,
             RadioSetModem( ( SX126x.ModulationParams.PacketType == PACKET_TYPE_GFSK ) ? MODEM_FSK : MODEM_LORA );
             SX126xSetModulationParams( &SX126x.ModulationParams );
             SX126xSetPacketParams( &SX126x.PacketParams );
+            /* FIX: Register 0x0736 (REG_IQ_POLARITY) explizit für TX anpassen! */
+            if (SX126x.PacketParams.Params.LoRa.InvertIQ == LORA_IQ_INVERTED) {
+                SX126xWriteRegister(REG_IQ_POLARITY, SX126xReadRegister(REG_IQ_POLARITY) & ~(1 << 2));
+            } else {
+                SX126xWriteRegister(REG_IQ_POLARITY, SX126xReadRegister(REG_IQ_POLARITY) | (1 << 2));
+            }
             break;
     }
 

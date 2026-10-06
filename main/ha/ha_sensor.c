@@ -62,7 +62,7 @@ static void publish_sensor_data(const struct view_data_sensor_data *sensor_data)
 static void view_event_handler(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
 {
     if (id == VIEW_EVENT_SENSOR_DATA) {
-        ESP_LOGI(TAG, "event: VIEW_EVENT_SENSOR_DATA");
+        ESP_LOGD(TAG, "event: VIEW_EVENT_SENSOR_DATA");
         publish_sensor_data((struct view_data_sensor_data *)event_data);
     }
 }

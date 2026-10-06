@@ -1,5 +1,8 @@
 #include "wifi.h"
 #include "indicator_enabler.h"
+#if CONFIG_GUI_CONFIG_EXTERN
+#include "sd_model.h"
+#endif
 
 int indicator_model_init(void) {
 #ifdef STORAGE_NVS_H
@@ -21,6 +24,10 @@ int indicator_model_init(void) {
 	#ifdef SENSOR_H
 	indicator_sensor_init();
 	#endif
+#endif
+
+#if CONFIG_LORA_ENABLE
+    lora_model_init();
 #endif
 
 #ifdef CMD_H
@@ -47,5 +54,10 @@ int indicator_model_init(void) {
 
 #ifdef INDICATOR_TERMINAL_H
 	indicator_terminal_init();
+#endif
+
+#if CONFIG_GUI_CONFIG_EXTERN
+    /* Initialize SD card storage backend model */
+    sd_model_init();
 #endif
 }

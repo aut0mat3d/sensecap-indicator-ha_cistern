@@ -113,11 +113,30 @@ static void _btn_press_up_callback(void *arg) {
     }
 }
 
+static void _btn_shutdown_event_handler(void* handler_args, esp_event_base_t base, int32_t id, void* event_data) {
+    if (id == VIEW_EVENT_SHUTDOWN) {
+        ESP_LOGI(TAG, "Shutdown event received, entering sleep mode");
+        sleep_flag = true;
+
+        /* Turn off screen backlight and update display controller state */
+        indicator_display_off();
+        bool st = 0;
+        esp_event_post_to(view_event_handle, VIEW_EVENT_BASE, VIEW_EVENT_SCREEN_CTRL, &st,
+                          sizeof(st), portMAX_DELAY);
+    }
+}
+
 int indicator_btn_init(void) {
     bsp_btn_register_callback(BOARD_BTN_ID_USER, BUTTON_SINGLE_CLICK, _btn_click_callback, NULL);
     bsp_btn_register_callback(BOARD_BTN_ID_USER, BUTTON_DOUBLE_CLICK, _btn_double_click_callback, NULL);
     bsp_btn_register_callback(BOARD_BTN_ID_USER, BUTTON_LONG_PRESS_START, _btn_press_start_callback, NULL);
     bsp_btn_register_callback(BOARD_BTN_ID_USER, BUTTON_LONG_PRESS_HOLD, _btn_long_press_hold_callback, NULL);
     bsp_btn_register_callback(BOARD_BTN_ID_USER, BUTTON_PRESS_UP, _btn_press_up_callback, NULL);
+
+    /* Register Event Handler for System Shutdown */
+    ESP_ERROR_CHECK(esp_event_handler_instance_register_with(
+        view_event_handle, VIEW_EVENT_BASE, VIEW_EVENT_SHUTDOWN,
+        _btn_shutdown_event_handler, NULL, NULL));
+
     return ESP_OK;
 }

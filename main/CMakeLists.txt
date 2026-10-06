@@ -17,7 +17,7 @@ function(collect_sources source_var)
 endfunction()
 
 # Define a list of directories to include
-set(DIRECTORIES_TO_INCLUDE "util" "ha" "wifi" "sensor" "display" "settings" "rp2040" "btn" "mqtt" "storage" "cmd" "nav" "assets") # Recursively access folders | only modify here could be better
+set(DIRECTORIES_TO_INCLUDE "util" "ha" "wifi" "sensor" "display" "settings" "rp2040" "btn" "mqtt" "storage" "cmd" "nav" "assets" "cistern" "gui_ext" "lora")
 
 # Call the custom function to collect the source files
 collect_sources(COLLECTED_SOURCES ${DIRECTORIES_TO_INCLUDE})
@@ -26,4 +26,24 @@ collect_sources(COLLECTED_SOURCES ${DIRECTORIES_TO_INCLUDE})
 idf_component_register(
   SRCS "main.c" "lv_port.c" "indicator_model.c" "indicator_view.c" ${COLLECTED_SOURCES}
   INCLUDE_DIRS "." ${DIRECTORIES_TO_INCLUDE}
+  REQUIRES
+    lora
+    mqtt
+    json
+    console
+    nvs_flash
+    esp_event
+    driver
+    esp_wifi
+    esp_http_client
+    esp_netif
+)
+
+# Global Defines for Cistern mode and external GUI-Config (via SD-Card)
+# Cistern mode relies on a SD-Card for storing Data history
+add_compile_definitions(
+    CONFIG_CISTERN_MODE=1
+    CONFIG_GUI_CONFIG_EXTERN=1
+    CONFIG_LORA_ENABLE=1
+    CONFIG_LORA_P2P=1
 )

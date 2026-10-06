@@ -12,7 +12,8 @@
   "settings": {
     "clangd.arguments": [
       "--background-index",
-      "--completion-style=detailed"
+      "--completion-style=detailed",
+      "--query-driver=**/*gcc*,**/*g++*,**/*elf*"
     ]
   }
 }

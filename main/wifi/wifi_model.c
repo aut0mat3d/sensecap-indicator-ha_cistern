@@ -14,6 +14,7 @@
 #include "lwip/sockets.h"
 #include "esp_event.h"
 #include "ping/ping_sock.h"
+#include "sntp_service.h"
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT	   BIT1
@@ -137,6 +138,9 @@ static void _ip_event_handler(void* arg, esp_event_base_t event_base, int32_t ev
 		ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
 		ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
 		s_retry_num = 0;
+
+		/* Start or restart SNTP service upon receiving IP */
+        sntp_service_start("pool.ntp.org");
 
 		xSemaphoreGive(_g_net_check_sem);
 	}
@@ -478,12 +482,16 @@ int indicator_wifi_model_init(void) {
 	}
 	else
 	{
-		ESP_LOGI(TAG, "Not config wifi, Entry wifi config screen");
+		ESP_LOGI(TAG, "Not config wifi");
 		uint8_t screen = SCREEN_WIFI_CONFIG;
 		ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 		ESP_ERROR_CHECK(esp_wifi_start());
+#if !CONFIG_CISTERN_MODE
 		esp_event_post_to(view_event_handle, VIEW_EVENT_BASE, VIEW_EVENT_SCREEN_START, &screen, sizeof(screen),
 						  portMAX_DELAY);
+#else
+		ESP_LOGI(TAG, "Cistern mode active: Suppressing automatic WiFi setup screen");
+#endif
 	}
 
 	return 0;

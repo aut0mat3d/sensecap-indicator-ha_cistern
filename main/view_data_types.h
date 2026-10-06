@@ -103,6 +103,7 @@ enum sensor_data_type {
 struct view_data_sensor_data {
     enum sensor_data_type sensor_type;
     float                 value;
+    uint32_t              dev_addr; /* 0 = Internal Display-Sensor, >0 = LoRa DevAddr */
 };
 
 struct view_data_sensor_history_data {
@@ -116,6 +117,30 @@ struct view_data_sensor_history_data {
     float                     week_max;
 };
 
+/* ── LoRa Telemetry ------────────────────────────────────────────────────── */
+#define VIEW_EVENT_LORA_TELEMETRY  (0x7F)
+
+struct view_data_lora_telemetry {
+    uint32_t dev_addr;
+    uint32_t fcnt;
+    uint8_t  val_type;
+    uint8_t  context;
+    char     key[24];
+    char     unit[12];
+    float    val;
+};
+
+/* ── LoRa Diagnostic Data ────────────────────────────────────────────────── */
+#if CONFIG_LORA_ENABLE
+struct view_data_lora_diag {
+    int16_t  rssi;
+    int8_t   snr;
+    int16_t  noise_floor;
+    uint32_t dev_addr;
+    char     dev_name[32];
+};
+#endif
+
 /* ── Home Assistant ───────────────────────────────────────────────────────── */
 
 struct view_data_ha_sensor_data {
@@ -126,6 +151,25 @@ struct view_data_ha_sensor_data {
 struct view_data_ha_switch_data {
     uint8_t index;
     int     value;
+};
+
+typedef enum {
+    SD_STATE_UNCHECKED       = -1, /* Still unchecked / initialization pending */
+    SD_STATE_MISMATCH        =  0, /* Validation failed: Wrong volume label or wrong device */
+    SD_STATE_VALID_DEVICE    =  1, /* Belongs to this device, but no valid partitions */
+    SD_STATE_VALID_FAT32     =  2, /* Belongs to device, FAT32 partition ready */
+    SD_STATE_VALID_FAT32_LFS =  3  /* Belongs to device, FAT32 AND LittleFS partitions ready */
+} sd_card_state_t;
+
+/* ── SD-Card Info ───────────────────────────────────────────────────────── */
+
+struct sd_card_info {
+    bool is_present;
+    bool is_usb_mounted;
+    sd_card_state_t state;
+    uint64_t total_mb;
+    char volume_label[12];  /* Max 11 chars + null terminator for FAT32 */
+    char expected_label[12];/* Generated from ESP32 MAC */
 };
 
 /* ── Event IDs (VIEW_EVENT_BASE) ─────────────────────────────────────────── */
@@ -217,7 +261,27 @@ enum {
 
     /* P: ha/ha_switch.c  C: ha/ha_switch.c (internal loop)  Payload: struct view_data_ha_switch_data */
     VIEW_EVENT_HA_SWITCH_SET,
+#if CONFIG_GUI_CONFIG_EXTERN
+    /* P: settings_view.c  C: storage/sd_model.c  Payload: uint8_t (0=LittleFS only, 1=Full SD) */
+    VIEW_EVENT_SD_FORMAT_REQ,
 
+    /* P: storage/sd_model.c  C: settings_view.c  Payload: bool (true=success, false=failed) */
+    VIEW_EVENT_SD_FORMAT_RET,
+
+    /* P: sd_view.c  C: sd_model.c  Payload: NULL */
+    VIEW_EVENT_SD_INFO_REQ,
+
+    /* P: sd_model.c  C: sd_view.c  Payload: struct sd_card_info */
+    VIEW_EVENT_SD_INFO_RET,
+
+    /* P: sd_view.c  C: sd_model.c  Payload: bool (true=enable USB MSC, false=disable) */
+    VIEW_EVENT_SD_USB_MOUNT_REQ,
+#endif
+
+#if CONFIG_LORA_ENABLE
+    /* P: lora/lora_model.c  C: lora/lora_diag_view.c  Payload: struct view_data_lora_diag */
+    VIEW_EVENT_LORA_DIAG_DATA,
+#endif
     VIEW_EVENT_ALL,
 };
 

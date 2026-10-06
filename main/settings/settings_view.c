@@ -9,6 +9,9 @@
 #include "nav.h"
 #include "sdkconfig.h"
 #include "view_data.h"
+#if CONFIG_GUI_CONFIG_EXTERN
+#include "sd_view.h"
+#endif
 
 LV_FONT_DECLARE(lv_font_montserrat_20);
 LV_FONT_DECLARE(lv_font_montserrat_24);
@@ -18,6 +21,26 @@ static const char *TAG = "settings-view";
 
 static lv_obj_t *s_settings_modal = NULL;
 static lv_obj_t *s_settings_ip_label = NULL;
+static lv_obj_t *s_settings_tileview = NULL;
+static lv_obj_t *s_settings_tile1 = NULL;
+static lv_obj_t *s_settings_tile2 = NULL;
+
+/* Weak declaration for LoRa Diagnostic view caller to allow smooth linking */
+__attribute__((weak)) void lora_diag_view_show(void)
+{
+	ESP_LOGI(TAG, "lora_diag_view_show called (default weak implementation)");
+}
+
+#if CONFIG_GUI_CONFIG_EXTERN
+static void settings_format_sd_cb(lv_event_t *e)
+{
+	if(lv_event_get_code(e) == LV_EVENT_CLICKED)
+	{
+		/* Open SD card management modal view */
+		sd_view_show();
+	}
+}
+#endif
 
 static void settings_refresh_ip_label(void)
 {
@@ -81,6 +104,14 @@ static void settings_open_broker(lv_event_t *e)
 	}
 }
 
+static void settings_open_lora_diag(lv_event_t *e)
+{
+	if(lv_event_get_code(e) == LV_EVENT_CLICKED)
+	{
+		lora_diag_view_show();
+	}
+}
+
 static void settings_on_back(lv_event_t *e)
 {
 	if(lv_event_get_code(e) == LV_EVENT_CLICKED)
@@ -97,6 +128,10 @@ void settings_view_show(void)
 	}
 
 	settings_refresh_ip_label();
+	if(s_settings_tileview)
+	{
+		lv_tileview_set_tile_by_index(s_settings_tileview, 0, 0, LV_ANIM_OFF);
+	}
 	lv_obj_remove_flag(s_settings_modal, LV_OBJ_FLAG_HIDDEN);
 	lv_obj_move_foreground(s_settings_modal);
 }
@@ -191,10 +226,12 @@ static void settings_create_modal(void)
 	s_settings_modal = lv_obj_create(lv_layer_top());
 	lv_obj_set_size(s_settings_modal, CONFIG_LCD_EVB_SCREEN_WIDTH,
 					CONFIG_LCD_EVB_SCREEN_HEIGHT);
-	lv_obj_set_align(s_settings_modal, LV_ALIGN_CENTER);
+	lv_obj_set_pos(s_settings_modal, 0, 0);
+	lv_obj_set_align(s_settings_modal, LV_ALIGN_TOP_LEFT);
 	lv_obj_add_flag(s_settings_modal, LV_OBJ_FLAG_CLICKABLE);
 	lv_obj_remove_flag(s_settings_modal,
 					   LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_GESTURE_BUBBLE);
+	lv_obj_set_scrollbar_mode(s_settings_modal, LV_SCROLLBAR_MODE_OFF);
 	lv_obj_set_style_bg_color(s_settings_modal, lv_color_hex(0x101418),
 							  LV_PART_MAIN | LV_STATE_DEFAULT);
 	lv_obj_set_style_bg_opa(s_settings_modal, LV_OPA_COVER,
@@ -207,6 +244,82 @@ static void settings_create_modal(void)
 							 LV_PART_MAIN | LV_STATE_DEFAULT);
 	lv_obj_add_flag(s_settings_modal, LV_OBJ_FLAG_HIDDEN);
 
+	/* Internal horizontal Tileview for multi-page settings swiping */
+	s_settings_tileview = lv_tileview_create(s_settings_modal);
+	lv_obj_set_size(s_settings_tileview, CONFIG_LCD_EVB_SCREEN_WIDTH,
+					CONFIG_LCD_EVB_SCREEN_HEIGHT);
+	lv_obj_set_pos(s_settings_tileview, 0, 0);
+	lv_obj_set_align(s_settings_tileview, LV_ALIGN_TOP_LEFT);
+	lv_obj_set_scrollbar_mode(s_settings_tileview, LV_SCROLLBAR_MODE_OFF);
+	lv_obj_remove_flag(s_settings_tileview, LV_OBJ_FLAG_SCROLL_ELASTIC |
+											 LV_OBJ_FLAG_SCROLL_MOMENTUM |
+											 LV_OBJ_FLAG_SCROLL_CHAIN);
+	lv_obj_set_style_bg_opa(s_settings_tileview, LV_OPA_TRANSP, LV_PART_MAIN);
+	lv_obj_set_style_border_width(s_settings_tileview, 0, LV_PART_MAIN);
+	lv_obj_set_style_radius(s_settings_tileview, 0, LV_PART_MAIN);
+	lv_obj_set_style_pad_all(s_settings_tileview, 0, LV_PART_MAIN);
+
+	/* Tile 1: Primary Settings Page */
+	s_settings_tile1 = lv_tileview_add_tile(s_settings_tileview, 0, 0,
+											LV_DIR_LEFT | LV_DIR_RIGHT);
+	lv_obj_set_size(s_settings_tile1, CONFIG_LCD_EVB_SCREEN_WIDTH,
+					CONFIG_LCD_EVB_SCREEN_HEIGHT);
+	lv_obj_remove_flag(s_settings_tile1, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_style_bg_opa(s_settings_tile1, LV_OPA_TRANSP, LV_PART_MAIN);
+	lv_obj_set_style_border_width(s_settings_tile1, 0, LV_PART_MAIN);
+	lv_obj_set_style_radius(s_settings_tile1, 0, LV_PART_MAIN);
+	lv_obj_set_style_pad_all(s_settings_tile1, 0, LV_PART_MAIN);
+
+	/* Tile 2: Secondary Settings Page */
+	s_settings_tile2 = lv_tileview_add_tile(s_settings_tileview, 1, 0,
+											LV_DIR_LEFT | LV_DIR_RIGHT);
+	lv_obj_set_size(s_settings_tile2, CONFIG_LCD_EVB_SCREEN_WIDTH,
+					CONFIG_LCD_EVB_SCREEN_HEIGHT);
+	lv_obj_remove_flag(s_settings_tile2, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_style_bg_opa(s_settings_tile2, LV_OPA_TRANSP, LV_PART_MAIN);
+	lv_obj_set_style_border_width(s_settings_tile2, 0, LV_PART_MAIN);
+	lv_obj_set_style_radius(s_settings_tile2, 0, LV_PART_MAIN);
+	lv_obj_set_style_pad_all(s_settings_tile2, 0, LV_PART_MAIN);
+
+	/* Page 1 Cards */
+	settings_create_card(s_settings_tile1, 80, 150,
+						 lv_color_hex(0x4EACE4), "WiFi", LV_SYMBOL_WIFI,
+						 settings_open_wifi);
+	settings_create_card(s_settings_tile1, 250, 150,
+						 lv_color_hex(0xEEBF41), "Display", LV_SYMBOL_IMAGE,
+						 settings_open_display);
+
+#if CONFIG_GUI_CONFIG_EXTERN
+	/* SD Card button (bottom-left) */
+	settings_create_card(s_settings_tile1, 80, 310,
+						 lv_color_hex(0x27AE60), "SD Card", LV_SYMBOL_SAVE,
+						 settings_format_sd_cb);
+
+	/* MQTT Broker button (bottom-right) */
+	settings_create_card(s_settings_tile1, 250, 310,
+						 lv_color_hex(0xE66D39), "Broker", LV_SYMBOL_SETTINGS,
+						 settings_open_broker);
+#else
+	/* Standard fallback: wide MQTT Broker button */
+	lv_obj_t *broker = lv_button_create(s_settings_tile1);
+	lv_obj_set_size(broker, 300, 60);
+	lv_obj_set_pos(broker, 90, 330);
+	settings_style_card(broker, lv_color_hex(0xE66D39));
+	lv_obj_add_event_cb(broker, settings_open_broker, LV_EVENT_CLICKED, NULL);
+
+	lv_obj_t *broker_label = lv_label_create(broker);
+	lv_label_set_text(broker_label, "Change MQTT Broker Address");
+	lv_obj_set_style_text_color(broker_label, lv_color_white(),
+								LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_center(broker_label);
+#endif
+
+	/* Page 2 Card: LoRa Diagnostic Page Launcher */
+	settings_create_card(s_settings_tile2, 80, 150,
+						 lv_color_hex(0x8E44AD), "LoRa Diag", LV_SYMBOL_SETTINGS,
+						 settings_open_lora_diag);
+
+	/* Header overlay (fixed on top of tiles) */
 	lv_obj_t *header = lv_obj_create(s_settings_modal);
 	lv_obj_set_size(header, CONFIG_LCD_EVB_SCREEN_WIDTH, 85);
 	lv_obj_set_align(header, LV_ALIGN_TOP_MID);
@@ -253,25 +366,6 @@ static void settings_create_modal(void)
 								LV_PART_MAIN | LV_STATE_DEFAULT);
 	lv_obj_set_align(s_settings_ip_label, LV_ALIGN_TOP_MID);
 	lv_obj_set_y(s_settings_ip_label, 105);
-
-	settings_create_card(s_settings_modal, 80, 150,
-						 lv_color_hex(0x4EACE4), "WiFi", LV_SYMBOL_WIFI,
-						 settings_open_wifi);
-	settings_create_card(s_settings_modal, 250, 150,
-						 lv_color_hex(0xEEBF41), "Display", LV_SYMBOL_IMAGE,
-						 settings_open_display);
-
-	lv_obj_t *broker = lv_button_create(s_settings_modal);
-	lv_obj_set_size(broker, 300, 60);
-	lv_obj_set_pos(broker, 90, 330);
-	settings_style_card(broker, lv_color_hex(0xE66D39));
-	lv_obj_add_event_cb(broker, settings_open_broker, LV_EVENT_CLICKED, NULL);
-
-	lv_obj_t *broker_label = lv_label_create(broker);
-	lv_label_set_text(broker_label, "Change MQTT Broker Address");
-	lv_obj_set_style_text_color(broker_label, lv_color_white(),
-								LV_PART_MAIN | LV_STATE_DEFAULT);
-	lv_obj_center(broker_label);
 }
 
 int settings_view_init(void)

@@ -189,6 +189,12 @@ void bsp_sx126x_init(void)
 
 void SX126xIoIrqInit( DioIrqHandler dioIrq )
 {
+    /* Clear any pending stale interrupts on the PCA9535 I/O expander */
+    uint8_t dummy_pin_val = 0;
+    if (p_io_expander && p_io_expander->read_input_pins) {
+        p_io_expander->read_input_pins(&dummy_pin_val);
+    }
+
     g_dioIrq = dioIrq;
 
     gpio_config_t io_conf = {};

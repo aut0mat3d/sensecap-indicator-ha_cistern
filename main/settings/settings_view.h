@@ -4,4 +4,5 @@
 int settings_view_init(void);
 void settings_view_show(void);
 
+
 #endif /* SETTINGS_VIEW_H */

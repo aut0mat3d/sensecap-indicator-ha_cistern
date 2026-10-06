@@ -1,4 +1,10 @@
 /**
+ * @file indicator_rp2040.hpp
+ * @brief Umbrella header for RP2040 co-processor firmware.
+ * @copyright © 2024-2026, Seeed Studio / SenseCAP Cistern Extension
+ */
+/**
+ * based on:
  * @file utility.h
  * @date  29 February 2024
 
@@ -13,60 +19,91 @@
 
 #include <Arduino.h>
 #include <PacketSerial.h>
+#include <SPI.h>
+#include <SdFat.h>
 #include <Wire.h>
 
-/* Cobs pkt type */
+/* RP2040 Hardware SPI1 Pin Definitions for MicroSD Card */
+#define SD_PIN_DET  7
+#define SD_PIN_SCK  10
+#define SD_PIN_MOSI 11
+#define SD_PIN_MISO 12
+#define SD_PIN_CS   13
+
+typedef enum {
+    SD_STATE_UNCHECKED       = -1, /* Still unchecked / initialization pending */
+    SD_STATE_MISMATCH        =  0, /* Validation failed: Wrong volume label or wrong device */
+    SD_STATE_VALID_DEVICE    =  1, /* Belongs to this device, but no valid partitions */
+    SD_STATE_VALID_FAT32     =  2, /* Belongs to device, FAT32 partition ready */
+    SD_STATE_VALID_FAT32_LFS =  3  /* Belongs to device, FAT32 AND LittleFS partitions ready */
+} sd_card_state_t;
+
+/* Packet protocol types for UART communication with ESP32-S3 */
 enum pkt_type {
     PKT_TYPE_NONE                 = 0,
-    PKT_TYPE_CMD_COLLECT_INTERVAL = 0xA0,  // uin32_t
-    PKT_TYPE_CMD_BEEP_ON          = 0xA1,  // uin32_t  ms: on time
+    PKT_TYPE_CMD_GET_SYS_INFO     = 0x20,
+    PKT_TYPE_RES_SYS_INFO         = 0x21,
+    PKT_TYPE_CMD_SET_ESP_MAC      = 0x22,  /* Payload: 6-byte raw MAC + 11-byte expected label */
+
+    PKT_TYPE_CMD_COLLECT_INTERVAL = 0xA0,  /* uint32_t ms */
+    PKT_TYPE_CMD_BEEP_ON          = 0xA1,  /* Legacy single beep click */
     PKT_TYPE_CMD_BEEP_OFF         = 0xA2,
     PKT_TYPE_CMD_SHUTDOWN         = 0xA3,
     PKT_TYPE_CMD_POWER_ON         = 0xA4,
     PKT_TYPE_CMD_RESCAN_GROVE     = 0xA5,
 
-    // Inner Sensor
-    // PKT_TYPE_SENSOR_SCD41_TEMP      = 0xB0, // not accurate
-    // PKT_TYPE_SENSOR_SCD41_HUMIDITY = 0xB1,
-    PKT_TYPE_SENSOR_SCD41_CO2 = 0xB2,  // float
+    /* Cistern Alarm System Packets */
+    PKT_TYPE_CMD_ALARM_SET        = 0xA6,  /* Payload: uint16_t tON_ms, uint16_t tOFF_ms */
+    PKT_TYPE_CMD_ALARM_MUTE       = 0xA7,  /* Payload: uint32_t mute_sec (0=indefinite) */
+    PKT_TYPE_CMD_ALARM_REARM      = 0xA8,  /* Payload: none */
 
-    // SHT41 AHT
-    PKT_TYPE_SENSOR_SHT41_TEMP     = 0xB3,
-    PKT_TYPE_SENSOR_SHT41_HUMIDITY = 0xB4,  // float
-    
-    // Inner Sensor SGP40
-    PKT_TYPE_SENSOR_SGP40_TVOC_INDEX = 0xB5,  // float
+    /* SD Card Management Packets */
+    PKT_TYPE_CMD_SD_GET_INFO      = 0x30,  /* Request card size, presence & validation state */
+    PKT_TYPE_RES_SD_INFO          = 0x31,  /* Response: present, usb_mounted, state, total_mb, label */
+    PKT_TYPE_CMD_SD_FORMAT        = 0x32,  /* Request format (0=LittleFS, 1=Full SD) */
+    PKT_TYPE_RES_SD_FORMAT        = 0x33,  /* Response: success (uint8_t) */
+    PKT_TYPE_CMD_USB_MSC_TOGGLE   = 0x34,  /* Toggle USB Mass Storage Mode */
+    PKT_TYPE_CMD_LORA_RAW_FRAME   = 0x36,  /* Payload: DevAddr(4B) + RSSI(2B) + SNR(1B) + Size(1B) + Payload(NB) */
+    PKT_TYPE_CMD_SET_TIME_CFG     = 0x37, /* Payload: posix_tz[64] + time_format[8] */
 
-    // Dynamic sensor registry packets
+    /* Telemetry & Sensor Data Packets */
+    PKT_TYPE_SENSOR_SCD41_CO2        = 0xB2,
+    PKT_TYPE_SENSOR_SHT41_TEMP       = 0xB3,
+    PKT_TYPE_SENSOR_SHT41_HUMIDITY   = 0xB4,
+    PKT_TYPE_SENSOR_SGP40_TVOC_INDEX = 0xB5,
+    PKT_TYPE_SENSOR_LIGHT_LUX        = 0xB6,
+
+    /* Dynamic Sensor Registry Packets */
     PKT_TYPE_SENSOR_ATTACHED = 0xB8,
     PKT_TYPE_SENSOR_DETACHED = 0xB9,
     PKT_TYPE_SENSOR_VALUE    = 0xBA,
+    PKT_TYPE_LORA_TELEMETRY  = 0xBB,  /* Payload: DevAddr(4B) + SensorID(1B) + FloatVal(4B) + Checksum(1B) */
+
 };
 
-#define PKT_SENSOR_ID_AHT20_TEMP 0
+/* Sensor IDs */
+#define PKT_SENSOR_ID_AHT20_TEMP     0
 #define PKT_SENSOR_ID_AHT20_HUMIDITY 1
-#define PKT_SENSOR_ID_SCD41_CO2 2
-#define PKT_SENSOR_ID_SGP40_VOC 3
-#define PKT_SENSOR_ID_SCD41_TEMP 4
-#define PKT_SENSOR_ID_SCD41_HUMIDITY 5
-#define PKT_SENSOR_ID_GROVE_BASE 0x10
+#define PKT_SENSOR_ID_SCD41_CO2      2
+#define PKT_SENSOR_ID_SGP40_VOC      3
+#define PKT_SENSOR_ID_LIGHT_LUX      6
+#define PKT_SENSOR_ID_GROVE_BASE     0x10
 
-#define PKT_SENSOR_CAT_TEMP 0
+/* Sensor Categories */
+#define PKT_SENSOR_CAT_TEMP     0
 #define PKT_SENSOR_CAT_HUMIDITY 1
-#define PKT_SENSOR_CAT_CO2 2
-#define PKT_SENSOR_CAT_VOC 3
-#define PKT_SENSOR_CAT_LIGHT 4
-#define PKT_SENSOR_CAT_PRESSURE 5
-#define PKT_SENSOR_CAT_PM 6
-#define PKT_SENSOR_CAT_NOX 7
-#define PKT_SENSOR_CAT_UNKNOWN 255
+#define PKT_SENSOR_CAT_CO2      2
+#define PKT_SENSOR_CAT_VOC      3
+#define PKT_SENSOR_CAT_LIGHT    4
 
-void sensor_data_send(PacketSerial& _PacketSerial, enum pkt_type type, float data);
+/* Protocol transmission helpers */
+void sensor_data_send(PacketSerial& packetSerial, enum pkt_type type, float data);
 void sensor_attached_send(PacketSerial& packetSerial, uint8_t id, uint8_t category, const char* name, const char* unit);
 void sensor_detached_send(PacketSerial& packetSerial, uint8_t id);
 void sensor_value_send(PacketSerial& packetSerial, uint8_t id, float data);
+void lora_telemetry_send(PacketSerial& packetSerial, uint32_t dev_addr, uint8_t id, float data);
 
-// Sensors
+/* Sensor Data Structures */
 typedef struct {
     float humidity;
     float temperature;
@@ -83,69 +120,65 @@ typedef struct {
     float    temperature;
 } SCD4XData;
 
+typedef struct {
+    float lux;
+    bool  valid;
+} LightData;
 
-/************************ aht  temp & humidity ****************************/
+/* Non-blocking Sensor Auto-Detection & Drivers */
+void sensor_power_on(void);
+void sensor_power_off(void);
+void sensor_i2c_auto_detect(PacketSerial& packetSerial);
 
 void sensor_aht_init(void);
 bool sensor_aht_get(AHTData& data);
-void sensor_aht_print(const AHTData& data);
+
 bool sensor_sht41_init(void);
-bool sensor_sht41_get(AHTData& data);
-/************************ sgp40 tvoc  ****************************/
+bool sensor_sht41_trigger(void);
+bool sensor_sht41_read(AHTData& data);
 
 void sensor_sgp40_init(void);
 bool sensor_sgp40_get(SPG40Data& data, const uint16_t compensationRh, const uint16_t compensationT);
-void sensor_sgp40_print(const SPG40Data& data);
-
-/************************ scd4x  co2 ****************************/
 
 void sensor_scd4x_init(void);
 bool sensor_scd4x_get(SCD4XData& data);
-void sensor_scd4x_print(const SCD4XData& data);
 
-/************************ grove  ****************************/
-void grove_adc_get(void);  // todo
-/************************ beep ****************************/
-void beep_init(void);
-void beep_off(void);
-void beep_on(void);  // Give it a beep
-/************************ Format printer ****************************/
-void printUint16Hex(uint16_t value);
-void printSerialNumber(uint16_t serial0, uint16_t serial1, uint16_t serial2);
-/************************ Sensor Power ****************************/
-void sensor_power_on(void);
-void sensor_power_off(void);
-/************************ Delay ****************************/
+bool sensor_light_init(void);
+bool sensor_light_get(LightData& data);
+
+/* Non-blocking Cistern Alarm Engine */
+void alarm_init(void);/* Extended LoRa Telemetry Helper with explicit DevAddr origin */
+void lora_telemetry_send(PacketSerial& packetSerial, uint32_t dev_addr, uint8_t sensor_id, float data);
+void alarm_set(uint16_t tON_ms, uint16_t tOFF_ms);
+void alarm_mute(uint32_t mute_sec);
+void alarm_rearm(void);
+void beep_click(uint16_t duration_ms = 50);
+void buzzer_update(void);
+
+/* SD Card Management Functions (Core 1) */
+void sd_card_init(void);
+void sd_card_get_info(uint8_t &is_present, uint8_t &is_usb_mounted, int8_t &state, uint32_t &capacity_mb, char* volume_label);
+bool sd_card_format(uint8_t format_type, const char* new_label);
+
+/* Non-blocking Delay Helper */
 class NonBlockingDelay {
    private:
-    unsigned long previousMillis;  // Last time
-    unsigned long interval;  // interval to wait
+    unsigned long previousMillis;
+    unsigned long interval;
 
    public:
     NonBlockingDelay(unsigned long interval) : interval(interval), previousMillis(0) {}
 
-    /**
-   * @brief if it is time to execute the function(similar to a timer)
-   * 
-   * @return true 
-   * @return false 
-   */
     bool check()
     {
         unsigned long currentMillis = millis();
         if (currentMillis - previousMillis >= interval) {
-            previousMillis = currentMillis;  // update time
-            return true;  // exceute time
+            previousMillis = currentMillis;
+            return true;
         }
-        return false;  // not the time yet
+        return false;
     }
 
-    /**
-   * @brief Set the Interval time
-   * 
-   * @param newInterval 
-   */
     void setInterval(unsigned long newInterval) { interval = newInterval; }
 };
 
-/************************ END ****************************/

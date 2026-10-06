@@ -2,13 +2,14 @@ CompileFlags:
   CompilationDatabase: "build"
   Remove:
     - "-mlongcalls"
+    - "-mlong-calls"
     - "-mdisable-hardware-atomics"
     - "-fstrict-volatile-bitfields"
     - "-fno-tree-switch-conversion"
 
 Diagnostics:
+  UnusedIncludes: None
   Suppress:
     - "drv_unknown_argument"
     - "drv_unknown_argument_with_suggestion"
-    - "pp_file_not_found"
-    - "unused-includes"
+    - "pp_expr_bad_token_lparen"
