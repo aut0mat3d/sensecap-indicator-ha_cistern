@@ -26,11 +26,17 @@ static const char *TAG = "lora-diag-view";
 #define TIMEFRAME_BUF_SIZE  8
 
 typedef struct {
-    char      key[24];
-    char      unit[12];
-    float     val;
-    lv_obj_t *lbl_item;
-    bool      active;
+    char            key[24];
+    char            unit[12];
+    lora_val_type_t val_type;
+    union {
+        float       f_val;
+        int32_t     i_val;
+        bool        b_val;
+        char        str_val[32];
+    } val;
+    lv_obj_t       *lbl_item;
+    bool            active;
 } dyn_metric_t;
 
 /* ── UI Widgets ─────────────────────────────────────────────────────────── */
@@ -459,13 +465,22 @@ static void lora_diag_view_event_handler(void *handler_args, esp_event_base_t ba
             if (s_lbl_footer) {
                 time_t now = time(NULL);
                 struct tm timeinfo;
+                
+                /* Force evaluation of TZ environment variable */
+                tzset();
                 localtime_r(&now, &timeinfo);
 
                 char buf[80];
-                snprintf(buf, sizeof(buf), "Rx: %lu  |  Last: %02d:%02d:%02d  |  Dev: 0x%08lX",
-                         (unsigned long)s_packet_rx_counter,
-                         timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
-                         (unsigned long)diag->dev_addr);
+                if (now > 1700000000) {
+                    snprintf(buf, sizeof(buf), "Rx: %lu  |  Last: %02d:%02d:%02d  |  Dev: 0x%08lX",
+                             (unsigned long)s_packet_rx_counter,
+                             timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
+                             (unsigned long)diag->dev_addr);
+                } else {
+                    snprintf(buf, sizeof(buf), "Rx: %lu  |  Last: No Sync  |  Dev: 0x%08lX",
+                             (unsigned long)s_packet_rx_counter,
+                             (unsigned long)diag->dev_addr);
+                }
                 lv_label_set_text(s_lbl_footer, buf);
             }
         } else if (diag->noise_floor != 0 && s_lbl_rf_metrics) {
@@ -478,7 +493,8 @@ static void lora_diag_view_event_handler(void *handler_args, esp_event_base_t ba
     }
     else if (id == VIEW_EVENT_LORA_TELEMETRY) {
         struct view_data_lora_telemetry *data = (struct view_data_lora_telemetry *)event_data;
-        if (!data || data->dev_addr == LORA_DEV_ADDR_LOCAL) return;
+        /* Ignore local I2C and MQTT values on RF diagnostic screen */
+        if (!data || data->origin != DATA_ORIGIN_LORA) return;
 
         lv_port_sem_take();
 
@@ -508,11 +524,28 @@ static void lora_diag_view_event_handler(void *handler_args, esp_event_base_t ba
         /* Update metric value & formatted recolor text */
         if (slot >= 0) {
             dyn_metric_t *m = &s_dyn_metrics[slot];
-            m->val = data->val;
+            m->val_type = data->val_type;
             strlcpy(m->unit, data->unit, sizeof(m->unit));
 
-            char buf[64];
-            snprintf(buf, sizeof(buf), "#bdc3c7 %s:# #2ecc71 %.1f %s#", m->key, m->val, m->unit);
+            char buf[96];
+            switch (m->val_type) {
+                case LORA_VAL_TYPE_FLOAT:
+                    m->val.f_val = data->val.f_val;
+                    snprintf(buf, sizeof(buf), "#bdc3c7 %s:# #2ecc71 %.1f %s#", m->key, m->val.f_val, m->unit);
+                    break;
+                case LORA_VAL_TYPE_INT:
+                    m->val.i_val = data->val.i_val;
+                    snprintf(buf, sizeof(buf), "#bdc3c7 %s:# #2ecc71 %ld %s#", m->key, (long)m->val.i_val, m->unit);
+                    break;
+                case LORA_VAL_TYPE_BOOL:
+                    m->val.b_val = data->val.b_val;
+                    snprintf(buf, sizeof(buf), "#bdc3c7 %s:# #2ecc71 %s#", m->key, m->val.b_val ? "TRUE" : "FALSE");
+                    break;
+                case LORA_VAL_TYPE_STRING:
+                    strlcpy(m->val.str_val, data->val.str_val, sizeof(m->val.str_val));
+                    snprintf(buf, sizeof(buf), "#bdc3c7 %s:# #2ecc71 %s %s#", m->key, m->val.str_val, m->unit);
+                    break;
+            }
 
             if (m->lbl_item) {
                 lv_label_set_recolor(m->lbl_item, true);

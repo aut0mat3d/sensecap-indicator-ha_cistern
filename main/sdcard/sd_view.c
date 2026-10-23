@@ -644,6 +644,10 @@ static void sd_view_event_handler(void *handler_args, esp_event_base_t base,
 					snprintf(buf, sizeof(buf), "Status: Unformatted / Mismatch (%llu MB)", (unsigned long long)info->total_mb);
 					lv_label_set_text(s_status_label, buf);
 					lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xe67e22), LV_PART_MAIN | LV_STATE_DEFAULT); /* Orange */
+				} else if (info->state == SD_STATE_VALID_FAT32) {
+					snprintf(buf, sizeof(buf), "Status: LittleFS unformatted (%llu MB)", (unsigned long long)info->total_mb);
+					lv_label_set_text(s_status_label, buf);
+					lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xe67e22), LV_PART_MAIN | LV_STATE_DEFAULT); /* Orange */
 				} else {
 					snprintf(buf, sizeof(buf), "Status: SD Card Ready (%llu MB)", (unsigned long long)info->total_mb);
 					lv_label_set_text(s_status_label, buf);
@@ -655,10 +659,10 @@ static void sd_view_event_handler(void *handler_args, esp_event_base_t base,
 				lv_label_set_text(s_info_label, buf);
 				lv_obj_set_style_text_color(s_info_label, lv_color_hex(0xbdc3c7), LV_PART_MAIN | LV_STATE_DEFAULT);
 
-				/* Format LittleFS Part. -> Requires valid LittleFS partition */
+				/* Format LittleFS Part. -> Active if SD belongs to device and P2 exists in MBR */
 				if(s_btn_lfs)
 				{
-					if(info->state == SD_STATE_VALID_FAT32_LFS) {
+					if(info->state >= SD_STATE_VALID_FAT32) {
 						lv_obj_remove_state(s_btn_lfs, LV_STATE_DISABLED);
 					} else {
 						lv_obj_add_state(s_btn_lfs, LV_STATE_DISABLED);

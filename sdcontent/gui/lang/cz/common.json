@@ -1,0 +1,23 @@
+{
+  "common": {
+    "back": "Zpět",
+    "cancel": "Zrušit",
+    "save": "Uložit",
+    "delete": "Smazat",
+    "ok": "OK",
+    "settings": "Nastavení"
+  },
+  "status": {
+    "ok": "Normální",
+    "warning": "Varování",
+    "danger": "Nebezpečí",
+    "estimated": "Odhadnuto",
+    "offline": "Offline"
+  },
+  "telemetry": {
+    "level": "Hladina:",
+    "rate": "Rychlost změny:",
+    "updated": "Aktualizace:",
+    "volume": "Objem:"
+  }
+}

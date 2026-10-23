@@ -1,0 +1,62 @@
+{
+  "device_name": "Hochbehälter",
+  "medium": "water",
+  "enabled": true,
+  "dev_addr": "05975DC9",
+  "dev_sn": "SERIAL_001",
+  "dev_eui": "EUI_001_24E124",
+  "keys": {
+    "nwk_skey": "00112233445566778899AABBCCDDEEFF",
+    "app_skey": "00112233445566778899AABBCCDDEEFF",
+    "d2d_key":  "00112233445566778899AABBCCDDEEFF"
+  },
+  "decoder": "EM500-SWL",
+  "offsets": {
+    "depth": {"value": 50, "unit": "mm" }
+  },
+  "virtual_decoder": {
+    "volume": {
+      "source_key": "depth",
+      "type": "rectangle",
+      "width": { "value": 200, "unit": "cm" },
+      "length": { "value": 200, "unit": "cm" },
+      "max_depth": { "value": 140, "unit": "cm" }
+    },
+    "level_gain": {
+      "source_key": "depth",
+      "calculation": "derivative",
+      "interval_sec": 0,
+      "unit": "cm/h"
+    },
+    "flowrate": {
+      "source_key": "volume",
+      "calculation": "derivative",
+      "interval_sec": 0,
+      "unit": "m³/h"
+    }
+  },
+  "thresholds": [
+    {
+      "id": "alarm_low",
+      "key": "depth",
+      "severity": "danger",
+      "value_percent": 15.0,
+      "damping": 0,
+      "hysteresis_percent": 3.0,
+      "buzzer_mode": "intermittent"
+    },
+    {
+      "id": "alarm_frate",
+      "key": "flowrate",
+      "severity": "danger",
+      "value_threshold": -2.0,
+      "damping": 2,
+      "hysteresis": 0.4,
+      "buzzer_mode": "intermittent"
+    }
+  ],
+  "display_config": {
+    "unit_system": "metric",
+    "volume_unit": "m3"
+  }
+}

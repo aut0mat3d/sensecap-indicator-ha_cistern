@@ -5,6 +5,7 @@
 
 #include "lora_model.h"
 #include "radio.h"
+#include <stdint.h>
 #include <sys/time.h>
 #include <time.h>
 #include "sntp_service.h"
@@ -21,32 +22,6 @@ static int16_t s_last_noise_floor = -100;
 bool s_time_synced_via_ntp = false;
 
 /* ── Packed Mirror Structs matching RP2040 Layout ──────────────────────── */
-
-typedef struct __attribute__((packed)) {
-    bool     enabled;         /* Enable P2P Mesh features */
-    char     device_id[16];   /* Node ID ("AUTO" or custom string) */
-    uint16_t network_id;      /* Mesh Network ID (e.g. 0x4A6F) */
-    uint8_t  aes_key[16];     /* 128-bit Mesh AES Encryption Key */
-    uint8_t  broadcast_ttl;   /* Default TTL hop count */
-} lora_mesh_config_t;
-
-typedef struct __attribute__((packed)) {
-    char posix_timezone[64];  /* e.g. "CET-1CEST,M3.5.0,M10.5.0/3" */
-    char time_format[8];      /* "24h" or "12h" */
-    char ntp_server[32];      /* e.g. "pool.ntp.org" */
-    bool p2p_sync_enabled;    /* Enable P2P time mesh */
-} lora_time_config_t;
-
-typedef struct __attribute__((packed)) {
-    uint32_t           rf_frequency_hz;
-    uint8_t            rf_spreading_factor;
-    uint16_t           rf_bandwidth_khz;
-    uint8_t            rf_coding_rate;
-    uint8_t            rf_preamble_len;
-    uint8_t            sync_word;
-    lora_mesh_config_t mesh;
-    lora_time_config_t time_cfg; /* Integrated Time Configuration */
-} lora_global_config_t;
 
 typedef struct __attribute__((packed)) {
     uint8_t trigger_fport;      /* Trigger FPort match (e.g. 13) */
@@ -68,6 +43,42 @@ typedef struct __attribute__((packed)) {
     bool    valid;           /* Rule active */
 } lora_fport_config_t;
 
+#define MAX_LUT_POINTS 16
+
+typedef enum {
+    TANK_TYPE_NONE = 0,
+    TANK_TYPE_RECTANGLE,
+    TANK_TYPE_CYLINDER_VERTICAL,
+    TANK_TYPE_CYLINDER_HORIZONTAL,
+    TANK_TYPE_CONE_FRUSTUM,
+    TANK_TYPE_LUT
+} tank_type_t;
+
+typedef struct {
+    float depth_cm;
+    float liters;
+} lut_point_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t     type;
+    float       max_depth_cm;
+    float       width_cm;
+    float       length_cm;
+    float       diameter_cm;
+    float       dish_height_cm;
+    float       bottom_diameter_cm;
+    float       top_diameter_cm;
+    float       height_cm;
+    float       cone_compensation;
+    lut_point_t lut[MAX_LUT_POINTS];
+    uint8_t     lut_count;
+} tank_geometry_t;
+
+typedef struct __attribute__((packed)) {
+    char unit_system[16];
+    char volume_unit[16];
+} tank_display_config_t;
+
 typedef struct __attribute__((packed)) {
     char                   device_name[32];
     char                   medium[16];
@@ -82,6 +93,8 @@ typedef struct __attribute__((packed)) {
     lora_device_reaction_t reaction;
     uint32_t               fcnt_down;
     lora_fport_config_t    fport_cfg;
+    tank_geometry_t        geometry;     /* Synchronize layout with RP2040 lorasensors.hpp */
+    tank_display_config_t  display_cfg;  /* Synchronize layout with RP2040 lorasensors.hpp */
 } lora_device_config_t;
 
 #define MAX_LORA_DEVICES 16
@@ -567,6 +580,21 @@ bool lora_model_enqueue_time_broadcast(uint32_t utc_timestamp) {
     return true;
 }
 
+/**
+ * @brief Checks if device has valid decryption keys for the specified FPort.
+ * Returns true if the payload on this FPort is unencrypted, or if app_skey / nwk_skey are non-zero.
+ */
+static bool lora_device_can_decrypt(const lora_device_config_t *dev, uint8_t fport) {
+    if (!dev) return false;
+    /* Explicitly unencrypted payload mode */
+    if (dev->fport_cfg.valid && dev->fport_cfg.fport == fport && dev->fport_cfg.encryption_mode == 1) {
+        return true;
+    }
+    /* Check if either app_skey or nwk_skey contains non-zero bytes */
+    static const uint8_t zero_key[16] = {0};
+    return (memcmp(dev->app_skey, zero_key, 16) != 0) || (memcmp(dev->nwk_skey, zero_key, 16) != 0);
+}
+
 /* ── Seeed Radio Event Handlers ─────────────────────────────────────────── */
 
 static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
@@ -597,10 +625,10 @@ static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) 
 
             /* Synchronize local RTC if time is valid and device is not synced via NTP */
             if (remote_utc > 1700000000 && !s_time_synced_via_ntp) {
-                struct timeval tv = { .tv_sec = (time_t)remote_utc, .tv_usec = 0 };
-                settimeofday(&tv, NULL);
-                ESP_LOGI(TAG, "RTC synced via P2P Standalone Time Broadcast: %lu", (unsigned long)remote_utc);
-            }
+            extern void time_service_apply_sync(uint32_t utc_sec, uint8_t flag);
+            time_service_apply_sync(remote_utc, 0x01);
+            ESP_LOGI(TAG, "RTC & RP2040 synced via P2P Time: %lu", (unsigned long)remote_utc);
+        }
         }
         Radio.RxBoosted(0);
         return;
@@ -622,9 +650,9 @@ static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) 
 
         /* STEP 1: Process timestamp FIRST before evaluating duplicate cache */
         if (remote_utc > 1700000000 && !s_time_synced_via_ntp) {
-            struct timeval tv = { .tv_sec = (time_t)remote_utc, .tv_usec = 0 };
-            settimeofday(&tv, NULL);
-            ESP_LOGI(TAG, "RTC synced via P2P Retransmit Header: %lu", (unsigned long)remote_utc);
+            extern void time_service_apply_sync(uint32_t utc_sec, uint8_t flag);
+            time_service_apply_sync(remote_utc, 0x01);
+            ESP_LOGI(TAG, "RTC & RP2040 synced via P2P Time: %lu", (unsigned long)remote_utc);
         }
 
         /* STEP 2: Anti-looping duplicate telemetry check */
@@ -658,7 +686,8 @@ static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) 
 
         /* Propagate Mesh Frame if TTL > 1 */
         if (g_rf_cfg.mesh.enabled && ttl > 1) {
-            uint32_t retransmit_delay = 1300 + (Radio.Random() % 3700);
+            // 1500 ms base delay ensures RX1 downlink is done; max 2800 ms ensures finish before packet 2
+            uint32_t retransmit_delay = 1500 + (Radio.Random() % 1300);
             uint32_t retransmit_ts = now_ms + retransmit_delay;
             lora_model_enqueue_retransmit(rx_dev_addr, fcnt, fport, ttl - 1, decrypted_tlv, tlv_len, retransmit_ts);
         }
@@ -712,6 +741,18 @@ static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) 
             fcnt  = payload[6] | (payload[7] << 8);
             fport = payload[8];
             frm_len = size - 9 - 4;
+
+            /* Guard: If this node has no keys for this device, it is a listener/slave:
+             * 1. Do NOT add to duplicate cache (otherwise the valid decrypted P2P Retransmit will be discarded!)
+             * 2. Do NOT attempt decryption with all-zero keys
+             * 3. Do NOT blind-retransmit encrypted ciphertext via P2P
+             * 4. Do NOT forward garbage to RP2040 */
+            if (!lora_device_can_decrypt(matched, fport)) {
+                ESP_LOGI(TAG, "Device '%s' has no decryption keys (listener mode) - ignoring direct sensor frame, awaiting P2P retransmit",
+                         matched->device_name);
+                Radio.RxBoosted(0);
+                return;
+            }
 
             add_duplicate_frame(rx_dev_addr, fcnt);
 
@@ -773,7 +814,8 @@ static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) 
         /* Enqueue P2P Mesh Retransmit broadcast or Standalone Time Broadcast */
         if (g_rf_cfg.mesh.enabled && matched && frm_len > 0) {
             if (g_rf_cfg.mesh.broadcast_ttl > 0) {
-                uint32_t retransmit_delay = 1300 + (Radio.Random() % 3700);
+                // 1500 ms base delay ensures RX1 downlink is done; max 2800 ms ensures finish before packet 2
+                uint32_t retransmit_delay = 1500 + (Radio.Random() % 1300);
                 uint32_t retransmit_ts = now_ms + retransmit_delay;
                 lora_model_enqueue_retransmit(rx_dev_addr, fcnt, fport, g_rf_cfg.mesh.broadcast_ttl, &payload[9], frm_len, retransmit_ts);
             } else if (g_rf_cfg.time_cfg.p2p_sync_enabled) {
@@ -839,6 +881,7 @@ static void OnCadDone(bool channelActivityDetected) {
 /* ── Public API Implementation ─────────────────────────────────────────── */
 
 void lora_model_on_rp2040_cfg_received(const uint8_t *buf, size_t len) {
+    ESP_LOGI(TAG, "CFG_RX: len=%u, expected_struct=%u", (unsigned)len, (unsigned)sizeof(lora_device_config_t));
     if (len < 2) return;
 
     uint8_t valid_cfg = buf[1];
@@ -916,45 +959,70 @@ void lora_model_update(void) {
 
         /* Process TX Queue if no transmission is active */
         if (!g_tx_in_progress) {
+            int selected_idx = -1;
+
+            // Priority 1: Check for time-critical LoRaWAN Downlinks (RX1 slot)
             for (size_t i = 0; i < MAX_TX_QUEUE_SIZE; i++) {
-                if (g_tx_queue[i].valid && now_ms >= g_tx_queue[i].target_timestamp_ms) {
-                    lora_tx_frame_t *frame = &g_tx_queue[i];
-
-                    ESP_LOGI(TAG, "Transmitting Frame from TX Queue! Type: %d, DevAddr: 0x%08lX, IQ Inverted: %d",
-                             frame->msg_type, (unsigned long)frame->dev_addr, frame->iq_inverted);
-
-                    g_tx_in_progress = true;
-
-                    /* 1. Configure TX parameters */
-                    uint8_t bw_idx = 0;
-                    if (g_rf_cfg.rf_bandwidth_khz >= 500) bw_idx = 2;
-                    else if (g_rf_cfg.rf_bandwidth_khz >= 250) bw_idx = 1;
-
-                    uint8_t cr = g_rf_cfg.rf_coding_rate;
-                    if (cr > 4) cr = cr - 4;
-
-                    Radio.SetTxConfig(
-                        MODEM_LORA,
-                        frame->tx_power_dbm,
-                        0,                        /* fdev */
-                        bw_idx,
-                        g_rf_cfg.rf_spreading_factor,
-                        cr,
-                        g_rf_cfg.rf_preamble_len,
-                        false,                    /* fixLen */
-                        true,                     /* crcOn */
-                        0, 0,
-                        frame->iq_inverted,       /* Downlinks use inverted IQ, P2P uses normal */
-                        3000                      /* Timeout ms */
-                    );
-
-                    /* 2. Dispatch payload via SX1262 driver */
-                    Radio.Send(frame->raw_payload, frame->payload_len);
-
-                    /* Mark frame handled */
-                    frame->valid = false;
+                if (g_tx_queue[i].valid && g_tx_queue[i].msg_type == TX_TYPE_LORAWAN_DOWNLINK &&
+                    now_ms >= g_tx_queue[i].target_timestamp_ms) {
+                    selected_idx = (int)i;
                     break;
                 }
+            }
+
+            // Priority 2: Check for P2P CLAIM announcements
+            if (selected_idx < 0) {
+                for (size_t i = 0; i < MAX_TX_QUEUE_SIZE; i++) {
+                    if (g_tx_queue[i].valid && g_tx_queue[i].msg_type == TX_TYPE_P2P_CLAIM &&
+                        now_ms >= g_tx_queue[i].target_timestamp_ms) {
+                        selected_idx = (int)i;
+                        break;
+                    }
+                }
+            }
+
+            // Priority 3: Regular P2P Retransmits & Time Broadcasts
+            if (selected_idx < 0) {
+                for (size_t i = 0; i < MAX_TX_QUEUE_SIZE; i++) {
+                    if (g_tx_queue[i].valid && now_ms >= g_tx_queue[i].target_timestamp_ms) {
+                        selected_idx = (int)i;
+                        break;
+                    }
+                }
+            }
+
+            if (selected_idx >= 0) {
+                lora_tx_frame_t *frame = &g_tx_queue[selected_idx];
+
+                ESP_LOGI(TAG, "Transmitting Frame from TX Queue! Type: %d, DevAddr: 0x%08lX, IQ Inverted: %d",
+                         frame->msg_type, (unsigned long)frame->dev_addr, frame->iq_inverted);
+
+                g_tx_in_progress = true;
+
+                uint8_t bw_idx = 0;
+                if (g_rf_cfg.rf_bandwidth_khz >= 500) bw_idx = 2;
+                else if (g_rf_cfg.rf_bandwidth_khz >= 250) bw_idx = 1;
+
+                uint8_t cr = g_rf_cfg.rf_coding_rate;
+                if (cr > 4) cr = cr - 4;
+
+                Radio.SetTxConfig(
+                    MODEM_LORA,
+                    frame->tx_power_dbm,
+                    0,
+                    bw_idx,
+                    g_rf_cfg.rf_spreading_factor,
+                    cr,
+                    g_rf_cfg.rf_preamble_len,
+                    false,
+                    true,
+                    0, 0,
+                    frame->iq_inverted,
+                    3000
+                );
+
+                Radio.Send(frame->raw_payload, frame->payload_len);
+                frame->valid = false;
             }
         }
 

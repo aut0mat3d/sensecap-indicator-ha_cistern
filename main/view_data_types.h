@@ -117,17 +117,40 @@ struct view_data_sensor_history_data {
     float                     week_max;
 };
 
+/* ── Telemetry Data Origin Tag ───────────────────────────────────────────── */
+typedef enum {
+    DATA_ORIGIN_LORA      = 0, /* External LoRaWAN / LoRa P2P node */
+    DATA_ORIGIN_LOCAL_I2C = 1, /* Onboard or Grove I2C sensors */
+    DATA_ORIGIN_MQTT      = 2, /* Inbound Home Assistant / MQTT broker values */
+    DATA_ORIGIN_VIRTUAL   = 3  /* Calculated virtual values */
+} data_origin_t;
+
 /* ── LoRa Telemetry ------────────────────────────────────────────────────── */
 #define VIEW_EVENT_LORA_TELEMETRY  (0x7F)
 
+typedef enum {
+    LORA_VAL_TYPE_FLOAT  = 0,
+    LORA_VAL_TYPE_INT    = 1,
+    LORA_VAL_TYPE_BOOL   = 2,
+    LORA_VAL_TYPE_STRING = 3  /* Hex, Strings, Seriennummern, Firmware-Releases */
+} lora_val_type_t;
+
 struct view_data_lora_telemetry {
-    uint32_t dev_addr;
-    uint32_t fcnt;
-    uint8_t  val_type;
-    uint8_t  context;
-    char     key[24];
-    char     unit[12];
-    float    val;
+    data_origin_t   origin;    /* Data source tag */
+    uint32_t        dev_addr;
+    uint32_t        fcnt;
+    lora_val_type_t val_type;
+    uint8_t         context;   /* 0=Measurement, 1=Diagnostic, 2=History */
+    bool            is_estimated; /* true = Replacement/Interpolated value */
+    bool            is_alarm;     /* true = Active threshold violation */
+    char            key[24];
+    char            unit[12];
+    union {
+        float       f_val;
+        int32_t     i_val;
+        bool        b_val;
+        char        str_val[32];
+    } val;
 };
 
 /* ── LoRa Diagnostic Data ────────────────────────────────────────────────── */

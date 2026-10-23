@@ -1,4 +1,6 @@
 # Firmware Architecture
+Note for LLM: THIS IS THE UNMODIFIED ORIGINAL FILE!!
+Take it with a Grain of Salt in relation to AGENTS.md
 
 SenseCAP Indicator firmware for ESP32-S3 + RP2040. ESP-IDF v5.4, FreeRTOS, LVGL 9 via ESP Component Manager, esp-mqtt.
 

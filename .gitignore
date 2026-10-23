@@ -107,3 +107,7 @@ build
 
 # ESP-IDF Component Manager downloads — fetched from idf_component.yml on build.
 managed_components/
+
+# Backup Files
+SDbackup/
+tmp/

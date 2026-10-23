@@ -1,0 +1,15 @@
+{
+  "device_name": "SGP40 VOC Sensor",
+  "medium": "environment",
+  "enabled": true,
+  "dev_addr": "0x47",
+  "decoder": "SGP40",
+  "offsets": {
+    "SGP40_TVOC_INDEX": {"value": 0, "unit": ""},
+    "SGP40_RAW": {"value": 0, "unit": ""}
+  },
+  "virtual_decoder": {},
+  "display_config": {
+    "unit_system": "metric"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "device_name": "SCD41 CO2 Sensor",
+  "medium": "environment",
+  "enabled": true,
+  "dev_addr": "0x46",
+  "decoder": "SCD41",
+  "offsets": {
+    "SCD41_CO2": {"value": 0, "unit": "ppm"},
+    "SCD41_TEMP": {"value": 0, "unit": "°C"},
+    "SCD41_HUMIDITY": {"value": 0, "unit": "%"}
+  },
+  "virtual_decoder": {
+    "dewpoint": {
+      "source_keys": ["SCD41_TEMP", "SCD41_HUMIDITY"],
+      "calculation": "dewpoint",
+      "unit": "°C",
+      "corr_factor": 1.0
+    }
+  },
+  "display_config": {
+    "unit_system": "metric"
+  }
+}

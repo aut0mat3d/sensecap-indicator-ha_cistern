@@ -1,0 +1,182 @@
+{
+  "version": "1.0.0",
+  "description": "Deutsche Unit-Namen für SenseCAP Cistern Extension. Überschreibt nur die name-Felder, alle anderen Werte bleiben aus der Haupt-units.json.",
+  "quantity_types": {
+    "length": {
+      "description": "Lineare Dimensionen und Abstände",
+      "si_base": "m",
+      "units": {
+        "mm": { "name": "Millimeter" },
+        "cm": { "name": "Zentimeter" },
+        "m":  { "name": "Meter" },
+        "km": { "name": "Kilometer" },
+        "inch": { "name": "Zoll" },
+        "ft": { "name": "Fuß" },
+        "yd": { "name": "Yard" },
+        "mile": { "name": "Meile" }
+      }
+    },
+    "volume": {
+      "description": "Volumen und Kapazität",
+      "si_base": "m3",
+      "units": {
+        "ml": { "name": "Milliliter" },
+        "liter": { "name": "Liter" },
+        "m3": { "name": "Kubikmeter" },
+        "gallon_us": { "name": "US Gallone" },
+        "gallon_uk": { "name": "Britische Gallone" },
+        "barrel": { "name": "Oil Barrel" }
+      }
+    },
+    "area": {
+      "description": "Flächenmaße",
+      "si_base": "m2",
+      "units": {
+        "mm2": { "name": "Quadratmillimeter" },
+        "cm2": { "name": "Quadratzentimeter" },
+        "m2": { "name": "Quadratmeter" },
+        "km2": { "name": "Quadratkilometer" },
+        "ha": { "name": "Hektar" },
+        "acre": { "name": "Acre" },
+        "ft2": { "name": "Quadratfuß" },
+        "in2": { "name": "Quadratzoll" }
+      }
+    },
+    "temperature": {
+      "description": "Temperaturmessungen",
+      "si_base": "K",
+      "units": {
+        "C": { "name": "Grad Celsius" },
+        "K": { "name": "Kelvin" },
+        "F": { "name": "Grad Fahrenheit" }
+      }
+    },
+    "pressure": {
+      "description": "Druckmessungen",
+      "si_base": "Pa",
+      "units": {
+        "Pa": { "name": "Pascal" },
+        "hPa": { "name": "Hektopascal" },
+        "kPa": { "name": "Kilopascal" },
+        "bar": { "name": "Bar" },
+        "psi": { "name": "PSI" },
+        "mmHg": { "name": "Millimeter Quecksilbersäule" },
+        "inHg": { "name": "Zoll Quecksilbersäule" }
+      }
+    },
+    "solar_radiation": {
+      "description": "Solar- und Lichtmessungen",
+      "si_base": "W/m2",
+      "units": {
+        "W/m2": { "name": "Watt pro Quadratmeter" },
+        "lux": { "name": "Lux" },
+        "UV_index": { "name": "UV-Index" },
+        "fc": { "name": "Foot-Candles" }
+      }
+    },
+    "force": {
+      "description": "Kraftmessungen",
+      "si_base": "N",
+      "units": {
+        "N": { "name": "Newton" },
+        "kN": { "name": "Kilonewton" },
+        "lbf": { "name": "Pfund-Kraft" },
+        "kgf": { "name": "Kilogramm-Kraft" }
+      }
+    },
+    "flow_rate": {
+      "description": "Volumenstrom",
+      "si_base": "m3/s",
+      "units": {
+        "m3/s": { "name": "Kubikmeter pro Sekunde" },
+        "m3/h": { "name": "Kubikmeter pro Stunde" },
+        "L/min": { "name": "Liter pro Minute" },
+        "L/s": { "name": "Liter pro Sekunde" },
+        "gpm": { "name": "Gallonen pro Minute" }
+      }
+    },
+    "level": {
+      "description": "Füllstand (dimensionslos)",
+      "si_base": "%",
+      "units": {
+        "%": { "name": "Prozent" },
+        "ratio": { "name": "Verhältnis (0-1)" }
+      }
+    },
+    "mass": {
+      "description": "Massenmessungen",
+      "si_base": "kg",
+      "units": {
+        "g": { "name": "Gramm" },
+        "kg": { "name": "Kilogramm" },
+        "t": { "name": "Tonne" },
+        "lb": { "name": "Pfund" },
+        "oz": { "name": "Unze" }
+      }
+    },
+    "time": {
+      "description": "Zeitmessungen",
+      "si_base": "s",
+      "units": {
+        "ms": { "name": "Millisekunde" },
+        "s": { "name": "Sekunde" },
+        "min": { "name": "Minute" },
+        "h": { "name": "Stunde" },
+        "d": { "name": "Tag" }
+      }
+    },
+    "speed": {
+      "description": "Geschwindigkeitsmessungen",
+      "si_base": "m/s",
+      "units": {
+        "m/s": { "name": "Meter pro Sekunde" },
+        "km/h": { "name": "Kilometer pro Stunde" },
+        "mph": { "name": "Meilen pro Stunde" },
+        "knot": { "name": "Knoten" }
+      }
+    },
+    "energy": {
+      "description": "Energiemessungen",
+      "si_base": "J",
+      "units": {
+        "J": { "name": "Joule" },
+        "kWh": { "name": "Kilowattstunde" },
+        "cal": { "name": "Kalorie" },
+        "kcal": { "name": "Kilokalorie" }
+      }
+    },
+    "power": {
+      "description": "Leistungsmessungen",
+      "si_base": "W",
+      "units": {
+        "W": { "name": "Watt" },
+        "kW": { "name": "Kilowatt" },
+        "MW": { "name": "Megawatt" },
+        "hp": { "name": "Pferdestärke" }
+      }
+    },
+    "frequency": {
+      "description": "Frequenzmessungen",
+      "si_base": "Hz",
+      "units": {
+        "Hz": { "name": "Hertz" },
+        "kHz": { "name": "Kilohertz" },
+        "MHz": { "name": "Megahertz" },
+        "GHz": { "name": "Gigahertz" }
+      }
+    },
+    "angle": {
+      "description": "Winkelmessungen",
+      "si_base": "rad",
+      "units": {
+        "rad": { "name": "Radiant" },
+        "deg": { "name": "Grad" },
+        "gon": { "name": "Neugrad" }
+      }
+    }
+  },
+  "notes": {
+    "purpose": "This file only contains German translations for unit names. All other fields (factor, symbol, offset, etc.) are inherited from the main units.json",
+    "merge_strategy": "This file is merged with the main units.json: name fields are overwritten, all other fields remain from main units.json"
+  }
+}

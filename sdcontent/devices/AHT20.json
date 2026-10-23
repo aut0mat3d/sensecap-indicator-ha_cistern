@@ -1,0 +1,22 @@
+{
+  "device_name": "AHT20 Temperature & Humidity",
+  "medium": "environment",
+  "enabled": true,
+  "dev_addr": "0x44",
+  "decoder": "AHT20",
+  "offsets": {
+    "AHT20_TEMP": {"value": 0, "unit": "°C"},
+    "AHT20_HUMIDITY": {"value": 0, "unit": "%"}
+  },
+  "virtual_decoder": {
+    "dewpoint": {
+      "source_keys": ["AHT20_TEMP", "AHT20_HUMIDITY"],
+      "calculation": "dewpoint",
+      "unit": "°C",
+      "corr_factor": 1.0
+    }
+  },
+  "display_config": {
+    "unit_system": "metric"
+  }
+}

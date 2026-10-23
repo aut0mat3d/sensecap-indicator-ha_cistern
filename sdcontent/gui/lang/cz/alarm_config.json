@@ -1,0 +1,23 @@
+{
+  "colors": {
+    "color_danger": "0xE74C3C",
+    "color_warning": "0xF39C12",
+    "color_info": "0x9E9E9E",
+    "color_incoming": "0xE74C3C",
+    "color_going": "0x2ECC71",
+    "color_muted": "0x95A5A6",
+    "color_retriggered": "0x3498DB",
+    "color_acknowledged": "0x7F8C8D"
+  },
+  "texts": {
+    "danger": "Nebezpečí",
+    "warning": "Varování",
+    "info": "Informace",
+    "incoming": "Příchozí",
+    "going": "Odeznělo",
+    "muted": "Ztlumeno",
+    "retriggered": "Znovu spuštěno",
+    "acknowledged": "Potvrzeno"
+  }
+}
+

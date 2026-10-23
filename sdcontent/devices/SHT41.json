@@ -1,0 +1,22 @@
+{
+  "device_name": "SHT41 Temperature & Humidity",
+  "medium": "environment",
+  "enabled": true,
+  "dev_addr": "0x45",
+  "decoder": "SHT41",
+  "offsets": {
+    "SHT41_TEMP": {"value": 0, "unit": "°C"},
+    "SHT41_HUMIDITY": {"value": 0, "unit": "%"}
+  },
+  "virtual_decoder": {
+    "dewpoint": {
+      "source_keys": ["SHT41_TEMP", "SHT41_HUMIDITY"],
+      "calculation": "dewpoint",
+      "unit": "°C",
+      "corr_factor": 1.0
+    }
+  },
+  "display_config": {
+    "unit_system": "metric"
+  }
+}

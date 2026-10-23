@@ -1,0 +1,210 @@
+{
+  "version": "1.0.0",
+  "description": "Central unit database for RP2040 (sensor parsing, volume calculation) and ESP32 (GUI display conversion)",
+  "quantity_types": {
+    "length": {
+      "description": "Linear dimensions and distances",
+      "si_base": "m",
+      "units": {
+        "mm": { "factor": 0.001, "symbol": "mm", "name": "Millimeter" },
+        "cm": { "factor": 0.01, "symbol": "cm", "name": "Centimeter" },
+        "m":  { "factor": 1.0, "symbol": "m", "name": "Meter" },
+        "km": { "factor": 1000.0, "symbol": "km", "name": "Kilometer" },
+        "inch": { "factor": 0.0254, "symbol": "in", "name": "Inch" },
+        "ft": { "factor": 0.3048, "symbol": "ft", "name": "Foot" },
+        "yd": { "factor": 0.9144, "symbol": "yd", "name": "Yard" },
+        "mile": { "factor": 1609.34, "symbol": "mi", "name": "Mile" }
+      }
+    },
+    "volume": {
+      "description": "Volume and capacity",
+      "si_base": "m3",
+      "units": {
+        "ml": { "factor": 0.000001, "symbol": "mL", "name": "Milliliter" },
+        "liter": { "factor": 0.001, "symbol": "L", "name": "Liter" },
+        "m3": { "factor": 1.0, "symbol": "m³", "name": "Cubic Meter" },
+        "gallon_us": { "factor": 0.00378541, "symbol": "gal", "name": "US Gallon" },
+        "gallon_uk": { "factor": 0.00454609, "symbol": "gal", "name": "UK Gallon" },
+        "barrel": { "factor": 0.158987, "symbol": "bbl", "name": "Oil Barrel" }
+      }
+    },
+    "area": {
+      "description": "Area measurements",
+      "si_base": "m2",
+      "units": {
+        "mm2": { "factor": 0.000001, "symbol": "mm²", "name": "Square Millimeter" },
+        "cm2": { "factor": 0.0001, "symbol": "cm²", "name": "Square Centimeter" },
+        "m2": { "factor": 1.0, "symbol": "m²", "name": "Square Meter" },
+        "km2": { "factor": 1000000.0, "symbol": "km²", "name": "Square Kilometer" },
+        "ha": { "factor": 10000.0, "symbol": "ha", "name": "Hectare" },
+        "acre": { "factor": 4046.86, "symbol": "acre", "name": "Acre" },
+        "ft2": { "factor": 0.092903, "symbol": "ft²", "name": "Square Foot" },
+        "in2": { "factor": 0.00064516, "symbol": "in²", "name": "Square Inch" }
+      }
+    },
+    "temperature": {
+      "description": "Temperature measurements",
+      "si_base": "K",
+      "units": {
+        "C": { "factor": 1.0, "offset": 0, "symbol": "°C", "name": "Celsius" },
+        "K": { "factor": 1.0, "offset": 0, "symbol": "K", "name": "Kelvin" },
+        "F": { "factor": 0.555556, "offset": -459.67, "symbol": "°F", "name": "Fahrenheit" }
+      }
+    },
+    "pressure": {
+      "description": "Pressure measurements",
+      "si_base": "Pa",
+      "units": {
+        "Pa": { "factor": 1.0, "symbol": "Pa", "name": "Pascal" },
+        "hPa": { "factor": 100.0, "symbol": "hPa", "name": "Hectopascal" },
+        "kPa": { "factor": 1000.0, "symbol": "kPa", "name": "Kilopascal" },
+        "bar": { "factor": 100000.0, "symbol": "bar", "name": "Bar" },
+        "psi": { "factor": 6894.76, "symbol": "psi", "name": "PSI" },
+        "mmHg": { "factor": 133.322, "symbol": "mmHg", "name": "mm Mercury" },
+        "inHg": { "factor": 3386.39, "symbol": "\"Hg", "name": "Inch Mercury" }
+      }
+    },
+    "solar_radiation": {
+      "description": "Solar and light measurements",
+      "si_base": "W/m2",
+      "units": {
+        "W/m2": { "factor": 1.0, "symbol": "W/m²", "name": "Watts per Square Meter" },
+        "lux": { "factor": 0.0079, "symbol": "lx", "name": "Lux", "note": "Approximate conversion" },
+        "UV_index": { "factor": 1.0, "symbol": "", "name": "UV Index", "type": "dimensionless" },
+        "fc": { "factor": 10.7639, "symbol": "fc", "name": "Foot-candles" }
+      }
+    },
+    "force": {
+      "description": "Force measurements",
+      "si_base": "N",
+      "units": {
+        "N": { "factor": 1.0, "symbol": "N", "name": "Newton" },
+        "kN": { "factor": 1000.0, "symbol": "kN", "name": "Kilonewton" },
+        "lbf": { "factor": 4.44822, "symbol": "lbf", "name": "Pound-force" },
+        "kgf": { "factor": 9.80665, "symbol": "kgf", "name": "Kilogram-force" }
+      }
+    },
+    "flow_rate": {
+      "description": "Volumetric flow rates",
+      "si_base": "m3/s",
+      "units": {
+        "m3/s": { "factor": 1.0, "symbol": "m³/s", "name": "Cubic Meters per Second" },
+        "m3/h": { "factor": 0.000277778, "symbol": "m³/h", "name": "Cubic Meters per Hour" },
+        "L/min": { "factor": 1.66667e-5, "symbol": "L/min", "name": "Liters per Minute" },
+        "L/s": { "factor": 0.001, "symbol": "L/s", "name": "Liters per Second" },
+        "gpm": { "factor": 6.30902e-5, "symbol": "gpm", "name": "Gallons per Minute" }
+      }
+    },
+    "level": {
+      "description": "Fill level (dimensionless)",
+      "si_base": "%",
+      "units": {
+        "%": { "factor": 1.0, "symbol": "%", "name": "Percent" },
+        "ratio": { "factor": 1.0, "symbol": "", "name": "Ratio (0-1)" }
+      }
+    },
+    "mass": {
+      "description": "Mass measurements",
+      "si_base": "kg",
+      "units": {
+        "g": { "factor": 0.001, "symbol": "g", "name": "Gram" },
+        "kg": { "factor": 1.0, "symbol": "kg", "name": "Kilogram" },
+        "t": { "factor": 1000.0, "symbol": "t", "name": "Tonne" },
+        "lb": { "factor": 0.453592, "symbol": "lb", "name": "Pound" },
+        "oz": { "factor": 0.0283495, "symbol": "oz", "name": "Ounce" }
+      }
+    },
+    "time": {
+      "description": "Time measurements",
+      "si_base": "s",
+      "units": {
+        "ms": { "factor": 0.001, "symbol": "ms", "name": "Millisecond" },
+        "s": { "factor": 1.0, "symbol": "s", "name": "Second" },
+        "min": { "factor": 60.0, "symbol": "min", "name": "Minute" },
+        "h": { "factor": 3600.0, "symbol": "h", "name": "Hour" },
+        "d": { "factor": 86400.0, "symbol": "d", "name": "Day" }
+      }
+    },
+    "speed": {
+      "description": "Speed measurements",
+      "si_base": "m/s",
+      "units": {
+        "m/s": { "factor": 1.0, "symbol": "m/s", "name": "Meters per Second" },
+        "km/h": { "factor": 0.277778, "symbol": "km/h", "name": "Kilometers per Hour" },
+        "mph": { "factor": 0.44704, "symbol": "mph", "name": "Miles per Hour" },
+        "knot": { "factor": 0.514444, "symbol": "kn", "name": "Knot" }
+      }
+    },
+    "energy": {
+      "description": "Energy measurements",
+      "si_base": "J",
+      "units": {
+        "J": { "factor": 1.0, "symbol": "J", "name": "Joule" },
+        "kWh": { "factor": 3600000.0, "symbol": "kWh", "name": "Kilowatt-hour" },
+        "cal": { "factor": 4.184, "symbol": "cal", "name": "Calorie" },
+        "kcal": { "factor": 4184.0, "symbol": "kcal", "name": "Kilocalorie" }
+      }
+    },
+    "power": {
+      "description": "Power measurements",
+      "si_base": "W",
+      "units": {
+        "W": { "factor": 1.0, "symbol": "W", "name": "Watt" },
+        "kW": { "factor": 1000.0, "symbol": "kW", "name": "Kilowatt" },
+        "MW": { "factor": 1000000.0, "symbol": "MW", "name": "Megawatt" },
+        "hp": { "factor": 745.7, "symbol": "hp", "name": "Horsepower" }
+      }
+    },
+    "frequency": {
+      "description": "Frequency measurements",
+      "si_base": "Hz",
+      "units": {
+        "Hz": { "factor": 1.0, "symbol": "Hz", "name": "Hertz" },
+        "kHz": { "factor": 1000.0, "symbol": "kHz", "name": "Kilohertz" },
+        "MHz": { "factor": 1000000.0, "symbol": "MHz", "name": "Megahertz" },
+        "GHz": { "factor": 1000000000.0, "symbol": "GHz", "name": "Gigahertz" }
+      }
+    },
+    "angle": {
+      "description": "Angle measurements",
+      "si_base": "rad",
+      "units": {
+        "rad": { "factor": 1.0, "symbol": "rad", "name": "Radian" },
+        "deg": { "factor": 0.0174533, "symbol": "°", "name": "Degree" },
+        "gon": { "factor": 0.015708, "symbol": "gon", "name": "Gradian" }
+      }
+    }
+  },
+  "unit_system_presets": {
+    "metric": {
+      "length": "m",
+      "volume": "m3",
+      "area": "m2",
+      "temperature": "C",
+      "pressure": "hPa",
+      "mass": "kg",
+      "time": "s",
+      "speed": "m/s",
+      "energy": "kWh",
+      "power": "W"
+    },
+    "imperial": {
+      "length": "ft",
+      "volume": "gallon_us",
+      "area": "ft2",
+      "temperature": "F",
+      "pressure": "psi",
+      "mass": "lb",
+      "time": "s",
+      "speed": "mph",
+      "energy": "kWh",
+      "power": "hp"
+    }
+  },
+  "notes": {
+    "usage": "Used by RP2040 for: (1) Parsing sensor data with unit conversion, (2) Volume calculation from height values using tank_geometry. Used by ESP32 for: (1) GUI display unit conversion",
+    "convention": "target_unit in decoders: if not specified, use unit (no conversion). target_unit is optional for backward compatibility",
+    "validation": "Unit conversion only allowed within same quantity_type. Temperature requires special offset handling",
+    "fallback": "If unit not found in quantity_type, use original value and log warning"
+  }
+}

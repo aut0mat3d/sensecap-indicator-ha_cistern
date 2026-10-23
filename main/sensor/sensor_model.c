@@ -149,24 +149,7 @@ int _sensor_data_parse_handle(uint8_t* p_data, ssize_t len) {
 	uint8_t pkt_type = p_data[0];
 	switch(pkt_type)
 	{
-			/*SCD41*/
-		case PKT_TYPE_SENSOR_SCD41_CO2:
-			// ESP_LOGI(TAG, "PKT_TYPE_SENSOR_SCD41_CO2");
-			update_sensor_data(SCD41_SENSOR_CO2, (p_data + 1));
-			break;
-		case PKT_TYPE_SENSOR_SGP40_TVOC_INDEX:
-			// ESP_LOGI(TAG, "PKT_TYPE_SENSOR_SGP40_TVOC_INDEX");
-			update_sensor_data(SGP40_SENSOR_TVOC, (p_data + 1));
-			break;
-		case PKT_TYPE_SENSOR_SHT41_TEMP:
-			ESP_LOGI(TAG, "PKT_TYPE_SENSOR_SHT41_TEMP"); // Not Used
-			update_sensor_data(SHT41_SENSOR_TEMP, (p_data + 1));
-			break;
-			/*SHT41*/
-		case PKT_TYPE_SENSOR_SHT41_HUMIDITY:
-			// ESP_LOGI(TAG, "PKT_TYPE_SENSOR_SHT41_HUMIDITY");
-			update_sensor_data(SHT41_SENSOR_HUMIDITY, (p_data + 1));
-			break;
+
 		default:
 			// Handle unknown packet type
 			break;

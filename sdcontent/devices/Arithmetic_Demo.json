@@ -1,0 +1,44 @@
+{
+  "device_name": "Arithmetic Demo",
+  "medium": "test",
+  "enabled": true,
+  "dev_addr": "AABBCCDD",
+  "keys": {},
+  "decoder": "TEST_ARITHMETIC",
+  "virtual_decoder": {
+    "sum_example": {
+      "source_keys": ["value_a", "value_b", "value_c"],
+      "calculation": "sum",
+      "unit": "units"
+    },
+    "average_example": {
+      "source_keys": ["value_a", "value_b", "value_c"],
+      "calculation": "average",
+      "unit": "units"
+    },
+    "subtract_example": {
+      "source_keys": ["value_a", "value_b"],
+      "calculation": "subtract",
+      "unit": "units"
+    },
+    "multiply_example": {
+      "source_keys": ["value_a", "value_b"],
+      "calculation": "multiply",
+      "unit": "units²"
+    },
+    "divide_example": {
+      "source_keys": ["value_a", "value_b"],
+      "calculation": "divide",
+      "unit": "ratio"
+    },
+    "complex_expression": {
+      "source_keys": ["sum_example", "multiply_example"],
+      "calculation": "subtract",
+      "unit": "combined"
+    }
+  },
+  "display_config": {
+    "unit_system": "metric",
+    "volume_unit": "m3"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "version": "1.0.0",
+  "description": "Custom English unit names for SenseCAP Cistern Extension. Overrides builtin English names where specified.",
+  "quantity_types": {
+    "length": {
+      "units": {
+        "m": { "name": "Meter" }  // Builtin already has "Meter", this is just an example
+      }
+    }
+  },
+  "notes": {
+    "purpose": "This file can contain custom English unit names to override the builtin ones. Empty or not present = use builtin.",
+    "example": "Add custom names here if you prefer different terminology (e.g., 'Metre' instead of 'Meter')"
+  }
+}

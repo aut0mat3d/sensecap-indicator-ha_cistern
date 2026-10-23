@@ -1,0 +1,135 @@
+{
+  "format": "IPSO_TLV",
+  "fport_config": [
+    {
+      "fport": 13,
+      "encryption": "partial",
+      "cipher_offset": 1,
+      "key": "app_skey",
+      "payload_offset": 1
+    }
+  ],
+  "commands": {
+    "reboot": {
+      "fport": 85,
+      "raw_hex": "FF10FF"
+    },
+    "read_status": {
+      "fport": 85,
+      "raw_hex": "FF28FF"
+    },
+    "set_report_interval": {
+      "fport": 85,
+      "prefix": "FF03",
+      "datatype": "uint16_le",
+      "unit": "seconds",
+      "default_val": 120
+    }
+  },
+  "reactions": [
+    {
+      "trigger": {
+        "fport": 228,
+        "raw_prefix": "0x55",
+        "encrypted": false
+      },
+      "action": {
+        "command": "read_status",
+        "timing_mode": "rx1_exact",
+        "max_retries": 3
+      }
+    }
+  ],
+  "mappings": [
+    {
+      "fport": 0,
+      "channel": "0x01",
+      "type": "0x75",
+      "key": "battery_soc",
+      "unit": "%",
+      "datatype": "uint8",
+      "target_type": "float",
+      "context": "diagnostic",
+      "corr_factor": 1.0,
+      "store_longterm": true,
+      "store_roundtrip": true,
+      "roundtrip_interval_sec": 3600,
+      "tolerance_sec": 15
+    },
+    {
+      "fport": 0,
+      "channel": "0x03",
+      "type": "0x77",
+      "key": "depth",
+      "unit": "cm",
+      "target_unit": "cm",
+      "datatype": "uint16_le",
+      "target_type": "float",
+      "context": "measurement",
+      "corr_factor": 1.0,
+      "store_longterm": true,
+      "store_roundtrip": true,
+      "roundtrip_interval_sec": 300,
+      "tolerance_sec": 15
+    },
+    {
+      "fport": 0,
+      "channel": "0x20",
+      "type": "0xCE",
+      "key": "history_depth",
+      "unit": "cm",
+      "datatype": "ipso_history",
+      "context": "history"
+    },
+    {
+      "fport": 0,
+      "channel": "0xFF",
+      "type": "0x01",
+      "key": "ipso_version",
+      "unit": "",
+      "datatype": "uint8",
+      "target_type": "int",
+      "context": "diagnostic"
+    },
+    {
+      "fport": 0,
+      "channel": "0xFF",
+      "type": "0x09",
+      "key": "hardware_version",
+      "unit": "",
+      "datatype": "uint16_le",
+      "target_type": "hex",
+      "context": "diagnostic"
+    },
+    {
+      "fport": 0,
+      "channel": "0xFF",
+      "type": "0x0A",
+      "key": "firmware_version",
+      "unit": "",
+      "datatype": "uint16_le",
+      "target_type": "hex",
+      "context": "diagnostic"
+    },
+    {
+      "fport": 0,
+      "channel": "0xFF",
+      "type": "0x0B",
+      "key": "device_status",
+      "unit": "",
+      "datatype": "uint8",
+      "target_type": "int",
+      "context": "diagnostic"
+    },
+    {
+      "fport": 0,
+      "channel": "0xFF",
+      "type": "0x16",
+      "key": "serial_number",
+      "unit": "",
+      "datatype": "bytes_8",
+      "target_type": "hex",
+      "context": "diagnostic"
+    }
+  ]
+}

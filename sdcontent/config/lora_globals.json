@@ -1,0 +1,16 @@
+{
+  "rf_frequency_hz": 868300000,
+  "rf_spreading_factor": 10,
+  "rf_bandwidth_khz": 125,
+  "rf_coding_rate": 5,
+  "rf_preamble_len": 8,
+  "sync_word": "0x34",
+  "p2p_mesh": {
+    "enabled": true,
+    "device_id": "AUTO",
+    "network_id": "0x1A1F",
+    "aes_key": "00112233445566778899AABBCCDDEEFF",
+    "retransmit_interval_ms": 1500,
+    "broadcast_ttl": 2
+  }
+}

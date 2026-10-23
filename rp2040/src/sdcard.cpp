@@ -4,6 +4,8 @@
  */
 
 #include "sdcard.hpp"
+#include "littlefs_buffer.hpp"
+#include "littlefs_driver.hpp"
 #include <ArduinoJson.h>
 
 /* Extern global PacketSerial instance defined in main.cpp */
@@ -81,6 +83,11 @@ static char g_expected_label[12] = "SCAP_UNK";
 
 /* Card Detect ISR Variable */
 static volatile bool g_sd_card_event_triggered = false;
+/* Card Detect Hardware Debounce Variables */
+static volatile bool     g_sd_card_edge_detected = false;
+static volatile uint32_t g_sd_last_edge_ms = 0;
+static int8_t            g_last_pushed_state = -99;
+static uint8_t           g_last_pushed_present = 255;
 
 /* Non-blocking Format State Machine Variables */
 typedef enum {
@@ -123,9 +130,9 @@ static void msc_flush_cb(void) {
 /* ── Card Detect Hardware ISR ──────────────────────────────────────────── */
 
 static void gpio7_sd_detect_isr(void) {
-    g_sd_card_event_triggered = true;
+    g_sd_card_edge_detected = true;
+    g_sd_last_edge_ms = millis();
 }
-
 /* ── MBR & VBR Low-Level Patch Helpers ─────────────────────────────────── */
 
 static bool write_custom_mbr(uint32_t p1_start, uint32_t p1_size) {
@@ -335,6 +342,11 @@ void sd_card_msc_toggle(bool enable) {
 
     /* Push updated MSC state immediately to ESP32 */
     g_sd_card_event_triggered = true;
+
+    /* Flush pending sensor records buffered in RAM while PC held exclusive SD lock */
+    if (!enable && littlefs_driver_is_mounted()) {
+        littlefs_buffer_flush_all();
+    }
 }
 
 void sd_card_get_info(uint8_t &is_present, uint8_t &is_usb_mounted, int8_t &state, uint32_t &capacity_mb, char* volume_label) {
@@ -342,6 +354,10 @@ void sd_card_get_info(uint8_t &is_present, uint8_t &is_usb_mounted, int8_t &stat
 
     /* 1. Hardware Pin Check ALWAYS comes first (GPIO 7) */
     if (digitalRead(SD_PIN_DET) != LOW) {
+        /* Safety: Unmount LittleFS immediately so write routines know SD is gone */
+        if (g_sd_initialized || littlefs_driver_is_mounted()) {
+            littlefs_driver_unmount();
+        }
         g_sd_initialized = false;
         is_present = 0;
         is_usb_mounted = 0;
@@ -463,12 +479,18 @@ void sd_card_get_info(uint8_t &is_present, uint8_t &is_usb_mounted, int8_t &stat
         }
     }
 
+    /* Mount & verify LittleFS on Partition 2 */
+    bool p2_lfs_valid = false;
     if (label_matches && p2_mbr_valid) {
-        state = SD_STATE_VALID_FAT32_LFS; /* 3 */
-    } else if (label_matches) {
-        state = SD_STATE_VALID_FAT32;     /* 2 */
+        p2_lfs_valid = littlefs_driver_is_mounted() || littlefs_driver_mount();
+    }
+
+    if (label_matches && p2_mbr_valid && p2_lfs_valid) {
+        state = SD_STATE_VALID_FAT32_LFS; /* 3: Beide Partitionen voll verifiziert & bereit! */
+    } else if (label_matches && p2_mbr_valid) {
+        state = SD_STATE_VALID_FAT32;     /* 2: FAT32 passt, LittleFS noch unformatiert */
     } else {
-        state = SD_STATE_MISMATCH;        /* 0 */
+        state = SD_STATE_MISMATCH;        /* 0: Fremde Karte oder ungültiges Label */
     }
 }
 
@@ -488,11 +510,10 @@ bool sd_card_format_start(uint8_t format_type, const char* new_label) {
 /* ── Non-Blocking State Machine Executed in loop1() ────────────────────── */
 
 void sd_card_update(PacketSerial &packetSerial) {
-    /* 1. Handle Card-Detect Hardware Interrupt Events & Boot Sync */
-    static NonBlockingDelay debounce_delay(150);
-    if (g_sd_card_event_triggered) {
-        if (debounce_delay.check()) {
-            g_sd_card_event_triggered = false;
+    /* 1. Trailing-Edge Debouncing */
+    if (g_sd_card_edge_detected) {
+        if (millis() - g_sd_last_edge_ms >= 300) {
+            g_sd_card_edge_detected = false;
 
             uint8_t present = 0, usb_mounted = 0;
             int8_t state = SD_STATE_UNCHECKED;
@@ -501,19 +522,24 @@ void sd_card_update(PacketSerial &packetSerial) {
 
             sd_card_get_info(present, usb_mounted, state, capacity_mb, volume_label);
 
-            uint8_t res_buf[24] = {0};
-            res_buf[0] = static_cast<uint8_t>(PKT_TYPE_RES_SD_INFO);
-            res_buf[1] = present;
-            res_buf[2] = usb_mounted;
-            res_buf[3] = static_cast<uint8_t>(state);
-            memcpy(&res_buf[4], &capacity_mb, sizeof(capacity_mb));
-            memcpy(&res_buf[8], volume_label, 11);
+            if (state != g_last_pushed_state || present != g_last_pushed_present) {
+                g_last_pushed_state = state;
+                g_last_pushed_present = present;
 
-            packetSerial.send(res_buf, 19);
-            Serial.printf("SD Card Event Pushed! State: %d, Label: %s\r\n", state, volume_label);
-        
-            /* Signal main loop to reload LoRa config files from SD */
-            g_config_reload_pending = true;
+                uint8_t res_buf[24] = {0};
+                res_buf[0] = static_cast<uint8_t>(PKT_TYPE_RES_SD_INFO);
+                res_buf[1] = present;
+                res_buf[2] = usb_mounted;
+                res_buf[3] = static_cast<uint8_t>(state);
+                memcpy(&res_buf[4], &capacity_mb, sizeof(capacity_mb));
+                memcpy(&res_buf[8], volume_label, 11);
+
+                packetSerial.send(res_buf, 19);
+                Serial.printf("SD Card Event Pushed! State: %d, Label: %s\r\n", state, volume_label);
+
+                /* Signal main loop to reload LoRa config files from SD */
+                g_config_reload_pending = true;
+            }
         }
     }
 
@@ -540,25 +566,27 @@ void sd_card_update(PacketSerial &packetSerial) {
 
     switch (g_fmt_state) {
         case FMT_START:
-            Serial.printf("SD Format: Starting machine for type=%d, label=%s\r\n", g_fmt_type, g_fmt_target_label);
-            
-            if (!g_sd_initialized) {
-                sd_card_init();
-            }
+         Serial.printf("SD Format: Starting machine for type=%d, label=%s\r\n", g_fmt_type, g_fmt_target_label);
 
-            if (g_usb_msc_active) {
-                usb_msc.setUnitReady(false);
-                g_usb_msc_active = false;
-            }
-            
-            g_fmt_step_start_ms = millis();
-            if (g_fmt_type == 0) {
-                Serial.println("I am not implemented yet, hence: \r\n  we have to implement LittleFS first ;)\r\n");
-                g_fmt_state = FMT_SUCCESS;
-            } else {
-                g_fmt_state = FMT_WRITE_INITIAL_MBR;
-            }
-            break;
+         if (!g_sd_initialized) {
+             sd_card_init();
+         }
+
+         if (g_usb_msc_active) {
+             usb_msc.setUnitReady(false);
+             g_usb_msc_active = false;
+         }
+
+         g_fmt_step_start_ms = millis();
+         if (g_fmt_type == 0) {
+             /* Format LittleFS Partition 2 directly */
+             Serial.println("[SD_FORMAT] Formatting LittleFS partition 2...");
+             bool ok = littlefs_driver_format();
+             g_fmt_state = ok ? FMT_SUCCESS : FMT_ERROR;
+         } else {
+             g_fmt_state = FMT_WRITE_INITIAL_MBR;
+         }
+         break;
 
         case FMT_WRITE_INITIAL_MBR:
             Serial.println("SD Format Step 1: Writing initial MBR at Sector 0...\r\n");
@@ -646,22 +674,27 @@ void sd_card_update(PacketSerial &packetSerial) {
         }
 
         case FMT_CREATE_HANDSHAKE_FILE: {
-            Serial.println("SD Format Step 5: Creating /.volume_label file...\r\n");
-            FatFile label_file;
-            g_fmt_step_start_ms = millis();
-            if (label_file.open("/.volume_label", O_WRITE | O_CREAT | O_TRUNC)) {
-                label_file.write(g_fmt_target_label, strlen(g_fmt_target_label));
-                label_file.close();
-                sd.card()->syncDevice();
-                sd_card_set_expected_label(g_fmt_target_label);
-                g_fmt_step_start_ms = millis();
-                g_fmt_state = FMT_VERIFY;
-            } else {
-                Serial.println("SD Format Error: Failed to create /.volume_label file!\r\n");
-                g_fmt_state = FMT_ERROR;
-            }
-            break;
-        }
+         Serial.println("SD Format Step 5: Creating /.volume_label file...\r\n");
+         FatFile label_file;
+         g_fmt_step_start_ms = millis();
+         if (label_file.open("/.volume_label", O_WRITE | O_CREAT | O_TRUNC)) {
+             label_file.write(g_fmt_target_label, strlen(g_fmt_target_label));
+             label_file.close();
+             sd.card()->syncDevice();
+             sd_card_set_expected_label(g_fmt_target_label);
+
+             /* Format Partition 2 with LittleFS structure */
+             Serial.println("SD Format Step 5b: Formatting LittleFS Partition 2...\r\n");
+             littlefs_driver_format();
+
+             g_fmt_step_start_ms = millis();
+             g_fmt_state = FMT_VERIFY;
+         } else {
+             Serial.println("SD Format Error: Failed to create /.volume_label file!\r\n");
+             g_fmt_state = FMT_ERROR;
+         }
+         break;
+     }
 
         case FMT_VERIFY: {
             Serial.println("SD Format Step 6: Verifying format integrity...\r\n");

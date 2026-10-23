@@ -28,4 +28,6 @@
 
 #include "ha.h"
 
+#include "cistern_view.h"
+
 #endif /*INDICATOR_INCLUDES_H*/

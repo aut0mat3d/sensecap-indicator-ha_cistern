@@ -1,0 +1,47 @@
+{
+  "format": "PACKED_BINARY",
+  "mappings": [
+    {
+      "fport": 0,
+      "key": "SCD41_CO2",
+      "unit": "ppm",
+      "target_unit": "ppm",
+      "datatype": "uint16_le",
+      "target_type": "float",
+      "context": "measurement",
+      "corr_factor": 1.0,
+      "store_longterm": true,
+      "store_roundtrip": false,
+      "roundtrip_interval_sec": 0,
+      "tolerance_sec": 0
+    },
+    {
+      "fport": 0,
+      "key": "SCD41_TEMP",
+      "unit": "°C",
+      "target_unit": "°C",
+      "datatype": "float_le",
+      "target_type": "float",
+      "context": "measurement",
+      "corr_factor": 1.0,
+      "store_longterm": true,
+      "store_roundtrip": false,
+      "roundtrip_interval_sec": 0,
+      "tolerance_sec": 0
+    },
+    {
+      "fport": 0,
+      "key": "SCD41_HUMIDITY",
+      "unit": "%",
+      "target_unit": "%",
+      "datatype": "float_le",
+      "target_type": "float",
+      "context": "measurement",
+      "corr_factor": 1.0,
+      "store_longterm": true,
+      "store_roundtrip": false,
+      "roundtrip_interval_sec": 0,
+      "tolerance_sec": 0
+    }
+  ]
+}

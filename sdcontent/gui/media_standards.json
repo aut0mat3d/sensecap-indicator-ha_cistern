@@ -1,0 +1,51 @@
+{
+  "media_types": {
+    "water": {
+      "name_en": "Water",
+      "name_de": "Wasser",
+      "color_hex": "0x3498DB",
+      "unit_default": "m3"
+    },
+    "wastewater_grey": {
+      "name_en": "Greywater",
+      "name_de": "Grauwasser",
+      "color_hex": "0x5B7B88",
+      "unit_default": "m3"
+    },
+    "wastewater_black": {
+      "name_en": "Blackwater",
+      "name_de": "Schwarzwasser",
+      "color_hex": "0x5D4037",
+      "unit_default": "m3"
+    },
+    "oil": {
+      "name_en": "Fuel Oil / Diesel",
+      "name_de": "Heizoel / Diesel",
+      "color_hex": "0xF39C12",
+      "unit_default": "l"
+    },
+    "lpg": {
+      "name_en": "LPG / Propane",
+      "name_de": "Fluessiggas / Propan",
+      "color_hex": "0xD35400",
+      "unit_default": "l"
+    },
+    "pellets": {
+      "name_en": "Wood Pellets",
+      "name_de": "Holzpellets",
+      "color_hex": "0xD4AC0D",
+      "unit_default": "kg"
+    }
+  },
+  "physical_domains": {
+    "electricity": {
+      "voltage": { "unit": "V", "color_hex": "0x2980B9" },
+      "current": { "unit": "A", "color_hex": "0xE74C3C" },
+      "active_power": { "unit": "W", "color_hex": "0x2ECC71" }
+    },
+    "compressed_air": {
+      "pressure": { "unit": "bar", "color_hex": "0xE67E22" },
+      "flow_rate": { "unit": "l/min", "color_hex": "0x1ABC9C" }
+    }
+  }
+}

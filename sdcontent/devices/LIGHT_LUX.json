@@ -1,0 +1,14 @@
+{
+  "device_name": "Light Sensor",
+  "medium": "environment",
+  "enabled": true,
+  "dev_addr": "0x48",
+  "decoder": "LIGHT_LUX",
+  "offsets": {
+    "LIGHT_LUX": {"value": 0, "unit": "lux"}
+  },
+  "virtual_decoder": {},
+  "display_config": {
+    "unit_system": "metric"
+  }
+}

@@ -63,45 +63,23 @@ enum pkt_type {
     PKT_TYPE_CMD_SD_FORMAT        = 0x32,  /* Request format (0=LittleFS, 1=Full SD) */
     PKT_TYPE_RES_SD_FORMAT        = 0x33,  /* Response: success (uint8_t) */
     PKT_TYPE_CMD_USB_MSC_TOGGLE   = 0x34,  /* Toggle USB Mass Storage Mode */
+
     PKT_TYPE_CMD_LORA_RAW_FRAME   = 0x36,  /* Payload: DevAddr(4B) + RSSI(2B) + SNR(1B) + Size(1B) + Payload(NB) */
     PKT_TYPE_CMD_SET_TIME_CFG     = 0x37, /* Payload: posix_tz[64] + time_format[8] */
-
-    /* Telemetry & Sensor Data Packets */
-    PKT_TYPE_SENSOR_SCD41_CO2        = 0xB2,
-    PKT_TYPE_SENSOR_SHT41_TEMP       = 0xB3,
-    PKT_TYPE_SENSOR_SHT41_HUMIDITY   = 0xB4,
-    PKT_TYPE_SENSOR_SGP40_TVOC_INDEX = 0xB5,
-    PKT_TYPE_SENSOR_LIGHT_LUX        = 0xB6,
+    PKT_TYPE_CMD_READ_FILE        = 0x38, /* Payload: path string (null-terminated) */
+    PKT_TYPE_RES_FILE_DATA        = 0x39, /* Payload: status(uint8_t: 0=Error/Not found, 1=Data) + length(uint16_t) + data[] */
+    PKT_TYPE_CMD_SYNC_TIME        = 0x3A, /* Payload: utc_ts(uint32_t, 4B) + flags(uint8_t, 1B) */
+    PKT_TYPE_CMD_GET_CHART_DATA   = 0x3B, /* Request: zone query from ESP32 */
+    PKT_TYPE_RES_CHART_DATA       = 0x3C, /* Response: packed array of chart_data_point_t */
+    PKT_TYPE_CMD_GET_TIME         = 0x3D, /* Request last saved UTC timestamp from LittleFS */
+    PKT_TYPE_RES_TIME             = 0x3E, /* Response: uint32_t last_utc */
 
     /* Dynamic Sensor Registry Packets */
-    PKT_TYPE_SENSOR_ATTACHED = 0xB8,
-    PKT_TYPE_SENSOR_DETACHED = 0xB9,
-    PKT_TYPE_SENSOR_VALUE    = 0xBA,
     PKT_TYPE_LORA_TELEMETRY  = 0xBB,  /* Payload: DevAddr(4B) + SensorID(1B) + FloatVal(4B) + Checksum(1B) */
+    PKT_TYPE_LOCAL_TELEMETRY = 0xBC,  /* Onboard and Grove I2C sensors */
 
 };
 
-/* Sensor IDs */
-#define PKT_SENSOR_ID_AHT20_TEMP     0
-#define PKT_SENSOR_ID_AHT20_HUMIDITY 1
-#define PKT_SENSOR_ID_SCD41_CO2      2
-#define PKT_SENSOR_ID_SGP40_VOC      3
-#define PKT_SENSOR_ID_LIGHT_LUX      6
-#define PKT_SENSOR_ID_GROVE_BASE     0x10
-
-/* Sensor Categories */
-#define PKT_SENSOR_CAT_TEMP     0
-#define PKT_SENSOR_CAT_HUMIDITY 1
-#define PKT_SENSOR_CAT_CO2      2
-#define PKT_SENSOR_CAT_VOC      3
-#define PKT_SENSOR_CAT_LIGHT    4
-
-/* Protocol transmission helpers */
-void sensor_data_send(PacketSerial& packetSerial, enum pkt_type type, float data);
-void sensor_attached_send(PacketSerial& packetSerial, uint8_t id, uint8_t category, const char* name, const char* unit);
-void sensor_detached_send(PacketSerial& packetSerial, uint8_t id);
-void sensor_value_send(PacketSerial& packetSerial, uint8_t id, float data);
-void lora_telemetry_send(PacketSerial& packetSerial, uint32_t dev_addr, uint8_t id, float data);
 
 /* Sensor Data Structures */
 typedef struct {
@@ -128,7 +106,6 @@ typedef struct {
 /* Non-blocking Sensor Auto-Detection & Drivers */
 void sensor_power_on(void);
 void sensor_power_off(void);
-void sensor_i2c_auto_detect(PacketSerial& packetSerial);
 
 void sensor_aht_init(void);
 bool sensor_aht_get(AHTData& data);
