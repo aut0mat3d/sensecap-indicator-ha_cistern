@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include "chart_query_scheduler.h"
 
 static const char *TAG = "cistern-view";
 
@@ -39,45 +40,18 @@ static lv_obj_t         *s_view_parent = NULL;
 static lv_timer_t       *s_clock_timer = NULL;
 static esp_event_handler_instance_t s_telemetry_handler = NULL;
 
+/* Subscription handles for chart query scheduler (Zone 0: 7d, Zone 1: 24h, Zone 2: 55m) */
+static int8_t s_zone_subs[3] = {-1, -1, -1};
+
 /* State flags */
 static bool   s_initial_chart_loaded = false;
 static time_t s_last_rx_time = 0;
-
 
 void horiz_bargraph_clear_all(horiz_bargraph_t *graph) {
     if (!graph || !graph->chart) return;
     for (uint8_t z = 0; z < graph->zone_count; z++) {
         horiz_bargraph_update_zone_data(graph, z, NULL, 0);
     }
-}
-
-/* ── Asynchronous Archive Queries & Callbacks ──────────────────────────── */
-
-static void cistern_request_all_zones(void) {
-    time_t now = time(NULL);
-    if (now < 1700000000UL) return;
-
-    float alarm_min = CISTERN_ALARM_MIN_CM;
-    float alarm_max = 0.0f; /* Disabled */
-
-    ESP_LOGI(TAG, "Triggering chart queries for 3 zones at UTC=%lu...", (unsigned long)now);
-
-    /* Zone 0: -7d to -1d -> 7 daily points from daily.csv (step = 86400s) */
-    rp2040_request_chart_data(0, CISTERN_DEV_ADDR, CISTERN_KEY_DEPTH,
-                              (uint32_t)(now - (7 * 86400)), (uint32_t)now,
-                              86400, 7, alarm_min, alarm_max);
-
-    /* Zone 1: -24h to -0h -> 12 2-hour points from hourly.csv (step = 7200s) */
-    rp2040_request_chart_data(1, CISTERN_DEV_ADDR, CISTERN_KEY_DEPTH,
-                              (uint32_t)(now - (12 * 7200)), (uint32_t)now,
-                              7200, 12, alarm_min, alarm_max);
-
-    /* Zone 2: 11 completed 5-minute points ending at last closed bucket (step = 300s)
-     * Subtract 300s from now so we query closed intervals, leaving the current open interval to Zone 3 (live bar) */
-    uint32_t last_closed_bucket = (uint32_t)(now - (now % 300));
-    rp2040_request_chart_data(2, CISTERN_DEV_ADDR, CISTERN_KEY_DEPTH,
-                              last_closed_bucket - (11 * 300), last_closed_bucket,
-                              300, 11, alarm_min, alarm_max);
 }
 
 static void cistern_update_last_rx_ui(time_t rx_ts) {
@@ -91,77 +65,7 @@ static void cistern_update_last_rx_ui(time_t rx_ts) {
     }
 }
 
-/**
- * @brief Dispatch incoming historical data packet from RP2040 into target zone.
- */
-/**
- * @brief Dispatch incoming historical data packet from RP2040 into target zone.
- */
-static void cistern_chart_data_callback(uint8_t req_id, uint8_t status, uint32_t actual_interval,
-                                        const chart_data_point_t *points, uint16_t count) {
-    const char *zone_names[] = { "Zone 0 (7 Tage)", "Zone 1 (24 Std)", "Zone 2 (55 Min)" };
-    const char *z_name = (req_id < 3) ? zone_names[req_id] : "Zone ?";
-
-    ESP_LOGI(TAG, "── UART RX: %s (status=%u, step=%lu s, count=%u) ──",
-             z_name, status, (unsigned long)actual_interval, count);
-
-    if (status == 0 && points && count > 0) {
-        for (uint16_t i = 0; i < count; i++) {
-            const chart_data_point_t *p = &points[i];
-            time_t pt_ts = (time_t)p->timestamp;
-            struct tm tm_buf;
-            localtime_r(&pt_ts, &tm_buf);
-
-            char flag_str[32] = "";
-            if (p->flags & DATA_FLAG_NO_DATA) {
-                strcat(flag_str, "[NO_DATA/GAP] ");
-            } else {
-                if (p->flags & DATA_FLAG_ESTIMATED) strcat(flag_str, "[ESTIMATED] ");
-                if (p->flags & DATA_FLAG_AVERAGED)  strcat(flag_str, "[AVERAGED] ");
-                if (p->flags & DATA_FLAG_ALARM_DANGER) strcat(flag_str, "[ALARM] ");
-                if (p->flags == 0) strcat(flag_str, "[REAL] ");
-            }
-
-            ESP_LOGI(TAG, "  Slot [%02u] %02d.%02d. %02d:%02d:%02d UTC=%lu -> Val: %6.2f | Flags: 0x%02X %s",
-                     i, tm_buf.tm_mday, tm_buf.tm_mon + 1, tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec,
-                     (unsigned long)p->timestamp, p->value, p->flags, flag_str);
-        }
-
-        horiz_bargraph_update_zone_data(&s_horiz_graph, req_id, points, count);
-        s_initial_chart_loaded = true;
-
-        /* Slick GUI: If no live packet arrived yet, restore depth & timestamp from roundtrip archive */
-        if (req_id == 2 && s_last_rx_time == 0) {
-            int valid_idx = -1;
-            /* Search backwards for the newest point that is NOT a gap */
-            for (int k = (int)count - 1; k >= 0; k--) {
-                if (!(points[k].flags & DATA_FLAG_NO_DATA)) {
-                    valid_idx = k;
-                    break;
-                }
-            }
-
-            if (valid_idx >= 0) {
-                const chart_data_point_t *last_pt = &points[valid_idx];
-                bool is_est = (last_pt->flags & DATA_FLAG_ESTIMATED) != 0;
-                bool is_alarm = (last_pt->flags & (DATA_FLAG_ALARM_DANGER | DATA_FLAG_ALARM_WARN)) != 0;
-
-                vert_graph_update_value(&s_vert_graph, last_pt->value, "cm", is_est, is_alarm);
-                text_widget_update_binding(&s_text_widget, "depth", last_pt->value, "cm", is_est, is_alarm);
-
-                /* Initialize Zone 3 immediately with latest valid archive point */
-                horiz_bargraph_update_zone_data(&s_horiz_graph, 3, last_pt, 1);
-
-                s_last_rx_time = (time_t)last_pt->timestamp;
-                cistern_update_last_rx_ui(s_last_rx_time);
-                ESP_LOGI(TAG, "Restored latest depth from archive: %.2f cm (ts: %lu, slot: %d)", 
-                         last_pt->value, (unsigned long)last_pt->timestamp, valid_idx);
-            }
-        }
-    }
-}
-
-/* ── Autonomous 1-Second Timer Callback ────────────────────────────────── */
+/* ── Autonomous 1-Second Timer Callback (Clock & Handshake Check) ──────── */
 
 static void cistern_clock_timer_cb(lv_timer_t *timer) {
     time_t now = time(NULL);
@@ -175,24 +79,71 @@ static void cistern_clock_timer_cb(lv_timer_t *timer) {
                  tm_info.tm_mday, tm_info.tm_mon + 1, tm_info.tm_year + 1900,
                  tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec);
         gui_footer_set_left_text(date_buf);
-
-        /* 2. Autonomous Polling: Query archives */
-        static uint16_t poll_div = 0;
-        if (!s_initial_chart_loaded) {
-            /* Try every 3 seconds until initial historical data arrives */
-            if (poll_div++ % 3 == 0) {
-                ESP_LOGI(TAG, "Polling chart archives from RP2040 (retry)...");
-                cistern_request_all_zones();
-            }
-        } else {
-            /* Periodic fallback refresh: query every 5 minutes (300s) */
-            if (++poll_div >= 300) {
-                poll_div = 0;
-                cistern_request_all_zones();
-            }
-        }
     } else {
         gui_footer_set_left_text("Warte auf Zeitsync...");
+    }
+
+    /* 2. Check for completed chart archive responses via non-blocking handshake */
+    const char *zone_names[] = { "Zone 0 (7 Tage)", "Zone 1 (24 Std)", "Zone 2 (55 Min)" };
+    for (uint8_t z = 0; z < 3; z++) {
+        if (s_zone_subs[z] >= 0 && chart_query_scheduler_is_data_ready(s_zone_subs[z])) {
+            chart_data_point_t pts[32];
+            uint16_t count = 0;
+            if (chart_query_scheduler_consume_data(s_zone_subs[z], pts, 32, &count)) {
+                ESP_LOGI(TAG, "── UART RX: %s (count=%u) ──", zone_names[z], count);
+
+                for (uint16_t i = 0; i < count; i++) {
+                    const chart_data_point_t *p = &pts[i];
+                    time_t pt_ts = (time_t)p->timestamp;
+                    struct tm tm_buf;
+                    localtime_r(&pt_ts, &tm_buf);
+
+                    char flag_str[32] = "";
+                    if (p->flags & DATA_FLAG_NO_DATA) {
+                        strcat(flag_str, "[NO_DATA/GAP] ");
+                    } else {
+                        if (p->flags & DATA_FLAG_ESTIMATED) strcat(flag_str, "[ESTIMATED] ");
+                        if (p->flags & DATA_FLAG_AVERAGED)  strcat(flag_str, "[AVERAGED] ");
+                        if (p->flags & DATA_FLAG_ALARM_DANGER) strcat(flag_str, "[ALARM] ");
+                        if (p->flags == 0) strcat(flag_str, "[REAL] ");
+                    }
+
+                    ESP_LOGI(TAG, "  Slot [%02u] %02d.%02d. %02d:%02d:%02d UTC=%lu -> Val: %6.2f | Flags: 0x%02X %s",
+                             i, tm_buf.tm_mday, tm_buf.tm_mon + 1, tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec,
+                             (unsigned long)p->timestamp, p->value, p->flags, flag_str);
+                }
+
+                horiz_bargraph_update_zone_data(&s_horiz_graph, z, pts, count);
+                s_initial_chart_loaded = true;
+
+                /* Cold-start restore: restore depth and timestamp from newest non-gap point of Zone 2 */
+                if (z == 2 && s_last_rx_time == 0) {
+                    int valid_idx = -1;
+                    for (int k = (int)count - 1; k >= 0; k--) {
+                        if (!(pts[k].flags & DATA_FLAG_NO_DATA)) {
+                            valid_idx = k;
+                            break;
+                        }
+                    }
+
+                    if (valid_idx >= 0) {
+                        const chart_data_point_t *last_pt = &pts[valid_idx];
+                        bool is_est = (last_pt->flags & DATA_FLAG_ESTIMATED) != 0;
+                        bool is_alarm = (last_pt->flags & (DATA_FLAG_ALARM_DANGER | DATA_FLAG_ALARM_WARN)) != 0;
+
+                        vert_graph_update_value(&s_vert_graph, last_pt->value, "cm", is_est, is_alarm);
+                        text_widget_update_binding(&s_text_widget, "depth", last_pt->value, "cm", is_est, is_alarm);
+
+                        horiz_bargraph_update_zone_data(&s_horiz_graph, 3, last_pt, 1);
+
+                        s_last_rx_time = (time_t)last_pt->timestamp;
+                        cistern_update_last_rx_ui(s_last_rx_time);
+                        ESP_LOGI(TAG, "Restored latest depth from archive: %.2f cm (ts: %lu, slot: %d)", 
+                                 last_pt->value, (unsigned long)last_pt->timestamp, valid_idx);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -239,9 +190,8 @@ static void cistern_telemetry_event_handler(void *handler_args, esp_event_base_t
     /* 2. Update Text Card (6x5) */
     text_widget_update_binding(&s_text_widget, telem->key, val, telem->unit, is_estimated, is_alarm);
 
-    /* 3. Primary depth sensor updates: Vertical bar, Live-Slot (Zone 3), and Chart refresh */
+    /* 3. Primary depth sensor updates: Vertical bar and Live-Slot (Zone 3) only */
     if (is_depth) {
-        /* Update Vertical Level Bar (4x5) */
         vert_graph_update_value(&s_vert_graph, val, telem->unit, is_estimated, is_alarm);
 
         /* Update Live-Bargraph in Zone 3 (most-right bar) ONLY for depth */
@@ -254,9 +204,6 @@ static void cistern_telemetry_event_handler(void *handler_args, esp_event_base_t
         if (is_estimated) live_pt.flags |= DATA_FLAG_ESTIMATED;
 
         horiz_bargraph_update_zone_data(&s_horiz_graph, 3, &live_pt, 1);
-
-        /* Refresh historical chart zones from RP2040 */
-        cistern_request_all_zones();
     }
 
     /* 4. Record last telemetry reception timestamp and update 5th row */
@@ -346,15 +293,24 @@ int cistern_view_init(void) {
     horiz_bargraph_clear_all(&s_horiz_graph);
     s_initial_chart_loaded = false;
 
-    /* Register UART callback for chart data responses */
-    rp2040_register_chart_data_callback(cistern_chart_data_callback);
+    /* Register subscriptions in chart_query_scheduler */
+    s_zone_subs[0] = chart_query_scheduler_subscribe(CISTERN_DEV_ADDR, CISTERN_KEY_DEPTH, 0, 86400, 7, 0.0f, CISTERN_MAX_DEPTH_CM);
+    s_zone_subs[1] = chart_query_scheduler_subscribe(CISTERN_DEV_ADDR, CISTERN_KEY_DEPTH, 1, 7200, 12, 0.0f, CISTERN_MAX_DEPTH_CM);
+    s_zone_subs[2] = chart_query_scheduler_subscribe(CISTERN_DEV_ADDR, CISTERN_KEY_DEPTH, 2, 300, 11, 0.0f, CISTERN_MAX_DEPTH_CM);
+
+    /* Activate subscriptions for this view */
+    for (int i = 0; i < 3; i++) {
+        if (s_zone_subs[i] >= 0) {
+            chart_query_scheduler_set_active(s_zone_subs[i], true);
+        }
+    }
 
     /* 3. Register Event Listener for LoRa Telemetry */
     esp_event_handler_instance_register_with(
         view_event_handle, VIEW_EVENT_BASE, VIEW_EVENT_LORA_TELEMETRY,
         cistern_telemetry_event_handler, NULL, &s_telemetry_handler);
 
-    /* 4. Start 1-Second Autonomous Timer (Clock + Autonomous Initial Polling) */
+    /* 4. Start 1-Second Autonomous Timer (Clock + Handshake polling) */
     s_clock_timer = lv_timer_create(cistern_clock_timer_cb, 1000, NULL);
 
     ESP_LOGI(TAG, "Cistern View initialized.");
@@ -367,7 +323,12 @@ void cistern_view_destroy(void) {
         s_clock_timer = NULL;
     }
 
-    rp2040_register_chart_data_callback(NULL);
+    /* Deactivate chart subscriptions */
+    for (int i = 0; i < 3; i++) {
+        if (s_zone_subs[i] >= 0) {
+            chart_query_scheduler_set_active(s_zone_subs[i], false);
+        }
+    }
 
     if (s_telemetry_handler) {
         esp_event_handler_instance_unregister_with(view_event_handle, VIEW_EVENT_BASE, 

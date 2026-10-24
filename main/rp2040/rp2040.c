@@ -17,6 +17,7 @@
 #include "sntp_service.h"
 #include "i18n.h"
 #include "gui/i18n/gui_i18n.h"
+#include "chart_query_scheduler.h"
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
@@ -365,6 +366,9 @@ static bool _packet_handle(uint8_t* p_data, size_t len) {
                 ESP_LOGI(TAG, "UART Rx: RES_CHART_DATA Zone %u: status=%u, count=%u, step=%lu s",
                          req_id, status, count, (unsigned long)actual_interval);
 
+                /* Forward directly into the FIFO scheduler */
+                chart_query_scheduler_on_response(req_id, status, actual_interval, count, pts);
+
                 if (s_chart_data_cb) {
                     s_chart_data_cb(req_id, status, actual_interval, pts, count);
                 }
@@ -427,6 +431,8 @@ static void esp32_rp2040_comm_task(void* arg) {
 #if SENSOR_COMM_DEBUG
 		ESP_LOGI(TAG, "len:%d", len);
 #endif
+        /* Drive serialized chart query FIFO queue and bucket triggers */
+        chart_query_scheduler_update();
 		if(len > 0)
 		{
 #if SENSOR_COMM_DEBUG
@@ -520,6 +526,7 @@ static void _commu_event_handler(void* handler_args, esp_event_base_t base, int3
 }
 
 void esp32_rp2040_init(void) {
+    chart_query_scheduler_init();
 	xTaskCreate(esp32_rp2040_comm_task, "esp32_rp2040_comm_task", ESP32_RP2040_COMM_TASK_STACK_SIZE,
 				NULL, 5, NULL);
 	ESP_ERROR_CHECK(esp_event_handler_instance_register_with(view_event_handle, VIEW_EVENT_BASE,
@@ -628,9 +635,9 @@ int rp2040_request_chart_data(uint8_t req_id, uint32_t dev_addr, const char *key
     if (ret.status == COBS_ENCODE_OK) {
         cobs_buf[ret.out_len] = 0x00;
         int written = uart_write_bytes(ESP32_COMM_PORT_NUM, cobs_buf, ret.out_len + 1);
-    /*    ESP_LOGI(TAG, "UART Tx: Req Chart Zone %u (key=%s, start=%lu, end=%lu, step=%lu s) -> %d bytes sent",
+        ESP_LOGI(TAG, "UART Tx: Req Chart Zone %u (key=%s, start=%lu, end=%lu, step=%lu s) -> %d bytes sent",
                  req_id, key ? key : "?", (unsigned long)start_ts, (unsigned long)end_ts, (unsigned long)interval_sec, written);
-      */
+      
         return written;
     }
     ESP_LOGE(TAG, "UART Tx: COBS encode failed for chart request");

@@ -73,6 +73,7 @@ enum pkt_type {
     PKT_TYPE_RES_CHART_DATA       = 0x3C, /* Response: packed array of chart_data_point_t */
     PKT_TYPE_CMD_GET_TIME         = 0x3D, /* Request last saved UTC timestamp from LittleFS */
     PKT_TYPE_RES_TIME             = 0x3E, /* Response: uint32_t last_utc */
+    
 
     /* Dynamic Sensor Registry Packets */
     PKT_TYPE_LORA_TELEMETRY  = 0xBB,  /* Payload: DevAddr(4B) + SensorID(1B) + FloatVal(4B) + Checksum(1B) */
