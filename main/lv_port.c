@@ -34,7 +34,8 @@ void lv_port_init(void)
     lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
     lvgl_cfg.task_priority = CONFIG_LCD_TASK_PRIORITY;
     lvgl_cfg.task_stack = LV_PORT_TASK_STACK_SIZE;
-    lvgl_cfg.task_affinity = -1;
+    lvgl_cfg.task_affinity = 1;
+    lvgl_cfg.task_priority = 6;
     lvgl_cfg.task_max_sleep_ms = LV_PORT_TASK_MAX_SLEEP_MS;
     lvgl_cfg.timer_period_ms = LV_PORT_TASK_DELAY_MS;
 
@@ -45,7 +46,7 @@ void lv_port_init(void)
 
 void lv_port_sem_take(void)
 {
-    lvgl_port_lock(0);
+    lvgl_port_lock(portMAX_DELAY);
 }
 
 void lv_port_sem_give(void)

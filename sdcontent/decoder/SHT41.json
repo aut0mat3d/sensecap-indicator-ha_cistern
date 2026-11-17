@@ -9,11 +9,7 @@
       "datatype": "float_le",
       "target_type": "float",
       "context": "measurement",
-      "corr_factor": 1.0,
-      "store_longterm": true,
-      "store_roundtrip": false,
-      "roundtrip_interval_sec": 0,
-      "tolerance_sec": 0
+      "corr_factor": 1.0
     },
     {
       "fport": 0,
@@ -23,11 +19,7 @@
       "datatype": "float_le",
       "target_type": "float",
       "context": "measurement",
-      "corr_factor": 1.0,
-      "store_longterm": true,
-      "store_roundtrip": false,
-      "roundtrip_interval_sec": 0,
-      "tolerance_sec": 0
+      "corr_factor": 1.0
     }
   ]
 }

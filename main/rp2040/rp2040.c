@@ -13,10 +13,12 @@
 #include "driver/uart.h"
 #include "view_data.h"
 #include "lora/lora_model.h"
+#include "alarm/alarm_model.h"
 #include "debug_log.h"
 #include "sntp_service.h"
 #include "i18n.h"
 #include "gui/i18n/gui_i18n.h"
+#include "media_standards.h"
 #include "chart_query_scheduler.h"
 #include <time.h>
 #include <stdlib.h>
@@ -46,6 +48,30 @@ static size_t s_file_rx_len = 0;
 static bool s_file_rx_success = false;
 
 static chart_data_callback_t s_chart_data_cb = NULL;
+static SemaphoreHandle_t s_uart_tx_mutex = NULL;
+
+static SemaphoreHandle_t s_thresh_req_sem = NULL;
+static bool s_thresh_req_success = false;
+
+static SemaphoreHandle_t s_offset_req_sem = NULL;
+static bool s_offset_req_success = false;
+
+
+/**
+ * @brief Thread-safe drop-in replacement for uart_write_bytes.
+ */
+static int _uart_write_safe(uart_port_t uart_num, const void *src, size_t size) {
+    if (!src || size == 0) return -1;
+    if (!s_uart_tx_mutex) {
+        return uart_write_bytes(uart_num, src, size);
+    }
+
+    xSemaphoreTake(s_uart_tx_mutex, portMAX_DELAY);
+    int written = uart_write_bytes(uart_num, src, size);
+    xSemaphoreGive(s_uart_tx_mutex);
+
+    return written;
+}
 
 void rp2040_register_chart_data_callback(chart_data_callback_t cb) {
     s_chart_data_cb = cb;
@@ -79,7 +105,7 @@ int rp2040_read_file_from_sd(const char *path, char *out_buf, size_t max_len, ui
         return -1;
     }
     cobs_buf[ret.out_len] = 0x00;
-    uart_write_bytes(ESP32_COMM_PORT_NUM, cobs_buf, ret.out_len + 1);
+    _uart_write_safe(ESP32_COMM_PORT_NUM, cobs_buf, ret.out_len + 1);
 
     /* Wait for response from RP2040 */
     if (xSemaphoreTake(s_file_req_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
@@ -142,7 +168,7 @@ static int _cmd_send(uint8_t cmd, void* p_data, uint8_t len) {
 	if(ret.status == COBS_ENCODE_OK)
 	{
 		buf[ret.out_len] = 0x00;
-		return uart_write_bytes(ESP32_COMM_PORT_NUM, buf, ret.out_len + 1);
+		return _uart_write_safe(ESP32_COMM_PORT_NUM, buf, ret.out_len + 1);
 	}
 	return -1;
 }
@@ -176,13 +202,15 @@ static bool _dynamic_sensor_packet_is_valid(const uint8_t* p_data, size_t len) {
     }
 }
 
-/* Helper task to reload language files without blocking the UART receiver task */
+/* Helper task to reload GUI files from SD (language files, media colors)
+ * without blocking the UART receiver task */
 static void i18n_reload_task(void *arg) {
     char *lang = (char *)arg;
     if (lang) {
         gui_i18n_reload_from_sd(lang);
         free(lang);
     }
+    media_standards_load_from_sd();
     vTaskDelete(NULL);
 }
 
@@ -252,7 +280,7 @@ static bool _packet_handle(uint8_t* p_data, size_t len) {
                 return true;
             }
             return true;
-		case PKT_TYPE_PUSH_LORA_CFG: { /* 0x35 */
+		case PKT_TYPE_PUSH_LORA_CFG: {
 			if (len >= 2 && p_data[1] != 0) {
 				size_t min_len = 2 + sizeof(lora_global_config_t);
 				if (len >= min_len) {
@@ -285,6 +313,12 @@ static bool _packet_handle(uint8_t* p_data, size_t len) {
 		#endif
 			return true;
 		}
+        case PKT_TYPE_PUSH_LORA_DEV: {
+        #if CONFIG_LORA_ENABLE
+            lora_model_on_rp2040_device_received(p_data, len);
+        #endif
+            return true;
+        }
 		case PKT_TYPE_RES_SD_INFO: {
 			if(len >= 19) {
 				struct sd_card_info info = {0};
@@ -388,6 +422,36 @@ static bool _packet_handle(uint8_t* p_data, size_t len) {
 			}
 			break;
 		}
+        case PKT_TYPE_RES_ALARM_LOAD: {
+			if (len >= 4) {
+				/* Payload: [1]=chunk_idx, [2]=total_chunks, [3]=count_in_chunk, [4..]=data */
+				alarm_model_on_history_chunk_received(&p_data[1], len - 1);
+				return true;
+			}
+			break;
+		}
+        case PKT_TYPE_RES_SET_THRESHOLD: {
+            if (len >= 2) {
+                s_thresh_req_success = (p_data[1] != 0);
+                ESP_LOGI(TAG, "UART Rx: RES_SET_THRESHOLD status=%d", s_thresh_req_success ? 1 : 0);
+                if (s_thresh_req_sem) {
+                    xSemaphoreGive(s_thresh_req_sem);
+                }
+                return true;
+            }
+            break;
+        }
+        case PKT_TYPE_RES_SET_OFFSET: {
+            if (len >= 2) {
+                s_offset_req_success = (p_data[1] != 0);
+                ESP_LOGI(TAG, "UART Rx: RES_SET_OFFSET status=%d", s_offset_req_success ? 1 : 0);
+                if (s_offset_req_sem) {
+                    xSemaphoreGive(s_offset_req_sem);
+                }
+                return true;
+            }
+            break;
+        }
 		default:
 			if(len > 1)
 			{
@@ -422,7 +486,7 @@ static void esp32_rp2040_comm_task(void* arg) {
     rp2040_send_esp_mac();
 
     cobs_decode_result ret;
-    static uint8_t frag[BUF_SIZE] = {0}; /* STATIC: Nimmt 2048 Bytes vom Stack weg! */
+    static uint8_t frag[BUF_SIZE] = {0}; /* STATIC: Nimmt 4096 Bytes vom Stack weg! */
     size_t frag_len = 0;
 
     while(1)
@@ -526,12 +590,15 @@ static void _commu_event_handler(void* handler_args, esp_event_base_t base, int3
 }
 
 void esp32_rp2040_init(void) {
+    if (!s_uart_tx_mutex) {
+        s_uart_tx_mutex = xSemaphoreCreateMutex();
+    }
     chart_query_scheduler_init();
-	xTaskCreate(esp32_rp2040_comm_task, "esp32_rp2040_comm_task", ESP32_RP2040_COMM_TASK_STACK_SIZE,
-				NULL, 5, NULL);
-	ESP_ERROR_CHECK(esp_event_handler_instance_register_with(view_event_handle, VIEW_EVENT_BASE,
-															 VIEW_EVENT_SHUTDOWN,
-															 _commu_event_handler, NULL, NULL));
+    xTaskCreate(esp32_rp2040_comm_task, "esp32_rp2040_comm_task", ESP32_RP2040_COMM_TASK_STACK_SIZE,
+                NULL, 5, NULL);
+    ESP_ERROR_CHECK(esp_event_handler_instance_register_with(view_event_handle, VIEW_EVENT_BASE,
+                                                             VIEW_EVENT_SHUTDOWN,
+                                                             _commu_event_handler, NULL, NULL));
 }
 
 int rp2040_send_esp_mac(void) {
@@ -607,7 +674,7 @@ int rp2040_send_lora_raw_frame(uint32_t dev_addr, int16_t rssi, int8_t snr, cons
     cobs_encode_result ret = cobs_encode(cobs_buf, sizeof(cobs_buf), raw_data, idx);
     if (ret.status == COBS_ENCODE_OK) {
         cobs_buf[ret.out_len] = 0x00;
-        return uart_write_bytes(ESP32_COMM_PORT_NUM, cobs_buf, ret.out_len + 1);
+        return _uart_write_safe(ESP32_COMM_PORT_NUM, cobs_buf, ret.out_len + 1);
     }
 
     return -1;
@@ -634,7 +701,7 @@ int rp2040_request_chart_data(uint8_t req_id, uint32_t dev_addr, const char *key
     cobs_encode_result ret = cobs_encode(cobs_buf, sizeof(cobs_buf), payload, sizeof(payload));
     if (ret.status == COBS_ENCODE_OK) {
         cobs_buf[ret.out_len] = 0x00;
-        int written = uart_write_bytes(ESP32_COMM_PORT_NUM, cobs_buf, ret.out_len + 1);
+        int written = _uart_write_safe(ESP32_COMM_PORT_NUM, cobs_buf, ret.out_len + 1);
         ESP_LOGI(TAG, "UART Tx: Req Chart Zone %u (key=%s, start=%lu, end=%lu, step=%lu s) -> %d bytes sent",
                  req_id, key ? key : "?", (unsigned long)start_ts, (unsigned long)end_ts, (unsigned long)interval_sec, written);
       
@@ -642,4 +709,185 @@ int rp2040_request_chart_data(uint8_t req_id, uint32_t dev_addr, const char *key
     }
     ESP_LOGE(TAG, "UART Tx: COBS encode failed for chart request");
     return -1;
+}
+
+int rp2040_alarm_set(uint16_t t_on_ms, uint16_t t_off_ms) {
+    uint8_t payload[5];
+    payload[0] = 0xA6; /* PKT_TYPE_CMD_ALARM_SET */
+    payload[1] = (uint8_t)(t_on_ms & 0xFF);
+    payload[2] = (uint8_t)((t_on_ms >> 8) & 0xFF);
+    payload[3] = (uint8_t)(t_off_ms & 0xFF);
+    payload[4] = (uint8_t)((t_off_ms >> 8) & 0xFF);
+
+    uint8_t cobs_buf[16];
+    cobs_encode_result ret = cobs_encode(cobs_buf, sizeof(cobs_buf), payload, sizeof(payload));
+    if (ret.status == COBS_ENCODE_OK) {
+        cobs_buf[ret.out_len] = 0x00;
+        return _uart_write_safe(ESP32_COMM_PORT_NUM, cobs_buf, ret.out_len + 1);
+    }
+    return -1;
+}
+
+int rp2040_alarm_mute(uint32_t mute_sec) {
+    uint8_t payload[5];
+    payload[0] = 0xA7; /* PKT_TYPE_CMD_ALARM_MUTE */
+    memcpy(&payload[1], &mute_sec, 4);
+
+    uint8_t cobs_buf[16];
+    cobs_encode_result ret = cobs_encode(cobs_buf, sizeof(cobs_buf), payload, sizeof(payload));
+    if (ret.status == COBS_ENCODE_OK) {
+        cobs_buf[ret.out_len] = 0x00;
+        return _uart_write_safe(ESP32_COMM_PORT_NUM, cobs_buf, ret.out_len + 1);
+    }
+    return -1;
+}
+
+int rp2040_alarm_rearm(void) {
+    uint8_t payload[1] = { 0xA8 }; /* PKT_TYPE_CMD_ALARM_REARM */
+    uint8_t cobs_buf[8];
+    cobs_encode_result ret = cobs_encode(cobs_buf, sizeof(cobs_buf), payload, sizeof(payload));
+    if (ret.status == COBS_ENCODE_OK) {
+        cobs_buf[ret.out_len] = 0x00;
+        return _uart_write_safe(ESP32_COMM_PORT_NUM, cobs_buf, ret.out_len + 1);
+    }
+    return -1;
+}
+
+int rp2040_alarm_send_save_chunk(uint8_t chunk_idx, uint8_t total_chunks, uint8_t count, const void *entries) {
+    if (!entries && count > 0) return -1;
+
+    size_t payload_len = 4 + (count * sizeof(alarm_entry_t));
+    if (payload_len > 800) return -1; /* Guard against buffer overflow */
+
+    uint8_t payload[800];
+    payload[0] = PKT_TYPE_CMD_ALARM_SAVE;
+    payload[1] = chunk_idx;
+    payload[2] = total_chunks;
+    payload[3] = count;
+
+    if (count > 0) {
+        memcpy(&payload[4], entries, count * sizeof(alarm_entry_t));
+    }
+
+    uint8_t cobs_buf[850];
+    cobs_encode_result ret = cobs_encode(cobs_buf, sizeof(cobs_buf), payload, payload_len);
+    if (ret.status == COBS_ENCODE_OK) {
+        cobs_buf[ret.out_len] = 0x00;
+        return _uart_write_safe(ESP32_COMM_PORT_NUM, cobs_buf, ret.out_len + 1);
+    }
+
+    ESP_LOGE(TAG, "COBS encode failed for alarm save chunk %u/%u", chunk_idx + 1, total_chunks);
+    return -1;
+}
+
+int rp2040_alarm_request_load(void) {
+    uint8_t payload[1] = { PKT_TYPE_CMD_ALARM_LOAD };
+    uint8_t cobs_buf[8];
+    cobs_encode_result ret = cobs_encode(cobs_buf, sizeof(cobs_buf), payload, sizeof(payload));
+    if (ret.status == COBS_ENCODE_OK) {
+        cobs_buf[ret.out_len] = 0x00;
+        ESP_LOGI(TAG, "UART Tx: Requested alarm history load from RP2040 SD card");
+        return _uart_write_safe(ESP32_COMM_PORT_NUM, cobs_buf, ret.out_len + 1);
+    }
+    return -1;
+}
+
+int rp2040_send_set_threshold(uint32_t dev_addr, const char *rule_id,
+                              bool is_percent, float threshold_val, float hysteresis_val,
+                              uint8_t damping, uint8_t severity, uint8_t buzzer_mode,
+                              uint32_t timeout_ms) {
+    if (!rule_id) return -1;
+
+    if (!s_thresh_req_sem && timeout_ms > 0) {
+        s_thresh_req_sem = xSemaphoreCreateBinary();
+    } else if (s_thresh_req_sem) {
+        /* Clear any stale token */
+        xSemaphoreTake(s_thresh_req_sem, 0);
+    }
+    s_thresh_req_success = false;
+
+    /* Build 33-byte command payload matching RP2040 packet parser */
+    uint8_t payload[33] = {0};
+    payload[0] = PKT_TYPE_CMD_SET_THRESHOLD;
+    memcpy(&payload[1], &dev_addr, 4);
+    strncpy((char *)&payload[5], rule_id, 16);
+    payload[21] = is_percent ? 1 : 0;
+    memcpy(&payload[22], &threshold_val, sizeof(float));
+    memcpy(&payload[26], &hysteresis_val, sizeof(float));
+    payload[30] = damping;
+    payload[31] = severity;
+    payload[32] = buzzer_mode;
+
+    uint8_t cobs_buf[48];
+    cobs_encode_result ret = cobs_encode(cobs_buf, sizeof(cobs_buf), payload, sizeof(payload));
+    if (ret.status != COBS_ENCODE_OK) {
+        ESP_LOGE(TAG, "COBS encode failed for CMD_SET_THRESHOLD");
+        return -1;
+    }
+    cobs_buf[ret.out_len] = 0x00;
+
+    int written = _uart_write_safe(ESP32_COMM_PORT_NUM, cobs_buf, ret.out_len + 1);
+    if (written <= 0) {
+        ESP_LOGE(TAG, "UART write failed for CMD_SET_THRESHOLD");
+        return -1;
+    }
+
+    /* Wait for acknowledgement if requested */
+    if (timeout_ms > 0 && s_thresh_req_sem) {
+        if (xSemaphoreTake(s_thresh_req_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+            return s_thresh_req_success ? 0 : -1;
+        }
+        ESP_LOGW(TAG, "Timeout waiting for RES_SET_THRESHOLD from RP2040");
+        return -1;
+    }
+
+    return 0;
+}
+
+int rp2040_send_set_offset(uint32_t dev_addr, const char *key,
+                           float value, const char *unit, uint32_t timeout_ms) {
+    if (!key) return -1;
+
+    if (!s_offset_req_sem && timeout_ms > 0) {
+        s_offset_req_sem = xSemaphoreCreateBinary();
+    } else if (s_offset_req_sem) {
+        /* Clear any stale token */
+        xSemaphoreTake(s_offset_req_sem, 0);
+    }
+    s_offset_req_success = false;
+
+    /* Build 33-byte command payload matching RP2040 packet parser */
+    uint8_t payload[33] = {0};
+    payload[0] = PKT_TYPE_CMD_SET_OFFSET;
+    memcpy(&payload[1], &dev_addr, 4);
+    strncpy((char *)&payload[5], key, 16);
+    memcpy(&payload[21], &value, sizeof(float));
+    if (unit) {
+        strncpy((char *)&payload[25], unit, 8);
+    }
+
+    uint8_t cobs_buf[48];
+    cobs_encode_result ret = cobs_encode(cobs_buf, sizeof(cobs_buf), payload, sizeof(payload));
+    if (ret.status != COBS_ENCODE_OK) {
+        ESP_LOGE(TAG, "COBS encode failed for CMD_SET_OFFSET");
+        return -1;
+    }
+    cobs_buf[ret.out_len] = 0x00;
+
+    int written = _uart_write_safe(ESP32_COMM_PORT_NUM, cobs_buf, ret.out_len + 1);
+    if (written <= 0) {
+        ESP_LOGE(TAG, "UART write failed for CMD_SET_OFFSET");
+        return -1;
+    }
+
+    /* Wait for acknowledgement if requested */
+    if (timeout_ms > 0 && s_offset_req_sem) {
+        if (xSemaphoreTake(s_offset_req_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+            return s_offset_req_success ? 0 : -1;
+        }
+        ESP_LOGW(TAG, "Timeout waiting for RES_SET_OFFSET from RP2040");
+        return -1;
+    }
+
+    return 0;
 }

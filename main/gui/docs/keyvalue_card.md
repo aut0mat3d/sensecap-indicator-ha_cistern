@@ -1,6 +1,6 @@
 # Text Widget Module
 
-The `text_widget` module provides a flexible multi-row text and telemetry card for displaying label-value pairs. It supports vertical auto-scrolling on overflow, automatic word-wrapping, dynamic data binding, and per-pair styling with data quality color indicators.
+The `keyvalue_card` module provides a flexible multi-row text and telemetry card for displaying label-value pairs. It supports vertical auto-scrolling on overflow, automatic word-wrapping, dynamic data binding, and per-pair styling with data quality color indicators.
 
 ## Overview
 
@@ -18,10 +18,10 @@ The text widget displays multiple rows of information in a scrollable card layou
 ### 1. Factory Method (Recommended for Page Manager)
 
 ```c
-#include "text_widget.h"
+#include "keyvalue_card.h"
 
 /* Create via factory function */
-widget_t* widget = text_widget_create(
+widget_t* widget = keyvalue_card_create(
     tile,                    // Parent LVGL object (tile or view container)
     "sensor_card",           // Unique widget ID
     "depth",                // Optional default binding key
@@ -32,19 +32,19 @@ widget_t* widget = text_widget_create(
 );
 
 /* Add pairs after creation */
-text_widget_add_pair((text_widget_t*)widget->user_data, 
+keyvalue_card_add_pair((keyvalue_card_t*)widget->user_data, 
     "depth", "Füllstand:", "--", "m³", lv_color_hex(0x52AAE5));
-text_widget_add_pair((text_widget_t*)widget->user_data,
+keyvalue_card_add_pair((keyvalue_card_t*)widget->user_data,
     "flowrate", "Änderungsrate:", "--", "m³/h", lv_color_hex(0x2ECC71));
 ```
 
 ### 2. Direct Initialization (Backward Compatible)
 
 ```c
-#include "text_widget.h"
+#include "keyvalue_card.h"
 
 /* Declare and configure */
-text_widget_t my_widget;
+keyvalue_card_t my_widget;
 my_widget.parent = tile;
 my_widget.x = 230;
 my_widget.y = 72;
@@ -57,7 +57,7 @@ my_widget.title = "Sensor Status";
 my_widget.title_color = lv_color_hex(0x9E9E9E);
 
 /* Configure pairs */
-text_widget_pair_t pairs[3];
+keyvalue_card_pair_t pairs[3];
 pairs[0].label = "Füllstand:";
 pairs[0].value = "3.42 m³";
 pairs[0].unit = "m³";
@@ -76,20 +76,20 @@ memcpy(my_widget.pairs, pairs, sizeof(pairs));
 my_widget.pair_count = 3;
 
 /* Initialize */
-if (text_widget_init(&my_widget) != 0) {
+if (keyvalue_card_init(&my_widget) != 0) {
     // Handle error
 }
 
 /* Update a value */
-text_widget_update_value(&my_widget, 0, "4.20 m³");
+keyvalue_card_update_value(&my_widget, 0, "4.20 m³");
 
 /* Cleanup when done */
-text_widget_destroy(&my_widget);
+keyvalue_card_destroy(&my_widget);
 ```
 
 ## Configuration Structure
 
-The `text_widget_t` structure contains all configurable parameters:
+The `keyvalue_card_t` structure contains all configurable parameters:
 
 ```c
 typedef struct {
@@ -102,7 +102,7 @@ typedef struct {
     
     /* Display */
     const char* title;         // Optional card title/header
-    text_widget_pair_t pairs[TEXT_WIDGET_MAX_PAIRS];  // Array of label-value pairs
+    keyvalue_card_pair_t pairs[keyvalue_card_MAX_PAIRS];  // Array of label-value pairs
     uint8_t pair_count;        // Number of configured pairs
     
     /* Styling */
@@ -118,10 +118,10 @@ typedef struct {
     /* Internal - Do not modify directly */
     lv_obj_t* container;       // Scrollable card container
     lv_obj_t* lbl_title;       // Title label object
-    lv_obj_t* pair_conts[TEXT_WIDGET_MAX_PAIRS]; // Row containers
-    lv_obj_t* labels[TEXT_WIDGET_MAX_PAIRS];    // Label objects
-    lv_obj_t* values[TEXT_WIDGET_MAX_PAIRS];    // Value objects
-} text_widget_t;
+    lv_obj_t* pair_conts[keyvalue_card_MAX_PAIRS]; // Row containers
+    lv_obj_t* labels[keyvalue_card_MAX_PAIRS];    // Label objects
+    lv_obj_t* values[keyvalue_card_MAX_PAIRS];    // Value objects
+} keyvalue_card_t;
 ```
 
 ### Pair Configuration
@@ -137,7 +137,7 @@ typedef struct {
     lv_color_t  label_color;       // Color for label text
     lv_color_t  value_color;       // Color for value text
     const lv_font_t* font;         // Font override for value (optional)
-} text_widget_pair_t;
+} keyvalue_card_pair_t;
 ```
 
 ## API Reference
@@ -146,56 +146,56 @@ typedef struct {
 
 | Function | Description |
 |----------|-------------|
-| `widget_t* text_widget_create(lv_obj_t* parent, const char* id, const char* binding_key, int16_t x, int16_t y, uint16_t w, uint16_t h)` | Factory function for widget_base integration. Returns `widget_t*` or NULL on failure. |
-| `int text_widget_init(text_widget_t* widget)` | Initialize a pre-allocated structure. Returns 0 on success, -1 on error. |
+| `widget_t* keyvalue_card_create(lv_obj_t* parent, const char* id, const char* binding_key, int16_t x, int16_t y, uint16_t w, uint16_t h)` | Factory function for widget_base integration. Returns `widget_t*` or NULL on failure. |
+| `int keyvalue_card_init(keyvalue_card_t* widget)` | Initialize a pre-allocated structure. Returns 0 on success, -1 on error. |
 
 ### Pair Management
 
 | Function | Description |
 |----------|-------------|
-| `int text_widget_add_pair(text_widget_t* widget, const char* binding_key, const char* label, const char* initial_value, const char* unit, lv_color_t value_color)` | Add a new label-value pair dynamically. Returns 0 on success, -1 if max pairs reached. |
+| `int keyvalue_card_add_pair(keyvalue_card_t* widget, const char* binding_key, const char* label, const char* initial_value, const char* unit, lv_color_t value_color)` | Add a new label-value pair dynamically. Returns 0 on success, -1 if max pairs reached. |
 
 ### Updates
 
 | Function | Description |
 |----------|-------------|
-| `void text_widget_update_value(text_widget_t* widget, uint8_t pair_index, const char* value)` | Update value text by index (simple string) |
-| `void text_widget_update_binding(text_widget_t* widget, const char* key, float value, const char* unit, bool is_estimated, bool is_alarm)` | Update value by binding key with quality flags |
-| `void text_widget_update_label(text_widget_t* widget, uint8_t pair_index, const char* label)` | Update label text by index |
-| `void text_widget_set_title(text_widget_t* widget, const char* title)` | Set or update card title (NULL to hide) |
+| `void keyvalue_card_update_value(keyvalue_card_t* widget, uint8_t pair_index, const char* value)` | Update value text by index (simple string) |
+| `void keyvalue_card_update_binding(keyvalue_card_t* widget, const char* key, float value, const char* unit, bool is_estimated, bool is_alarm)` | Update value by binding key with quality flags |
+| `void keyvalue_card_update_label(keyvalue_card_t* widget, uint8_t pair_index, const char* label)` | Update label text by index |
+| `void keyvalue_card_set_title(keyvalue_card_t* widget, const char* title)` | Set or update card title (NULL to hide) |
 
 ### Color Configuration
 
 | Function | Description |
 |----------|-------------|
-| `void text_widget_set_value_color(text_widget_t* widget, uint8_t pair_index, lv_color_t color)` | Set value text color for a specific pair |
-| `void text_widget_set_label_color(text_widget_t* widget, uint8_t pair_index, lv_color_t color)` | Set label text color for a specific pair |
+| `void keyvalue_card_set_value_color(keyvalue_card_t* widget, uint8_t pair_index, lv_color_t color)` | Set value text color for a specific pair |
+| `void keyvalue_card_set_label_color(keyvalue_card_t* widget, uint8_t pair_index, lv_color_t color)` | Set label text color for a specific pair |
 
 ### Cleanup
 
 | Function | Description |
 |----------|-------------|
-| `void text_widget_destroy(text_widget_t* widget)` | Clean up all LVGL objects and free resources |
+| `void keyvalue_card_destroy(keyvalue_card_t* widget)` | Clean up all LVGL objects and free resources |
 
 ## Data Binding
 
-The text widget supports **automatic data binding** via binding keys. When using `text_widget_update_binding()`, the widget searches for pairs matching the specified key and updates them:
+The text widget supports **automatic data binding** via binding keys. When using `keyvalue_card_update_binding()`, the widget searches for pairs matching the specified key and updates them:
 
 ```c
 /* Configure widget with bound pairs */
-text_widget_add_pair(&my_widget, "depth", "Füllstand:", "--", "m³", lv_color_hex(0x52AAE5));
-text_widget_add_pair(&my_widget, "flowrate", "Flow Rate:", "--", "m³/h", lv_color_hex(0x2ECC71));
+keyvalue_card_add_pair(&my_widget, "depth", "Füllstand:", "--", "m³", lv_color_hex(0x52AAE5));
+keyvalue_card_add_pair(&my_widget, "flowrate", "Flow Rate:", "--", "m³/h", lv_color_hex(0x2ECC71));
 
 /* Later, update via binding key */
-text_widget_update_binding(&my_widget, "depth", 3.42f, "m³", false, false);
-text_widget_update_binding(&my_widget, "flowrate", 0.12f, "m³/h", false, true);
+keyvalue_card_update_binding(&my_widget, "depth", 3.42f, "m³", false, false);
+keyvalue_card_update_binding(&my_widget, "flowrate", 0.12f, "m³/h", false, true);
 ```
 
 **Note:** The widget can also be updated via the widget_base interface when created with a binding_key.
 
 ## Data Quality Visualization
 
-The text widget supports **automatic color rendering based on data quality** when using `text_widget_update_binding()`:
+The text widget supports **automatic color rendering based on data quality** when using `keyvalue_card_update_binding()`:
 
 | State | Value Text Color | When to Use |
 |-------|------------------|-------------|
@@ -203,7 +203,7 @@ The text widget supports **automatic color rendering based on data quality** whe
 | **Estimated** | Light grey (0xBDC3C7) | Interpolated or replacement value |
 | **Alarm** | Red (0xE74C3C) | Threshold violation detected |
 
-The color is automatically applied when using `text_widget_update_binding()` with the quality flags.
+The color is automatically applied when using `keyvalue_card_update_binding()` with the quality flags.
 
 ### Manual Color Control
 
@@ -211,18 +211,18 @@ You can also manually set colors for each pair:
 
 ```c
 /* Set custom colors for a pair */
-text_widget_set_value_color(&my_widget, 1, lv_color_hex(0xE74C3C));  // Red for alarm
-text_widget_set_label_color(&my_widget, 1, lv_color_hex(0xFFFFFF));   // White for label
+keyvalue_card_set_value_color(&my_widget, 1, lv_color_hex(0xE74C3C));  // Red for alarm
+keyvalue_card_set_label_color(&my_widget, 1, lv_color_hex(0xFFFFFF));   // White for label
 ```
 
 ## Complete Example
 
 ```c
-#include "text_widget.h"
+#include "keyvalue_card.h"
 #include "lv_port.h"
 
 /* Create a sensor status card */
-text_widget_t sensor_card;
+keyvalue_card_t sensor_card;
 
 void setup_sensor_card(lv_obj_t* tile) {
     memset(&sensor_card, 0, sizeof(sensor_card));
@@ -237,27 +237,27 @@ void setup_sensor_card(lv_obj_t* tile) {
     sensor_card.title_color = lv_color_hex(0x9E9E9E);
     
     /* Add label-value pairs */
-    text_widget_add_pair(&sensor_card, "depth", "Füllstand:", "--", "m³", lv_color_hex(0x52AAE5));
-    text_widget_add_pair(&sensor_card, "volume", "Volumen:", "--", "m³", lv_color_hex(0x52AAE5));
-    text_widget_add_pair(&sensor_card, "flowrate", "Änderungsrate:", "--", "m³/h", lv_color_hex(0x2ECC71));
-    text_widget_add_pair(&sensor_card, "updated", "Aktualisierung:", "--", "", lv_color_hex(0xFFFFFF));
+    keyvalue_card_add_pair(&sensor_card, "depth", "Füllstand:", "--", "m³", lv_color_hex(0x52AAE5));
+    keyvalue_card_add_pair(&sensor_card, "volume", "Volumen:", "--", "m³", lv_color_hex(0x52AAE5));
+    keyvalue_card_add_pair(&sensor_card, "flowrate", "Änderungsrate:", "--", "m³/h", lv_color_hex(0x2ECC71));
+    keyvalue_card_add_pair(&sensor_card, "updated", "Aktualisierung:", "--", "", lv_color_hex(0xFFFFFF));
     
     /* Optional: Click handler for configuration */
     sensor_card.click_cb = on_sensor_config_clicked;
     
-    text_widget_init(&sensor_card);
+    keyvalue_card_init(&sensor_card);
 }
 
 void update_sensor_values(float depth, float volume, float flowrate, bool flowrate_alarm) {
     /* Update by binding keys with quality information */
-    text_widget_update_binding(&sensor_card, "depth", depth, "m³", false, false);
-    text_widget_update_binding(&sensor_card, "volume", volume, "m³", false, false);
-    text_widget_update_binding(&sensor_card, "flowrate", flowrate, "m³/h", false, flowrate_alarm);
+    keyvalue_card_update_binding(&sensor_card, "depth", depth, "m³", false, false);
+    keyvalue_card_update_binding(&sensor_card, "volume", volume, "m³", false, false);
+    keyvalue_card_update_binding(&sensor_card, "flowrate", flowrate, "m³/h", false, flowrate_alarm);
     
     /* Update by index (simple string) */
     char timestamp[32];
     snprintf(timestamp, sizeof(timestamp), "Vor %d Min.", 2);
-    text_widget_update_value(&sensor_card, 3, timestamp);
+    keyvalue_card_update_value(&sensor_card, 3, timestamp);
 }
 
 void on_sensor_config_clicked(lv_event_t *e) {
@@ -273,9 +273,9 @@ The text widget integrates seamlessly with the data storage system:
 ```c
 #include "data_storage.h"
 
-void update_from_telemetry(text_widget_t* widget, const char* channel_key, float value, const char* unit) {
+void update_from_telemetry(keyvalue_card_t* widget, const char* channel_key, float value, const char* unit) {
     /* Check if this widget has a pair bound to this channel */
-    text_widget_update_binding(widget, channel_key, value, unit, false, false);
+    keyvalue_card_update_binding(widget, channel_key, value, unit, false, false);
 }
 
 /* Or use the widget_base callback */
@@ -295,7 +295,7 @@ The text widget **automatically enables vertical scrolling** when content exceed
 
 ```c
 /* Content will automatically scroll when it exceeds 256px height */
-text_widget_t tall_widget;
+keyvalue_card_t tall_widget;
 tall_widget.height = 256;  // Fixed card height
 // Add many pairs - scrolling will be enabled automatically
 ```
@@ -304,7 +304,7 @@ tall_widget.height = 256;  // Fixed card height
 
 | Limit | Value |
 |-------|-------|
-| Maximum pairs | 8 (TEXT_WIDGET_MAX_PAIRS) |
+| Maximum pairs | 8 (keyvalue_card_MAX_PAIRS) |
 
 ## Default Values
 
@@ -331,7 +331,7 @@ The module supports the `widget_base.h` interface for dynamic page management:
 
 ```c
 /* The factory function returns a widget_t* */
-widget_t* widget = text_widget_create(parent, "id", "binding", x, y, w, h);
+widget_t* widget = keyvalue_card_create(parent, "id", "binding", x, y, w, h);
 
 /* Update via widget interface */
 if (widget->update_val) {
@@ -344,7 +344,7 @@ if (widget->destroy) {
 }
 ```
 
-The widget's `user_data` field contains the `text_widget_t*` for direct access if needed.
+The widget's `user_data` field contains the `keyvalue_card_t*` for direct access if needed.
 
 ## Use Cases
 

@@ -13,12 +13,15 @@
 #include <stdint.h>
 #include "indicator_rp2040.hpp"
 
-#define MAX_LORA_DEVICES 16
-#define MAX_LORA_DECODERS 8
-#define MAX_RULES_PER_DECODER 16
-#define MAX_LORA_COMMANDS_PER_DECODER 8
-#define MAX_REACTIONS_PER_DECODER 4
-#define MAX_LUT_POINTS 16
+#define MAX_LORA_DEVICES                16
+#define MAX_LORA_DECODERS               8
+#define MAX_RULES_PER_DECODER           16
+#define MAX_LORA_COMMANDS_PER_DECODER   8
+#define MAX_REACTIONS_PER_DECODER       4
+#define MAX_LUT_POINTS                  16
+#define MAX_THRESHOLDS_PER_DEVICE       8
+#define MAX_DEVICE_OFFSETS              4
+#define MAX_DEVICE_LIMITS               8
 
 typedef enum {
     TANK_TYPE_NONE = 0,
@@ -35,7 +38,7 @@ typedef struct {
 } lut_point_t;
 
 typedef struct __attribute__((packed)) {
-    tank_type_t type;
+    uint8_t     type;
     float       max_depth_cm;
     float       width_cm;
     float       length_cm;
@@ -48,6 +51,20 @@ typedef struct __attribute__((packed)) {
     lut_point_t lut[MAX_LUT_POINTS];
     uint8_t     lut_count;
 } tank_geometry_t;
+
+typedef struct __attribute__((packed)) {
+    char     rule_id[16];          /* "alarm_low", "alarm_frate" */
+    char     key[16];              /* "depth", "flowrate", "battery_soc" */
+    char     unit[16];             /* Resolved unit: "%", "cm", "m³/h", "°C", etc. */
+    bool     is_percent;           /* true = value_percent in JSON, false = absolute */
+    uint8_t  severity;             /* 0=danger, 1=warning, 2=info */
+    uint8_t  op;                   /* 0=less_than (<), 1=greater_than (>) */
+    float    threshold_val;        /* Original value from JSON (e.g. 15.0 or -2.0) */
+    float    hysteresis_val;       /* Original hysteresis from JSON (e.g. 3.0 or 0.4) */
+    uint8_t  damping;              /* Damping cycles (e.g. 0 or 2) */
+    uint8_t  buzzer_mode;          /* 0=intermittent, 1=continuous, 2=off */
+    bool     valid;
+} lora_threshold_config_t;
 
 typedef struct __attribute__((packed)) {
     char unit_system[16]; /* "metric" or "imperial" */
@@ -102,6 +119,22 @@ typedef struct __attribute__((packed)) {
 } lora_fport_config_t;
 
 typedef struct __attribute__((packed)) {
+    char  key[16];
+    float value;
+    char  unit[8];
+    bool  valid;
+} lora_offset_config_t;
+
+typedef struct __attribute__((packed)) {
+    char    key[16];
+    float   val_min;
+    float   val_max;
+    uint8_t cap_min;
+    uint8_t cap_max;
+    bool    valid;
+} lora_limit_config_t;
+
+typedef struct __attribute__((packed)) {
     char                   device_name[32];
     char                   medium[16];
     bool                   enabled;
@@ -117,6 +150,13 @@ typedef struct __attribute__((packed)) {
     lora_fport_config_t    fport_cfg;
     tank_geometry_t        geometry;
     tank_display_config_t  display_cfg;
+    uint8_t                 threshold_count;
+    lora_threshold_config_t thresholds[MAX_THRESHOLDS_PER_DEVICE];
+    uint8_t                 offset_count;
+    lora_offset_config_t    offsets[MAX_DEVICE_OFFSETS];
+    uint8_t                 limit_count;
+    lora_limit_config_t     limits[MAX_DEVICE_LIMITS];
+    uint32_t                report_interval_sec; /* Configured sensor transmit interval (device JSON, 60..3600 s); keep layout identical to main/lora/lora_model.h */
 } lora_device_config_t;
 
 typedef struct {
@@ -132,6 +172,9 @@ typedef struct {
     char     target_type[12];
     char     context[16];
     float    scale;
+    float   val_min;
+    float   val_max;
+    bool    has_bounds;
 } decoder_rule_t;
 
 typedef struct {
@@ -181,7 +224,8 @@ void lora_telemetry_send_dynamic(PacketSerial& ps, uint32_t dev_addr, uint32_t f
                                  const char* key, const char* unit, 
                                  const void* val_data, size_t val_len);
 
-void lorasensors_push_config_to_esp32(PacketSerial &ps, bool valid_cfg);
+void lorasensors_push_globals(PacketSerial &ps, bool valid_cfg);
+bool lorasensors_stream_single_device(PacketSerial &ps, size_t dev_idx);
 bool lorasensors_load_all(SdFat32 &sd);
 const lora_global_config_t& lorasensors_get_globals(void);
 const lora_device_config_t* lorasensors_find_device(uint32_t dev_addr);
@@ -189,5 +233,39 @@ size_t lorasensors_get_device_count(void);
 void lorasensors_process_raw_frame(PacketSerial &ps, const uint8_t *buffer, size_t size);
 const lora_command_t* lorasensors_find_command(const char* decoder_name, const char* cmd_key);
 size_t lorasensors_build_command_payload(const lora_command_t* cmd, uint32_t val, uint8_t* out_bytes, size_t max_len);
+
+
+/**
+ * @brief Atomically patch a specific sensor offset in a device's JSON on SD card
+ *        and synchronize internal RAM structures without requiring a reboot.
+ *
+ * @param sd Reference to mounted Fat32 filesystem
+ * @param dev_addr Target device address
+ * @param key Telemetry key (e.g. "depth")
+ * @param value Numeric offset value
+ * @param unit Engineering unit string (e.g. "mm", "cm")
+ * @return true on success, false if device not found or write failed
+ */
+bool lorasensors_save_offset_to_sd(SdFat32 &sd, uint32_t dev_addr, const char *key,
+                                   float value, const char *unit);
+
+/**
+ * @brief Atomically patch a specific threshold rule in a device's JSON on SD card
+ *        and synchronize internal RAM structures without requiring a reboot.
+ *
+ * @param sd Reference to mounted Fat32 filesystem
+ * @param dev_addr Target device address
+ * @param rule_id Unique threshold identifier (e.g. "alarm_low")
+ * @param is_percent True if value should be written as value_percent
+ * @param threshold_val Numeric threshold value
+ * @param hysteresis_val Numeric hysteresis value
+ * @param damping Damping filter cycles
+ * @param severity Severity enum (0=danger, 1=warning, 2=info)
+ * @param buzzer_mode Buzzer enum (0=intermittent, 1=continuous, 2=off)
+ * @return true on success, false if device/rule not found or write failed
+ */
+bool lorasensors_save_threshold_to_sd(SdFat32 &sd, uint32_t dev_addr, const char *rule_id,
+                                      bool is_percent, float threshold_val, float hysteresis_val,
+                                      uint8_t damping, uint8_t severity, uint8_t buzzer_mode);
 
 #endif /* LORASENSORS_HPP */

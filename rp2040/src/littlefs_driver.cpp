@@ -6,6 +6,7 @@
  */
 
 #include "littlefs_driver.hpp"
+#include "debug_log.hpp"
 #include "sdcard.hpp"
 #include <LittleFS.h>
 #include <Arduino.h>
@@ -31,7 +32,7 @@ static int lfs_sd_read(const struct lfs_config *c, lfs_block_t block,
     size_t count = size / 512;
 
     if (!sd_card_get_fs().card()->readSectors(sector, (uint8_t*)buffer, count)) {
-        Serial.printf("[LFS_DRV_ERR] Read error: LBA %lu, count %u\r\n", (unsigned long)sector, (unsigned)count);
+        LogSerial.printf("[LFS_DRV_ERR] Read error: LBA %lu, count %u\r\n", (unsigned long)sector, (unsigned)count);
         return LFS_ERR_IO;
     }
     return LFS_ERR_OK;
@@ -46,7 +47,7 @@ static int lfs_sd_prog(const struct lfs_config *c, lfs_block_t block,
     size_t count = size / 512;
 
     if (!sd_card_get_fs().card()->writeSectors(sector, (const uint8_t*)buffer, count)) {
-        Serial.printf("[LFS_DRV_ERR] Prog error: LBA %lu, count %u\r\n", (unsigned long)sector, (unsigned)count);
+        LogSerial.printf("[LFS_DRV_ERR] Prog error: LBA %lu, count %u\r\n", (unsigned long)sector, (unsigned)count);
         return LFS_ERR_IO;
     }
     return LFS_ERR_OK;
@@ -95,30 +96,30 @@ static void _init_cfg(void) {
 bool littlefs_driver_mount(void) {
     if (s_mounted) return true;
     if (!sd_card_get_fs().card()) {
-        Serial.println("[LFS_DRV] Mount skipped: SD card hardware not initialized");
+        LogSerial.println("[LFS_DRV] Mount skipped: SD card hardware not initialized");
         return false;
     }
 
     _init_cfg();
 
-    Serial.printf("[LFS_DRV] Attempting mount on Partition 2 (LBA %lu..%lu, %lu blocks)...\r\n",
+    LogSerial.printf("[LFS_DRV] Attempting mount on Partition 2 (LBA %lu..%lu, %lu blocks)...\r\n",
                   LFS_P2_START_LBA, LFS_P2_START_LBA + LFS_P2_SECTOR_COUNT - 1, LFS_TOTAL_BLOCKS);
 
     int err = lfs_mount(&s_lfs, &s_cfg);
     if (err) {
-        Serial.printf("[LFS_DRV] Partition 2 mount failed (code %d: unformatted or mismatch)\r\n", err);
+        LogSerial.printf("[LFS_DRV] Partition 2 mount failed (code %d: unformatted or mismatch)\r\n", err);
         s_mounted = false;
         return false;
     }
 
     s_mounted = true;
-    Serial.println("[LFS_DRV] Mount SUCCESS: LittleFS on Partition 2 is ready!");
+    LogSerial.println("[LFS_DRV] Mount SUCCESS: LittleFS on Partition 2 is ready!");
     return true;
 }
 
 bool littlefs_driver_format(void) {
     if (!sd_card_get_fs().card()) {
-        Serial.println("[LFS_DRV_ERR] Format failed: SD card not ready");
+        LogSerial.println("[LFS_DRV_ERR] Format failed: SD card not ready");
         return false;
     }
 
@@ -129,22 +130,22 @@ bool littlefs_driver_format(void) {
 
     _init_cfg();
 
-    Serial.printf("[LFS_DRV] Formatting Partition 2 (1024 MB LittleFS v2)...\r\n");
+    LogSerial.printf("[LFS_DRV] Formatting Partition 2 (1024 MB LittleFS v2)...\r\n");
     int err = lfs_format(&s_lfs, &s_cfg);
     if (err) {
-        Serial.printf("[LFS_DRV_ERR] lfs_format failed with code %d!\r\n", err);
+        LogSerial.printf("[LFS_DRV_ERR] lfs_format failed with code %d!\r\n", err);
         return false;
     }
 
-    Serial.println("[LFS_DRV] Format SUCCESS! Mounting filesystem...");
+    LogSerial.println("[LFS_DRV] Format SUCCESS! Mounting filesystem...");
     err = lfs_mount(&s_lfs, &s_cfg);
     if (err) {
-        Serial.printf("[LFS_DRV_ERR] Mount after format failed: code %d\r\n", err);
+        LogSerial.printf("[LFS_DRV_ERR] Mount after format failed: code %d\r\n", err);
         return false;
     }
 
     s_mounted = true;
-    Serial.println("[LFS_DRV] Partition 2 formatted and mounted successfully.");
+    LogSerial.println("[LFS_DRV] Partition 2 formatted and mounted successfully.");
     return true;
 }
 
@@ -152,7 +153,7 @@ void littlefs_driver_unmount(void) {
     if (s_mounted) {
         lfs_unmount(&s_lfs);
         s_mounted = false;
-        Serial.println("[LFS_DRV] LittleFS Partition 2 unmounted.");
+        LogSerial.println("[LFS_DRV] LittleFS Partition 2 unmounted.");
     }
 }
 
@@ -176,7 +177,7 @@ bool littlefs_driver_ensure_dir(const char* path) {
             *p = '\0';
             int err = lfs_mkdir(&s_lfs, temp);
             if (err != LFS_ERR_OK && err != LFS_ERR_EXIST) {
-                Serial.printf("[LFS_DRV_ERR] mkdir failed for %s (code %d)\r\n", temp, err);
+                LogSerial.printf("[LFS_DRV_ERR] mkdir failed for %s (code %d)\r\n", temp, err);
                 return false;
             }
             *p = '/';
@@ -185,15 +186,15 @@ bool littlefs_driver_ensure_dir(const char* path) {
 
     int err = lfs_mkdir(&s_lfs, temp);
     if (err != LFS_ERR_OK && err != LFS_ERR_EXIST) {
-        Serial.printf("[LFS_DRV_ERR] mkdir failed for %s (code %d)\r\n", temp, err);
+        LogSerial.printf("[LFS_DRV_ERR] mkdir failed for %s (code %d)\r\n", temp, err);
         return false;
     }
     return true;
 }
 
-bool littlefs_driver_append_line(const char* path, const char* line) {
-    if (!s_mounted || !path || !line) {
-        Serial.printf("[LFS_DRV_ERR] Cannot append: mounted=%d, path=%s\r\n", s_mounted, path ? path : "NULL");
+bool littlefs_driver_append_bytes(const char* path, const void* data, size_t len) {
+    if (!s_mounted || !path || !data) {
+        LogSerial.printf("[LFS_DRV_ERR] Cannot append: mounted=%d, path=%s\r\n", s_mounted, path ? path : "NULL");
         return false;
     }
 
@@ -204,21 +205,26 @@ bool littlefs_driver_append_line(const char* path, const char* line) {
     lfs_file_t file;
     int err = lfs_file_open(&s_lfs, &file, path, LFS_O_WRONLY | LFS_O_CREAT | LFS_O_APPEND);
     if (err) {
-        Serial.printf("[LFS_DRV_ERR] Open failed for append: %s (code %d)\r\n", path, err);
+        LogSerial.printf("[LFS_DRV_ERR] Open failed for append: %s (code %d)\r\n", path, err);
         return false;
     }
 
-    size_t len = strlen(line);
-    lfs_ssize_t written = lfs_file_write(&s_lfs, &file, line, len);
-    lfs_file_sync(&s_lfs, &file);
+    lfs_ssize_t written = lfs_file_write(&s_lfs, &file, data, len);
+    int sync_err = lfs_file_sync(&s_lfs, &file);
     lfs_file_close(&s_lfs, &file);
 
-    if (written < 0 || (size_t)written != len) {
-        Serial.printf("[LFS_DRV_ERR] Write mismatch on %s (expected %u, wrote %d)\r\n", path, (unsigned)len, (int)written);
+    if (written < 0 || (size_t)written != len || sync_err) {
+        LogSerial.printf("[LFS_DRV_ERR] Write mismatch on %s (expected %u, wrote %d, sync %d)\r\n",
+                         path, (unsigned)len, (int)written, sync_err);
         return false;
     }
 
     return true;
+}
+
+bool littlefs_driver_append_line(const char* path, const char* line) {
+    if (!line) return false;
+    return littlefs_driver_append_bytes(path, line, strlen(line));
 }
 
 bool littlefs_driver_rewrite_file(const char* path, const char* const* lines, size_t line_count) {
@@ -228,7 +234,7 @@ bool littlefs_driver_rewrite_file(const char* path, const char* const* lines, si
     lfs_file_t file;
     int err = lfs_file_open(&s_lfs, &file, path, LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
     if (err != LFS_ERR_OK) {
-        Serial.printf("[LFS_DRV_ERR] Rewrite open failed for %s (code %d)\r\n", path, err);
+        LogSerial.printf("[LFS_DRV_ERR] Rewrite open failed for %s (code %d)\r\n", path, err);
         return false;
     }
 
@@ -247,38 +253,53 @@ bool littlefs_driver_rewrite_file(const char* path, const char* const* lines, si
     return true;
 }
 
+typedef struct {
+    lfs_file_t file;
+    uint8_t    buf[512];
+    size_t     buf_pos;
+    size_t     buf_len;
+} lfs_buffered_file_t;
+
 lfs_file_handle_t littlefs_driver_open_read(const char* path) {
     if (!s_mounted || !path) return nullptr;
-    lfs_file_t* f = (lfs_file_t*)malloc(sizeof(lfs_file_t));
-    if (!f) return nullptr;
+    lfs_buffered_file_t* bf = (lfs_buffered_file_t*)malloc(sizeof(lfs_buffered_file_t));
+    if (!bf) return nullptr;
 
-    int err = lfs_file_open(&s_lfs, f, path, LFS_O_RDONLY);
+    bf->buf_pos = 0;
+    bf->buf_len = 0;
+
+    int err = lfs_file_open(&s_lfs, &bf->file, path, LFS_O_RDONLY);
     if (err != LFS_ERR_OK) {
-        free(f);
+        free(bf);
         return nullptr;
     }
-    return (lfs_file_handle_t)f;
+    return (lfs_file_handle_t)bf;
 }
 
 void littlefs_driver_close(lfs_file_handle_t handle) {
     if (!s_mounted || !handle) return;
-    lfs_file_t* f = (lfs_file_t*)handle;
-    lfs_file_close(&s_lfs, f);
-    free(f);
+    lfs_buffered_file_t* bf = (lfs_buffered_file_t*)handle;
+    lfs_file_close(&s_lfs, &bf->file);
+    free(bf);
 }
 
 int32_t littlefs_driver_read_line(lfs_file_handle_t handle, char* line_buf, size_t max_len) {
     if (!s_mounted || !handle || !line_buf || max_len == 0) return -1;
-    lfs_file_t* f = (lfs_file_t*)handle;
+    lfs_buffered_file_t* bf = (lfs_buffered_file_t*)handle;
 
     size_t idx = 0;
     while (idx < max_len - 1) {
-        char c;
-        lfs_ssize_t res = lfs_file_read(&s_lfs, f, &c, 1);
-        if (res <= 0) {
-            if (idx == 0) return -1; /* EOF reached */
-            break;
+        if (bf->buf_pos >= bf->buf_len) {
+            lfs_ssize_t res = lfs_file_read(&s_lfs, &bf->file, bf->buf, sizeof(bf->buf));
+            if (res <= 0) {
+                if (idx == 0) return -1; /* EOF reached */
+                break;
+            }
+            bf->buf_pos = 0;
+            bf->buf_len = (size_t)res;
         }
+
+        char c = (char)bf->buf[bf->buf_pos++];
         if (c == '\r') continue;
         line_buf[idx++] = c;
         if (c == '\n') break;
@@ -309,4 +330,65 @@ int32_t littlefs_driver_read_file(const char* path, uint8_t* buffer, size_t max_
     lfs_file_close(&s_lfs, &file);
 
     return (bytes_read >= 0) ? (int32_t)bytes_read : -1;
+}
+int32_t littlefs_driver_read_bytes(lfs_file_handle_t handle, void* buf, size_t len) {
+    if (!s_mounted || !handle || !buf) return -1;
+    lfs_buffered_file_t* bf = (lfs_buffered_file_t*)handle;
+    uint8_t* out = (uint8_t*)buf;
+    size_t done = 0;
+
+    while (done < len) {
+        if (bf->buf_pos >= bf->buf_len) {
+            lfs_ssize_t res = lfs_file_read(&s_lfs, &bf->file, bf->buf, sizeof(bf->buf));
+            if (res < 0) return (done > 0) ? (int32_t)done : -1;
+            if (res == 0) break; /* EOF */
+            bf->buf_pos = 0;
+            bf->buf_len = (size_t)res;
+        }
+        size_t chunk = bf->buf_len - bf->buf_pos;
+        if (chunk > len - done) chunk = len - done;
+        memcpy(&out[done], &bf->buf[bf->buf_pos], chunk);
+        bf->buf_pos += chunk;
+        done += chunk;
+    }
+    return (int32_t)done;
+}
+
+int32_t littlefs_driver_read_at(const char* path, uint32_t offset, void* buf, size_t len) {
+    if (!s_mounted || !path || !buf) return -1;
+
+    lfs_file_t file;
+    if (lfs_file_open(&s_lfs, &file, path, LFS_O_RDONLY) != LFS_ERR_OK) return -1;
+
+    int32_t result = -1;
+    if (lfs_file_seek(&s_lfs, &file, (lfs_soff_t)offset, LFS_SEEK_SET) >= 0) {
+        lfs_ssize_t n = lfs_file_read(&s_lfs, &file, buf, len);
+        result = (n >= 0) ? (int32_t)n : -1;
+    }
+    lfs_file_close(&s_lfs, &file);
+    return result;
+}
+
+int32_t littlefs_driver_file_size(const char* path) {
+    if (!s_mounted || !path) return -1;
+    struct lfs_info info;
+    if (lfs_stat(&s_lfs, path, &info) != LFS_ERR_OK || info.type != LFS_TYPE_REG) return -1;
+    return (int32_t)info.size;
+}
+
+int32_t littlefs_driver_list_dir(const char* path, lfs_dir_visit_fn visit, void* ctx) {
+    if (!s_mounted || !path || !visit) return -1;
+
+    lfs_dir_t dir;
+    if (lfs_dir_open(&s_lfs, &dir, path) != LFS_ERR_OK) return -1;
+
+    int32_t visited = 0;
+    struct lfs_info info;
+    while (lfs_dir_read(&s_lfs, &dir, &info) > 0) {
+        if (strcmp(info.name, ".") == 0 || strcmp(info.name, "..") == 0) continue;
+        visited++;
+        if (!visit(info.name, (uint32_t)info.size, info.type == LFS_TYPE_DIR, ctx)) break;
+    }
+    lfs_dir_close(&s_lfs, &dir);
+    return visited;
 }

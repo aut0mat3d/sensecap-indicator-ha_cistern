@@ -20,6 +20,7 @@ static bool     s_muted_indefinitely = false;
 void alarm_init(void)
 {
     pinMode(BUZZER_PIN, OUTPUT);
+    analogWriteFreq(2700); /* 2.7 kHz resonant frequency for SenseCAP Indicator buzzer */
     analogWrite(BUZZER_PIN, 0);
 }
 
@@ -34,8 +35,10 @@ void alarm_set(uint16_t tON_ms, uint16_t tOFF_ms)
     s_alarm_tOFF = tOFF_ms;
     s_alarm_cycle_start_ms = millis();
 
-    /* Setting a new alarm automatically clears previous mutes */
-    if (tON_ms > 0) {
+    /* Immediately silence hardware if alarm is cleared */
+    if (tON_ms == 0) {
+        analogWrite(BUZZER_PIN, 0);
+    } else {
         s_muted_indefinitely = false;
         s_mute_until_ms = 0;
     }

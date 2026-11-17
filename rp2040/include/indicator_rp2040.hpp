@@ -19,6 +19,10 @@
 
 #include <Arduino.h>
 #include <PacketSerial.h>
+/* Upgrade PacketSerial internal buffer to 2048 B across RP2040 firmware */
+typedef PacketSerial_<COBS, 0, 2048> PacketSerial2048;
+#define PacketSerial PacketSerial2048
+
 #include <SPI.h>
 #include <SdFat.h>
 #include <Wire.h>
@@ -40,46 +44,85 @@ typedef enum {
 
 /* Packet protocol types for UART communication with ESP32-S3 */
 enum pkt_type {
-    PKT_TYPE_NONE                 = 0,
+    PKT_TYPE_NONE                 = 0x00,
+
+    /* ── 0x20..0x2F: System & Identity ─────────────────────────────────── */
     PKT_TYPE_CMD_GET_SYS_INFO     = 0x20,
     PKT_TYPE_RES_SYS_INFO         = 0x21,
     PKT_TYPE_CMD_SET_ESP_MAC      = 0x22,  /* Payload: 6-byte raw MAC + 11-byte expected label */
 
+    /* ── 0x30..0x4F: Storage, Configuration & File Management ─────────── */
+    PKT_TYPE_CMD_SD_GET_INFO      = 0x30,  /* Request card size, presence & validation state */
+    PKT_TYPE_RES_SD_INFO          = 0x31,  /* Response: present, usb_mounted, state, total_mb, label */
+    PKT_TYPE_CMD_SD_FORMAT        = 0x32,  /* Request format (0=LittleFS, 1=Full SD) */
+    PKT_TYPE_RES_SD_FORMAT        = 0x33,  /* Response: success (uint8_t) */
+    PKT_TYPE_CMD_USB_MSC_TOGGLE   = 0x34,  /* Toggle USB Mass Storage Mode */
+    PKT_TYPE_PUSH_LORA_CFG        = 0x35,  /* Globals & total device count */
+    PKT_TYPE_CMD_LORA_RAW_FRAME   = 0x36,  /* Payload: DevAddr(4B) + RSSI(2B) + SNR(1B) + Size(1B) + Payload(NB) */
+    PKT_TYPE_CMD_SET_TIME_CFG     = 0x37,  /* Payload: posix_tz[64] + time_format[8] */
+    PKT_TYPE_CMD_READ_FILE        = 0x38,  /* Payload: path string (null-terminated) */
+    PKT_TYPE_RES_FILE_DATA        = 0x39,  /* Payload: status(uint8_t) + length(uint16_t) + data[] */
+    PKT_TYPE_CMD_SYNC_TIME        = 0x3A,  /* Payload: utc_ts(uint32_t) + flags(uint8_t) */
+    PKT_TYPE_CMD_GET_CHART_DATA   = 0x3B,  /* Request: zone query from ESP32 */
+    PKT_TYPE_RES_CHART_DATA       = 0x3C,  /* Response: packed array of chart_data_point_t */
+    PKT_TYPE_CMD_GET_TIME         = 0x3D,  /* Request last saved UTC timestamp from LittleFS */
+    PKT_TYPE_RES_TIME             = 0x3E,  /* Response: uint32_t last_utc */
+    PKT_TYPE_PUSH_LORA_DEV        = 0x3F,  /* Streamed single device configuration chunk */
+    PKT_TYPE_CMD_SET_THRESHOLD    = 0x40,  /* ESP32 -> RP2040: Patch threshold entry on SD */
+    PKT_TYPE_RES_SET_THRESHOLD    = 0x41,  /* RP2040 -> ESP32: Status (uint8_t: 1=OK, 0=ERR) */
+    PKT_TYPE_CMD_SET_OFFSET       = 0x42,  /* ESP32 -> RP2040: Patch offset entry on SD */
+    PKT_TYPE_RES_SET_OFFSET       = 0x43,  /* RP2040 -> ESP32: Status (uint8_t: 1=OK, 0=ERR) */
+    
+
+    /* ── 0xA0..0xAF: Power, Hardware & Buzzer Control ─────────────────── */
     PKT_TYPE_CMD_COLLECT_INTERVAL = 0xA0,  /* uint32_t ms */
     PKT_TYPE_CMD_BEEP_ON          = 0xA1,  /* Legacy single beep click */
     PKT_TYPE_CMD_BEEP_OFF         = 0xA2,
     PKT_TYPE_CMD_SHUTDOWN         = 0xA3,
     PKT_TYPE_CMD_POWER_ON         = 0xA4,
     PKT_TYPE_CMD_RESCAN_GROVE     = 0xA5,
-
-    /* Cistern Alarm System Packets */
     PKT_TYPE_CMD_ALARM_SET        = 0xA6,  /* Payload: uint16_t tON_ms, uint16_t tOFF_ms */
     PKT_TYPE_CMD_ALARM_MUTE       = 0xA7,  /* Payload: uint32_t mute_sec (0=indefinite) */
     PKT_TYPE_CMD_ALARM_REARM      = 0xA8,  /* Payload: none */
+    PKT_TYPE_CMD_ALARM_SAVE       = 0xA9,  /* Payload: chunk_idx(1B) + total_chunks(1B) + count(1B) + entries[] */
+    PKT_TYPE_CMD_ALARM_LOAD       = 0xAA,  /* Request: trigger RP2040 to stream saved history */
+    PKT_TYPE_RES_ALARM_LOAD       = 0xAB,   /* Response: chunk_idx(1B) + total_chunks(1B) + count(1B) + entries[] */
 
-    /* SD Card Management Packets */
-    PKT_TYPE_CMD_SD_GET_INFO      = 0x30,  /* Request card size, presence & validation state */
-    PKT_TYPE_RES_SD_INFO          = 0x31,  /* Response: present, usb_mounted, state, total_mb, label */
-    PKT_TYPE_CMD_SD_FORMAT        = 0x32,  /* Request format (0=LittleFS, 1=Full SD) */
-    PKT_TYPE_RES_SD_FORMAT        = 0x33,  /* Response: success (uint8_t) */
-    PKT_TYPE_CMD_USB_MSC_TOGGLE   = 0x34,  /* Toggle USB Mass Storage Mode */
-
-    PKT_TYPE_CMD_LORA_RAW_FRAME   = 0x36,  /* Payload: DevAddr(4B) + RSSI(2B) + SNR(1B) + Size(1B) + Payload(NB) */
-    PKT_TYPE_CMD_SET_TIME_CFG     = 0x37, /* Payload: posix_tz[64] + time_format[8] */
-    PKT_TYPE_CMD_READ_FILE        = 0x38, /* Payload: path string (null-terminated) */
-    PKT_TYPE_RES_FILE_DATA        = 0x39, /* Payload: status(uint8_t: 0=Error/Not found, 1=Data) + length(uint16_t) + data[] */
-    PKT_TYPE_CMD_SYNC_TIME        = 0x3A, /* Payload: utc_ts(uint32_t, 4B) + flags(uint8_t, 1B) */
-    PKT_TYPE_CMD_GET_CHART_DATA   = 0x3B, /* Request: zone query from ESP32 */
-    PKT_TYPE_RES_CHART_DATA       = 0x3C, /* Response: packed array of chart_data_point_t */
-    PKT_TYPE_CMD_GET_TIME         = 0x3D, /* Request last saved UTC timestamp from LittleFS */
-    PKT_TYPE_RES_TIME             = 0x3E, /* Response: uint32_t last_utc */
-    
-
-    /* Dynamic Sensor Registry Packets */
-    PKT_TYPE_LORA_TELEMETRY  = 0xBB,  /* Payload: DevAddr(4B) + SensorID(1B) + FloatVal(4B) + Checksum(1B) */
-    PKT_TYPE_LOCAL_TELEMETRY = 0xBC,  /* Onboard and Grove I2C sensors */
-
+    /* ── 0xB0..0xBF: Telemetry Data ────────────────────────────────────── */
+    PKT_TYPE_LORA_TELEMETRY       = 0xBB,  /* External LoRa / LoRaWAN nodes */
+    PKT_TYPE_LOCAL_TELEMETRY      = 0xBC   /* Onboard and Grove I2C sensors */
 };
+
+/* ── Alarm History Data Structures & Types ──────────────────────────────── */
+
+#define ALARM_SOURCE_MAX_LEN   32
+#define ALARM_MESSAGE_MAX_LEN  128
+
+typedef enum {
+    ALARM_STATE_INCOMING = 0,
+    ALARM_STATE_GOING,
+    ALARM_STATE_MUTED,
+    ALARM_STATE_RETRIGGERED,
+    ALARM_STATE_ACKNOWLEDGED
+} alarm_state_t;
+
+typedef enum {
+    ALARM_SEVERITY_DANGER = 0,
+    ALARM_SEVERITY_WARNING,
+    ALARM_SEVERITY_INFO
+} alarm_severity_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t timestamp;
+    char     source[ALARM_SOURCE_MAX_LEN];
+    char     message[ALARM_MESSAGE_MAX_LEN];
+    uint32_t severity;        /* Matches 32-bit enum */
+    uint32_t state;           /* Matches 32-bit enum */
+    uint8_t  is_acknowledged;
+    uint8_t  _pad[3];          /* 3 bytes padding for 4-byte boundary */
+    uint32_t acknowledged_at;
+    uint32_t triggered_count;
+} alarm_entry_t;
 
 
 /* Sensor Data Structures */
@@ -159,4 +202,7 @@ class NonBlockingDelay {
 
     void setInterval(unsigned long newInterval) { interval = newInterval; }
 };
+
+/* Include non-blocking Telemetry TX Queue AFTER all enums and types are declared */
+#include "telemetry_queue.hpp"
 

@@ -65,46 +65,49 @@ typedef void (*chart_data_callback_t)(uint8_t req_id, uint8_t status, uint32_t a
 
 enum pkt_type_cmd
 {
-	PKT_TYPE_NONE                 = 0,
-	PKT_TYPE_CMD_COLLECT_INTERVAL = 0xA0, /* uint32_t ms */
-	PKT_TYPE_CMD_BEEP_ON          = 0xA1, /* uint32_t ms duration */
-	PKT_TYPE_CMD_BEEP_OFF         = 0xA2,
-	PKT_TYPE_CMD_SHUTDOWN         = 0xA3,
-	PKT_TYPE_CMD_POWER_ON         = 0xA4,
-	PKT_TYPE_CMD_RESCAN_GROVE     = 0xA5,
+    PKT_TYPE_NONE                 = 0x00,
 
-	/* Cistern Alarm System */
-	PKT_TYPE_CMD_ALARM_SET        = 0xA6, /* tON_ms, tOFF_ms */
-	PKT_TYPE_CMD_ALARM_MUTE       = 0xA7, /* mute_sec */
-	PKT_TYPE_CMD_ALARM_REARM      = 0xA8,
-	PKT_TYPE_CMD_ALARM_ACK_ALL    = 0xA9, /* Acknowledge all alarms */
-	PKT_TYPE_CMD_ALARM_GET_LIST   = 0xAA, /* Request alarm list */
-	PKT_TYPE_RES_ALARM_LIST       = 0xAB, /* Response with alarm data */
-	PKT_TYPE_CMD_ALARM_ADD        = 0xAC, /* Add new alarm to RP2040 */
-	PKT_TYPE_CMD_ALARM_CONFIG_GET = 0xAD, /* Get alarm config from LittleFS */
-	PKT_TYPE_RES_ALARM_CONFIG     = 0xAE, /* Response with alarm config */
+    /* ── 0x20..0x2F: System & Identity ─────────────────────────────────── */
+    PKT_TYPE_CMD_GET_SYS_INFO     = 0x20,
+    PKT_TYPE_RES_SYS_INFO         = 0x21,
+    PKT_TYPE_CMD_SET_ESP_MAC      = 0x22,  /* Payload: 6-byte raw MAC + 11-byte expected label */
 
-	PKT_TYPE_CMD_SET_ESP_MAC     = 0x22, /* Payload: 6-byte raw MAC + 11-byte expected label */
+    /* ── 0x30..0x4F: Storage, Configuration & File Management ─────────── */
+    PKT_TYPE_CMD_SD_GET_INFO      = 0x30,  /* Request card size, presence & label check */
+    PKT_TYPE_RES_SD_INFO          = 0x31,  /* Response: present, usb_mounted, state, total_mb, label */
+    PKT_TYPE_CMD_SD_FORMAT        = 0x32,  /* Payload: format_type (0=LFS, 1=Full SD) + volume_label[12] */
+    PKT_TYPE_RES_SD_FORMAT        = 0x33,  /* Response: success (uint8_t) */
+    PKT_TYPE_CMD_USB_MSC_TOGGLE   = 0x34,  /* Toggle USB Mass Storage Mode */
+    PKT_TYPE_PUSH_LORA_CFG        = 0x35,  /* Globals & total device count */
+    PKT_TYPE_CMD_LORA_RAW_FRAME   = 0x36,  /* Payload: DevAddr(4B) + RSSI(2B) + SNR(1B) + Size(1B) + RawData(NB) */
+    PKT_TYPE_CMD_SET_TIME_CFG     = 0x37,  /* Payload: posix_tz[64] + time_format[8] */
+    PKT_TYPE_CMD_READ_FILE        = 0x38,  /* Payload: path string (null-terminated) */
+    PKT_TYPE_RES_FILE_DATA        = 0x39,  /* Payload: status(uint8_t) + length(uint16_t) + data[] */
+    PKT_TYPE_CMD_SYNC_TIME        = 0x3A,
+    PKT_TYPE_CMD_GET_CHART_DATA   = 0x3B,  /* Request: zone query from ESP32 */
+    PKT_TYPE_RES_CHART_DATA       = 0x3C,  /* Response: packed array of chart_data_point_t */
+    PKT_TYPE_CMD_GET_TIME         = 0x3D,  /* Request last saved UTC timestamp from LittleFS */
+    PKT_TYPE_RES_TIME             = 0x3E,  /* Response: uint32_t last_utc */
+    PKT_TYPE_PUSH_LORA_DEV        = 0x3F,  /* Streamed single device configuration chunk */
+    PKT_TYPE_CMD_SET_THRESHOLD    = 0x40,  /* ESP32 -> RP2040: Patch threshold entry on SD */
+    PKT_TYPE_RES_SET_THRESHOLD    = 0x41,  /* RP2040 -> ESP32: Status (uint8_t: 1=OK, 0=ERR) */
+    PKT_TYPE_CMD_SET_OFFSET       = 0x42,  /* ESP32 -> RP2040: Patch offset entry on SD */
+    PKT_TYPE_RES_SET_OFFSET       = 0x43,  /* RP2040 -> ESP32: Status (uint8_t: 1=OK, 0=ERR) */
 
-	/* SD Card Management Packets */
-	PKT_TYPE_CMD_SD_GET_INFO     = 0x30, /* Request card size, presence & label check */
-    PKT_TYPE_RES_SD_INFO         = 0x31, /* Response: present, usb_mounted, state, total_mb, label */
-    PKT_TYPE_CMD_SD_FORMAT       = 0x32, /* Payload: format_type (0=LFS, 1=Full SD) + volume_label[12] */
-    PKT_TYPE_RES_SD_FORMAT       = 0x33, /* Response: success (uint8_t) */
-    PKT_TYPE_CMD_USB_MSC_TOGGLE  = 0x34, /* Toggle USB Mass Storage Mode */
 
-	PKT_TYPE_PUSH_LORA_CFG       = 0x35, /* Payload: valid_flag + globals + devices */
-    PKT_TYPE_CMD_LORA_RAW_FRAME  = 0x36, /* Payload: DevAddr(4B) + RSSI(2B) + SNR(1B) + Size(1B) + RawData(NB) */
-
-	PKT_TYPE_CMD_SET_TIME_CFG 	 = 0x37, /* Payload: posix_tz[64] + time_format[8] */
-    PKT_TYPE_CMD_READ_FILE       = 0x38, /* Payload: path string (null-terminated) */
-    PKT_TYPE_RES_FILE_DATA       = 0x39, /* Payload: status(uint8_t: 0=Error/Not found, 1=Data) + length(uint16_t) + data[] */
-
-    PKT_TYPE_CMD_SYNC_TIME       = 0x3A,
-    PKT_TYPE_CMD_GET_CHART_DATA  = 0x3B, /* Request: zone query from ESP32 */
-    PKT_TYPE_RES_CHART_DATA      = 0x3C, /* Response: packed array of chart_data_point_t */
-    PKT_TYPE_CMD_GET_TIME        = 0x3D, /* Request last saved UTC timestamp from LittleFS */
-    PKT_TYPE_RES_TIME            = 0x3E, /* Response: uint32_t last_utc */
+    /* ── 0xA0..0xAF: Power, Hardware & Buzzer Control ─────────────────── */
+    PKT_TYPE_CMD_COLLECT_INTERVAL = 0xA0,  /* uint32_t ms */
+    PKT_TYPE_CMD_BEEP_ON          = 0xA1,  /* Legacy single beep click */
+    PKT_TYPE_CMD_BEEP_OFF         = 0xA2,
+    PKT_TYPE_CMD_SHUTDOWN         = 0xA3,
+    PKT_TYPE_CMD_POWER_ON         = 0xA4,
+    PKT_TYPE_CMD_RESCAN_GROVE     = 0xA5,
+    PKT_TYPE_CMD_ALARM_SET        = 0xA6,  /* tON_ms, tOFF_ms */
+    PKT_TYPE_CMD_ALARM_MUTE       = 0xA7,  /* mute_sec */
+    PKT_TYPE_CMD_ALARM_REARM      = 0xA8,
+    PKT_TYPE_CMD_ALARM_SAVE       = 0xA9,  /* Payload: chunk_idx(1B) + total_chunks(1B) + count(1B) + entries[] */
+    PKT_TYPE_CMD_ALARM_LOAD       = 0xAA,  /* Request: trigger RP2040 to stream saved history */
+    PKT_TYPE_RES_ALARM_LOAD       = 0xAB   /* Response: chunk_idx(1B) + total_chunks(1B) + count(1B) + entries[] */
 };
 
 enum pkt_type_data
@@ -138,6 +141,63 @@ void rp2040_register_chart_data_callback(chart_data_callback_t cb);
 int rp2040_request_chart_data(uint8_t req_id, uint32_t dev_addr, const char *key,
                               uint32_t start_ts, uint32_t end_ts, uint32_t interval_sec,
                               uint16_t max_points, float alarm_min, float alarm_max);
+
+
+/* Alarm (Buzzer) */
+int rp2040_alarm_set(uint16_t t_on_ms, uint16_t t_off_ms);
+int rp2040_alarm_mute(uint32_t mute_sec);
+int rp2040_alarm_rearm(void);
+
+/* Forward declaration to avoid circular include with alarm_model.h */
+struct alarm_entry_s;
+
+/**
+ * @brief Transmit an alarm history chunk to RP2040 for SD card persistence.
+ * @param chunk_idx Zero-based index of this chunk.
+ * @param total_chunks Total number of chunks in this burst.
+ * @param count Number of alarm entries in this chunk.
+ * @param entries Pointer to array of alarm entries.
+ * @return Number of UART bytes written, or -1 on error.
+ */
+int rp2040_alarm_send_save_chunk(uint8_t chunk_idx, uint8_t total_chunks, uint8_t count, const void *entries);
+
+/**
+ * @brief Request RP2040 to stream saved alarm history from SD card.
+ * @return Number of UART bytes written, or -1 on error.
+ */
+int rp2040_alarm_request_load(void);
+
+/**
+ * @brief Transmit a threshold configuration update to the RP2040 for SD card persistence.
+ *
+ * @param dev_addr Target device network address (DevAddr).
+ * @param rule_id Unique threshold identifier string (e.g. "alarm_low").
+ * @param is_percent True if value represents percentage, false for physical unit.
+ * @param threshold_val Numeric threshold trigger value.
+ * @param hysteresis_val Numeric hysteresis deadband value.
+ * @param damping Required consecutive filter hits.
+ * @param severity Alarm severity level (0=danger, 1=warning, 2=info).
+ * @param buzzer_mode Buzzer audio pattern (0=intermittent, 1=continuous, 2=off).
+ * @param timeout_ms Response wait timeout in ms (0 for fire-and-forget).
+ * @return 0 on success, negative error code on failure or timeout.
+ */
+int rp2040_send_set_threshold(uint32_t dev_addr, const char *rule_id,
+                              bool is_percent, float threshold_val, float hysteresis_val,
+                              uint8_t damping, uint8_t severity, uint8_t buzzer_mode,
+                              uint32_t timeout_ms);
+
+/**
+ * @brief Transmit a sensor offset update to the RP2040 for SD card persistence.
+ *
+ * @param dev_addr Target device network address (DevAddr).
+ * @param key Telemetry key string (e.g. "depth").
+ * @param value Numeric offset value.
+ * @param unit Engineering unit string (e.g. "mm", "cm").
+ * @param timeout_ms Response wait timeout in ms (0 for fire-and-forget).
+ * @return 0 on success, negative error code on failure or timeout.
+ */
+int rp2040_send_set_offset(uint32_t dev_addr, const char *key,
+                           float value, const char *unit, uint32_t timeout_ms);
 
 #ifdef __cplusplus
 } /*extern "C"*/

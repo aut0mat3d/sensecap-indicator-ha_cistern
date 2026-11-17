@@ -116,6 +116,41 @@ bool littlefs_driver_exists(const char* path);
  */
 bool littlefs_driver_remove(const char* path);
 
+/**
+ * @brief Append raw bytes to a file (binary safe). Creates parent directories if needed.
+ * @return true if all bytes were written and synced.
+ */
+bool littlefs_driver_append_bytes(const char* path, const void* data, size_t len);
+
+/**
+ * @brief Read raw bytes from an open file handle (shares the read-ahead buffer with read_line).
+ * @return Number of bytes read (0 at EOF), or -1 on error.
+ */
+int32_t littlefs_driver_read_bytes(lfs_file_handle_t handle, void* buf, size_t len);
+
+/**
+ * @brief Read len bytes at a byte offset of a file (open, seek, read, close).
+ * @return Number of bytes read, or -1 on error.
+ */
+int32_t littlefs_driver_read_at(const char* path, uint32_t offset, void* buf, size_t len);
+
+/**
+ * @brief Size of a file in bytes, or -1 if it does not exist.
+ */
+int32_t littlefs_driver_file_size(const char* path);
+
+/**
+ * @brief Directory entry callback for littlefs_driver_list_dir().
+ * @return false to stop the iteration.
+ */
+typedef bool (*lfs_dir_visit_fn)(const char* name, uint32_t size, bool is_dir, void* ctx);
+
+/**
+ * @brief Iterate the entries of a directory ("." and ".." are skipped).
+ * @return Number of visited entries, or -1 if the directory cannot be opened.
+ */
+int32_t littlefs_driver_list_dir(const char* path, lfs_dir_visit_fn visit, void* ctx);
+
 #ifdef __cplusplus
 }
 #endif

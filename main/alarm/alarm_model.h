@@ -120,11 +120,19 @@ typedef struct {
 typedef struct {
     alarm_color_config_t colors;
     alarm_text_config_t texts;
+    char     hw_button_behavior[16]; /**< "MUTE_TIME", "MUTE_PERM", "ACK_ALL" */
+    uint32_t mute_duration_sec;      /**< Duration in seconds (e.g. 7200) */
 } alarm_ui_config_t;
 
 // ============================================================================
 // Public API
 // ============================================================================
+
+/**
+ * @brief Check if system time has been synchronized (NTP, LoRa, or LittleFS recovery).
+ * @return true if time is valid (>= 1.7B), false if running on un-synced 1970 uptime.
+ */
+bool alarm_time_is_valid(void);
 
 /**
  * @brief Initialize alarm system
@@ -144,6 +152,8 @@ void alarm_model_shutdown(void);
  * @return Pointer to the new alarm entry, or NULL on error
  */
 alarm_entry_t* alarm_add(const char* source, const char* message, alarm_severity_t severity);
+
+alarm_entry_t* alarm_add_ex(const char* source, const char* message, alarm_severity_t severity, uint8_t buzzer_mode);
 
 /**
  * @brief Acknowledge an alarm (set state to ACKNOWLEDGED)
@@ -175,6 +185,12 @@ bool alarm_is_muted(void);
 uint32_t alarm_get_mute_remaining(void);
 
 /**
+ * @brief Check if there are active unacknowledged and unmuted alarms requiring attention.
+ * @return true if an active alarm requires operator action, false otherwise.
+ */
+bool alarm_has_active_unacknowledged(void);
+
+/**
  * @brief Set alarm state
  * @param entry Alarm entry
  * @param state New state
@@ -200,7 +216,7 @@ alarm_entry_t* alarm_get_ringbuffer(size_t* count);
 
 /**
  * @brief Load alarm configuration from LittleFS
- * @param path Path to config file on LittleFS (e.g., "/gui/alarm_config.json")
+ * @param path Path to config file on LittleFS (e.g., "/alarm/alarm_config.json")
  * @return true on success
  */
 bool alarm_config_load(const char* path);
@@ -223,6 +239,14 @@ bool alarm_history_load(void);
  * @return true on success
  */
 bool alarm_history_save(void);
+
+/**
+ * @brief Ingest an alarm history chunk received from RP2040 via UART.
+ * @param data Buffer containing chunk metadata and alarm entries.
+ * @param len Total length of data buffer.
+ */
+void alarm_model_on_history_chunk_received(const uint8_t *data, size_t len);
+
 
 /**
  * @brief Get alarm UI configuration (colors and texts)
@@ -257,5 +281,14 @@ void alarm_buzzer_stop(void);
  * @brief Update buzzer state based on active alarms
  */
 void alarm_buzzer_update(void);
+
+/**
+ * @brief Resolve/clear an active alarm when condition returns to normal.
+ *        Transitions state to ALARM_STATE_GOING (or resolves acknowledged alarms).
+ * @param source Alarm source identifier (e.g. "Hochbehaelter")
+ * @param message Alarm message identifier
+ */
+void alarm_resolve(const char* source, const char* message);
+
 
 #endif /* ALARM_MODEL_H */

@@ -15,8 +15,8 @@
 extern "C" {
 #endif
 
-#define FOOTER_HEIGHT   27
-#define FOOTER_POS_Y    453
+#define FOOTER_HEIGHT   32
+#define FOOTER_POS_Y    448
 
 /**
  * @brief Initialize the global footer container on the base screen.

@@ -1,7 +1,8 @@
 /**
  * @file horiz_bargraph.c
- * @brief Horizontal bar/line graph with dynamic scaling, compact mode (5x2),
- *        multi-zone time segmentation (1-4 zones), and LVGL 9 draw-task interception.
+ * @brief Horizontal bar/line graph with multi-zone time segmentation (1-4 zones),
+ *        10x8 seamless tile grid alignment, and LVGL 9 draw-task interception.
+ *        Guarantees zero external outlines and strictly internal border rendering.
  *
  * @copyright © 2026, SenseCAP Cistern Extension
  */
@@ -11,13 +12,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "alarm_model.h"
+#include <math.h>
 
 LV_FONT_DECLARE(ui_font_font0);
 
 #define DEFAULT_BG_COLOR      lv_color_hex(0x282828)
-#define DEFAULT_BAR_COLOR     lv_color_hex(0x3498db)
+#define DEFAULT_BAR_COLOR     lv_color_hex(0x3498DB)
 #define DEFAULT_TEXT_COLOR    lv_color_hex(0x9E9E9E)
 #define DEFAULT_ALARM_COLOR   lv_color_hex(0xE74C3C)
+#define DEFAULT_BORDER_COLOR  lv_color_hex(0x000000) /* Permanent seamless black bezel */
 
 static inline bool is_color_empty(lv_color_t c) {
     static const lv_color_t zero = {0};
@@ -29,6 +33,28 @@ static void horiz_bargraph_click_handler(lv_event_t *e) {
     horiz_bargraph_t *graph = (horiz_bargraph_t *)lv_obj_get_user_data(container);
     if (graph && graph->click_cb) {
         graph->click_cb(e);
+    }
+}
+
+/**
+ * @brief Refreshes the permanent internal bezel color without altering widget dimensions.
+ *        Prevents memory buffer shifts, coordinate overflow, and layout recalculations.
+ */
+static void _horiz_bargraph_refresh_border(horiz_bargraph_t *graph) {
+    if (!graph || !graph->container) return;
+
+    bool current_is_alarm = false;
+    if (graph->data_count > 0 && graph->is_alarm[graph->data_count - 1]) {
+        current_is_alarm = true;
+    }
+
+    if (current_is_alarm) {
+        const alarm_ui_config_t *ui_cfg = alarm_get_ui_config();
+        lv_color_t danger_col = lv_color_hex(ui_cfg ? ui_cfg->colors.color_danger : 0xE74C3C);
+        lv_obj_set_style_border_color(graph->container, danger_col, LV_PART_MAIN);
+    } else {
+        /* Idle state: permanent black border */
+        lv_obj_set_style_border_color(graph->container, DEFAULT_BORDER_COLOR, LV_PART_MAIN);
     }
 }
 
@@ -50,21 +76,26 @@ static void horiz_bargraph_draw_task_cb(lv_event_t *e) {
             /* Empty historical slots: 100% transparent (no draw artifact) */
             if (!graph->has_data[pt_idx]) {
                 fill_dsc->opa = LV_OPA_TRANSP;
-            } else if (graph->is_alarm[pt_idx]) {
-                fill_dsc->color = !is_color_empty(graph->alarm_color) ? graph->alarm_color : DEFAULT_ALARM_COLOR;
-                fill_dsc->opa = LV_OPA_COVER;
-            } else if (graph->is_estimated[pt_idx]) {
-                fill_dsc->color = graph->bar_color;
-                fill_dsc->opa = LV_OPA_50;
             } else {
-                fill_dsc->color = graph->bar_color;
-                fill_dsc->opa = LV_OPA_COVER;
+                /* 1. State determines color (Alarm vs. Configured Media Color) */
+                if (graph->is_alarm[pt_idx]) {
+                    fill_dsc->color = !is_color_empty(graph->alarm_color) ? graph->alarm_color : DEFAULT_ALARM_COLOR;
+                } else {
+                    fill_dsc->color = graph->bar_color;
+                }
+
+                /* 2. Quality determines opacity (Estimated = 50% shading, Real = 100% solid) */
+                if (graph->is_estimated[pt_idx]) {
+                    fill_dsc->opa = LV_OPA_50;
+                } else {
+                    fill_dsc->opa = LV_OPA_COVER;
+                }
             }
         }
     }
 }
 
-static void _horiz_bargraph_update_internal(horiz_bargraph_t *graph, const float *new_data, 
+static void _horiz_bargraph_update_internal(horiz_bargraph_t *graph, const float *new_data,
                                             const bool *is_estimated, const bool *is_alarm, uint8_t count) {
     if (!graph || !graph->chart || !new_data) return;
 
@@ -72,16 +103,22 @@ static void _horiz_bargraph_update_internal(horiz_bargraph_t *graph, const float
     graph->data_count = copy_count;
 
     for (uint8_t i = 0; i < copy_count; i++) {
-        graph->data[i] = new_data[i];
-        graph->is_estimated[i] = is_estimated ? is_estimated[i] : false;
-        graph->is_alarm[i] = is_alarm ? is_alarm[i] : false;
+        bool is_invalid = isnan(new_data[i]) || isinf(new_data[i]);
+        graph->data[i] = is_invalid ? 0.0f : new_data[i];
+        graph->has_data[i] = !is_invalid;
+        graph->is_estimated[i] = (!is_invalid && is_estimated) ? is_estimated[i] : false;
+        graph->is_alarm[i] = (!is_invalid && is_alarm) ? is_alarm[i] : false;
     }
 
     lv_chart_set_point_count(graph->chart, copy_count > 0 ? copy_count : 1);
     for (uint8_t i = 0; i < copy_count; i++) {
-        lv_chart_set_value_by_id(graph->chart, graph->series, i, (int32_t)(new_data[i] + 0.5f));
+        int32_t pt_val = graph->has_data[i] ? (int32_t)(graph->data[i] + 0.5f) : 0;
+        lv_chart_set_value_by_id(graph->chart, graph->series, i, pt_val);
     }
     lv_chart_refresh(graph->chart);
+
+    /* Update internal bezel color based on real-time alarm state */
+    _horiz_bargraph_refresh_border(graph);
 }
 
 int horiz_bargraph_init(horiz_bargraph_t *graph) {
@@ -89,13 +126,16 @@ int horiz_bargraph_init(horiz_bargraph_t *graph) {
 
     lv_port_sem_take();
 
+    /* Apply default styling and parameters */
     if (!graph->font) graph->font = &ui_font_font0;
     if (is_color_empty(graph->bg_color)) graph->bg_color = DEFAULT_BG_COLOR;
     if (is_color_empty(graph->bar_color)) graph->bar_color = DEFAULT_BAR_COLOR;
     if (is_color_empty(graph->text_color)) graph->text_color = DEFAULT_TEXT_COLOR;
     if (is_color_empty(graph->alarm_color)) graph->alarm_color = DEFAULT_ALARM_COLOR;
-    if (graph->width == 0) graph->width = 472;
-    if (graph->height == 0) graph->height = 136;
+
+    /* Fallback to standard 10x3 grid tile geometry (480 x 144 px) if unspecified */
+    if (graph->width == 0) graph->width = HORIZ_BARGRAPH_DEFAULT_W;
+    if (graph->height == 0) graph->height = HORIZ_BARGRAPH_DEFAULT_H;
     if (graph->min_value == 0.0f && graph->max_value == 0.0f) graph->max_value = 100.0f;
 
     /* 1. Main Card Container */
@@ -103,18 +143,23 @@ int horiz_bargraph_init(horiz_bargraph_t *graph) {
     lv_obj_set_size(graph->container, graph->width, graph->height);
     lv_obj_set_pos(graph->container, graph->x, graph->y);
     lv_obj_remove_flag(graph->container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_radius(graph->container, 12, LV_PART_MAIN);
+    lv_obj_set_style_radius(graph->container, 8, LV_PART_MAIN);
     lv_obj_set_style_bg_color(graph->container, graph->bg_color, LV_PART_MAIN);
-    lv_obj_set_style_border_width(graph->container, 0, LV_PART_MAIN);
+
+    /* Permanent 2px internal bezel (black in idle, colored in alarm) */
+    lv_obj_set_style_border_width(graph->container, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(graph->container, DEFAULT_BORDER_COLOR, LV_PART_MAIN);
+    lv_obj_set_style_outline_width(graph->container, 0, LV_PART_MAIN);
+
     lv_obj_set_style_pad_all(graph->container, 6, LV_PART_MAIN);
-    
+
     lv_obj_set_user_data(graph->container, graph);
     lv_obj_add_event_cb(graph->container, horiz_bargraph_click_handler, LV_EVENT_CLICKED, NULL);
 
-    bool is_compact = (graph->height <= 95);
+    bool is_compact = (graph->height <= 96);
     uint16_t chart_top_offset = (is_compact) ? 18 : 24;
 
-    /* 2. Title Label */
+    /* 2. Title Label (single-zone mode) */
     if (graph->title && graph->title[0] != '\0') {
         graph->lbl_title = lv_label_create(graph->container);
         lv_label_set_text(graph->lbl_title, graph->title);
@@ -134,13 +179,13 @@ int horiz_bargraph_init(horiz_bargraph_t *graph) {
     }
 
     uint16_t chart_w = (graph->width > 12) ? (graph->width - 12) : 50;
-    uint16_t chart_h = (graph->height > chart_top_offset + 6) ? (graph->height - chart_top_offset - 6) : 30;
+    uint16_t chart_h = (graph->height > chart_top_offset + 12) ? (graph->height - chart_top_offset - 12) : 30;
 
     /* 4. Chart Widget */
     graph->chart = lv_chart_create(graph->container);
     lv_obj_set_size(graph->chart, chart_w, chart_h);
     lv_obj_set_pos(graph->chart, 0, chart_top_offset);
-    
+
     switch (graph->chart_type) {
         case HORIZ_BARGRAPH_TYPE_LINE:
             lv_chart_set_type(graph->chart, LV_CHART_TYPE_LINE);
@@ -164,7 +209,7 @@ int horiz_bargraph_init(horiz_bargraph_t *graph) {
 
     lv_chart_set_point_count(graph->chart, graph->data_count > 0 ? graph->data_count : 31);
     lv_chart_set_range(graph->chart, LV_CHART_AXIS_PRIMARY_Y, (int32_t)graph->min_value, (int32_t)graph->max_value);
-    
+
     lv_obj_set_style_bg_opa(graph->chart, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_border_width(graph->chart, 0, LV_PART_MAIN);
 
@@ -179,6 +224,13 @@ int horiz_bargraph_init(horiz_bargraph_t *graph) {
     return 0;
 }
 
+void horiz_bargraph_clear_all(horiz_bargraph_t *graph) {
+    if (!graph || !graph->chart) return;
+    for (uint8_t z = 0; z < graph->zone_count; z++) {
+        horiz_bargraph_update_zone_data(graph, z, NULL, 0);
+    }
+}
+
 void horiz_bargraph_update_data(horiz_bargraph_t *graph, const float *new_data, uint8_t count) {
     if (!graph) return;
     lv_port_sem_take();
@@ -186,7 +238,7 @@ void horiz_bargraph_update_data(horiz_bargraph_t *graph, const float *new_data, 
     lv_port_sem_give();
 }
 
-void horiz_bargraph_update_series(horiz_bargraph_t *graph, const float *values, 
+void horiz_bargraph_update_series(horiz_bargraph_t *graph, const float *values,
                                   const bool *is_estimated, const bool *is_alarm, uint8_t count) {
     if (!graph) return;
     lv_port_sem_take();
@@ -197,19 +249,23 @@ void horiz_bargraph_update_series(horiz_bargraph_t *graph, const float *values,
 void horiz_bargraph_update_point(horiz_bargraph_t *graph, uint8_t index, float value, bool is_estimated, bool is_alarm) {
     if (!graph || !graph->chart || index >= HORIZ_BARGRAPH_MAX_POINTS) return;
     lv_port_sem_take();
-    graph->data[index] = value;
-    graph->is_estimated[index] = is_estimated;
-    graph->is_alarm[index] = is_alarm;
+    bool is_invalid = isnan(value) || isinf(value);
+    graph->data[index] = is_invalid ? 0.0f : value;
+    graph->has_data[index] = !is_invalid;
+    graph->is_estimated[index] = !is_invalid && is_estimated;
+    graph->is_alarm[index] = !is_invalid && is_alarm;
     if (index >= graph->data_count) graph->data_count = index + 1;
     if (index < lv_chart_get_point_count(graph->chart)) {
-        lv_chart_set_value_by_id(graph->chart, graph->series, index, (int32_t)(value + 0.5f));
+        lv_chart_set_value_by_id(graph->chart, graph->series, index, is_invalid ? 0 : (int32_t)(value + 0.5f));
         lv_chart_refresh(graph->chart);
     }
+
+    _horiz_bargraph_refresh_border(graph);
     lv_port_sem_give();
 }
 
 void horiz_bargraph_set_axis_labels(horiz_bargraph_t *graph, const char **labels, uint8_t count) {
-    if (!graph || !labels || graph->height <= 95) return;
+    if (!graph || !labels || graph->height <= 96) return;
     lv_port_sem_take();
 
     graph->axis_label_count = (count <= HORIZ_BARGRAPH_MAX_LABELS) ? count : HORIZ_BARGRAPH_MAX_LABELS;
@@ -217,12 +273,12 @@ void horiz_bargraph_set_axis_labels(horiz_bargraph_t *graph, const char **labels
         graph->axis_labels[i] = labels[i];
     }
 
-    /* Restore title visibility if active */
+    /* Restore title visibility if defined */
     if (graph->lbl_title && graph->title && graph->title[0] != '\0') {
         lv_obj_remove_flag(graph->lbl_title, LV_OBJ_FLAG_HIDDEN);
     }
 
-    uint16_t chart_w = (graph->width > 16) ? (graph->width - 12) : 50;
+    uint16_t chart_w = (graph->width > 12) ? (graph->width - 12) : 50;
 
     if (graph->container && graph->axis_label_count > 0) {
         for (uint8_t i = 0; i < graph->axis_label_count; i++) {
@@ -276,7 +332,7 @@ void horiz_bargraph_set_zones(horiz_bargraph_t *graph, const horiz_bargraph_zone
     }
 
     uint16_t chart_w = (graph->width > 12) ? (graph->width - 12) : 50;
-    bool is_compact = (graph->height <= 95);
+    bool is_compact = (graph->height <= 96);
     uint8_t accumulated_bars = 0;
     uint16_t divider_height = graph->height / 4; /* Top 25% height */
 
@@ -304,7 +360,7 @@ void horiz_bargraph_set_zones(horiz_bargraph_t *graph, const horiz_bargraph_zone
                 lv_obj_add_flag(graph->axis_labels_obj[z], LV_OBJ_FLAG_HIDDEN);
             }
 
-            /* 2. Vertical divider line between this zone and next zone */
+            /* 2. Vertical divider line between this zone and the next */
             if (z < graph->zone_count - 1) {
                 if (!graph->zone_dividers[z]) {
                     graph->zone_dividers[z] = lv_obj_create(graph->container);
@@ -338,7 +394,7 @@ void horiz_bargraph_set_zones(horiz_bargraph_t *graph, const horiz_bargraph_zone
     lv_port_sem_give();
 }
 
-void horiz_bargraph_update_zone_data(horiz_bargraph_t *graph, uint8_t zone_idx, 
+void horiz_bargraph_update_zone_data(horiz_bargraph_t *graph, uint8_t zone_idx,
                                      const chart_data_point_t *points, uint16_t count) {
     if (!graph || !graph->chart || !graph->series || zone_idx >= graph->zone_count) return;
 
@@ -381,16 +437,16 @@ void horiz_bargraph_update_zone_data(horiz_bargraph_t *graph, uint8_t zone_idx,
             }
         }
 
-        /* Populate points: NO_DATA becomes an invisible physical gap */
+        /* Populate points: NO_DATA or NAN becomes an invisible physical gap */
         for (uint8_t i = 0; i < to_copy; i++) {
             uint8_t target_idx = start_offset + pad_left + i;
             const chart_data_point_t *pt = &points[points_start_idx + i];
 
             if (target_idx < HORIZ_BARGRAPH_MAX_POINTS) {
-                bool is_no_data = (pt->flags & DATA_FLAG_NO_DATA) != 0;
+                bool is_no_data = ((pt->flags & DATA_FLAG_NO_DATA) != 0) || isnan(pt->value) || isinf(pt->value);
 
                 graph->data[target_idx] = is_no_data ? 0.0f : pt->value;
-                graph->has_data[target_idx] = !is_no_data; /* FALSE = 100% transparent in draw callback! */
+                graph->has_data[target_idx] = !is_no_data; /* FALSE = 100% transparent in draw callback */
                 graph->is_estimated[target_idx] = !is_no_data && ((pt->flags & DATA_FLAG_ESTIMATED) != 0);
                 graph->is_alarm[target_idx] = !is_no_data && ((pt->flags & (DATA_FLAG_ALARM_DANGER | DATA_FLAG_ALARM_WARN)) != 0);
 
@@ -398,6 +454,9 @@ void horiz_bargraph_update_zone_data(horiz_bargraph_t *graph, uint8_t zone_idx,
             }
         }
     }
+
+    /* Refresh internal bezel color based on active alarm status */
+    _horiz_bargraph_refresh_border(graph);
 
     lv_chart_refresh(graph->chart);
     lv_port_sem_give();
@@ -468,7 +527,13 @@ static void _horiz_bargraph_widget_update(widget_t *self, float value, const cha
     if (!self || !self->user_data) return;
     horiz_bargraph_t *graph = (horiz_bargraph_t *)self->user_data;
     uint8_t target_idx = (graph->data_count > 0) ? (graph->data_count - 1) : 0;
-    horiz_bargraph_update_point(graph, target_idx, value, false, false);
+
+    /* Check alarm threshold against configured bounds (NAN != 0) */
+    bool is_alarm = false;
+    if (!isnan(value) && !isinf(value) && !is_color_empty(graph->alarm_color)) {
+        if (value < graph->min_value || value > graph->max_value) is_alarm = true;
+    }
+    horiz_bargraph_update_point(graph, target_idx, value, false, is_alarm);
 }
 
 static void _horiz_bargraph_widget_destroy(widget_t *self) {

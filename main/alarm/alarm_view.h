@@ -26,6 +26,8 @@ int alarm_view_init(void);
  */
 void alarm_view_show(void);
 
+void alarm_view_hide(void);
+
 /**
  * @brief Update alarm list display
  */
@@ -59,14 +61,20 @@ void alarm_view_toggle_grouping(void);
 void alarm_view_acknowledge_all(void);
 
 /**
- * @brief Mute alarms for 2 hours
+ * @brief Mute alarms for a configurable period
  */
-void alarm_view_mute_2h(void);
+void alarm_view_mute_time(void);
 
 /**
  * @brief Handle hardware button press (acknowledge all)
  */
 void alarm_view_handle_hw_button(void);
+
+/**
+ * @brief Notify the view of an alarm journal change to trigger a live redraw if open.
+ */
+void alarm_view_notify_change(void);
+
 
 #ifdef __cplusplus
 }

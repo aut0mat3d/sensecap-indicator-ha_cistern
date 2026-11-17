@@ -1,15 +1,16 @@
 /**
  * @file data_storage.cpp
  * @brief Non-Blocking Data Storage Engine using true LittleFS on SD Partition 2.
- *        Handles raw data (roundtrip), hourly, and daily aggregation
+ *        Handles grid data (raw), hourly, and daily aggregation
  *        with RAM accumulation, wall-clock alignment, and offline recovery.
+ *        Records are stored in segmented binary files (see archive_store.hpp).
  *
  * @copyright © 2026, SenseCAP Cistern Extension
  */
 
 #include "data_storage.hpp"
 #include "littlefs_driver.hpp"
-#include "littlefs_buffer.hpp"
+#include "archive_store.hpp"
 #include "debug_log.hpp"
 #include <ArduinoJson.h>
 #include <string.h>
@@ -42,33 +43,14 @@ static bool strendswith(const char* str, const char* suffix) {
     return strncmp(str + str_len - suffix_len, suffix, suffix_len) == 0;
 }
 
-static bool parse_channel_key(const char* channel_key, char* dev_addr, size_t dev_addr_size, 
-                             char* decoder, size_t decoder_size, char* key, size_t key_size) {
-    if (!channel_key) return false;
-    
-    const char* first_dot = strchr(channel_key, '.');
-    const char* second_dot = first_dot ? strchr(first_dot + 1, '.') : nullptr;
-    
-    if (!first_dot || !second_dot) return false;
-    
-    size_t dev_addr_len = first_dot - channel_key;
-    size_t decoder_len = second_dot - (first_dot + 1);
-    size_t key_len = strlen(second_dot + 1);
-    
-    if (dev_addr_len >= dev_addr_size || decoder_len >= decoder_size || key_len >= key_size) {
-        return false;
+/** FNV-1a hash of a channel key (identifies queued records across config reloads) */
+static uint32_t channel_key_hash(const char* key) {
+    uint32_t h = 2166136261UL;
+    for (const char* p = key; p && *p; p++) {
+        h ^= (uint8_t)toupper((unsigned char)*p);
+        h *= 16777619UL;
     }
-    
-    strncpy(dev_addr, channel_key, dev_addr_len);
-    dev_addr[dev_addr_len] = '\0';
-    
-    strncpy(decoder, first_dot + 1, decoder_len);
-    decoder[decoder_len] = '\0';
-    
-    strncpy(key, second_dot + 1, key_len);
-    key[key_len] = '\0';
-    
-    return true;
+    return h;
 }
 
 static int32_t find_channel(const char* channel_key) {
@@ -79,95 +61,6 @@ static int32_t find_channel(const char* channel_key) {
         }
     }
     return -1;
-}
-
-/**
- * @brief Robust CSV parser for roundtrip.csv lines: <timestamp>,<value>,<unit>,<is_estimated>
- */
-static bool parse_roundtrip_line(const char* line, uint32_t* ts, float* val, char* unit, size_t unit_size, uint8_t* is_est) {
-    if (!line || line[0] == '#' || line[0] == '\0') return false;
-    char* p = (char*)line;
-    char* endp = nullptr;
-
-    *ts = strtoul(p, &endp, 10);
-    if (endp == p || *endp != ',') return false;
-    p = endp + 1;
-
-    *val = strtof(p, &endp);
-    if (endp == p || *endp != ',') return false;
-    p = endp + 1;
-
-    char* comma = strchr(p, ',');
-    if (!comma) return false;
-    size_t ulen = comma - p;
-    if (ulen >= unit_size) ulen = unit_size - 1;
-    strncpy(unit, p, ulen);
-    unit[ulen] = '\0';
-    p = comma + 1;
-
-    *is_est = (uint8_t)strtoul(p, nullptr, 10);
-    return true;
-}
-
-/**
- * @brief Robust CSV parser for hourly/daily aggregated lines:
- *        Supports 6-column legacy: <start_ts>,<avg>,<min>,<max>,<count>,<has_estimated>
- *        and 7-column with TZ:     <start_ts>,<tz_offset>,<avg>,<min>,<max>,<count>,<has_estimated>
- */
-static bool parse_aggregated_line(const char* line, uint32_t* ts, int32_t* tz_offset,
-                                 float* avg, float* min_val, float* max_val, uint32_t* count, uint8_t* has_est) {
-    if (!line || line[0] == '#' || line[0] == '\0') return false;
-
-    /* Count commas to detect format (5 commas = 6 columns, 6 commas = 7 columns) */
-    int commas = 0;
-    for (const char* p = line; *p != '\0'; p++) {
-        if (*p == ',') commas++;
-    }
-
-    char* p = (char*)line;
-    char* endp = nullptr;
-
-    *ts = strtoul(p, &endp, 10);
-    if (endp == p || *endp != ',') return false;
-    p = endp + 1;
-
-    /* Extract optional tz_offset if present */
-    if (commas >= 6) {
-        long off = strtol(p, &endp, 10);
-        if (endp == p || *endp != ',') return false;
-        if (tz_offset) *tz_offset = (int32_t)off;
-        p = endp + 1;
-    } else {
-        if (tz_offset) *tz_offset = 0;
-    }
-
-    *avg = strtof(p, &endp);
-    if (endp == p || *endp != ',') return false;
-    p = endp + 1;
-
-    *min_val = strtof(p, &endp);
-    if (endp == p || *endp != ',') return false;
-    p = endp + 1;
-
-    *max_val = strtof(p, &endp);
-    if (endp == p || *endp != ',') return false;
-    p = endp + 1;
-
-    *count = strtoul(p, &endp, 10);
-    if (endp == p || *endp != ',') return false;
-    p = endp + 1;
-
-    *has_est = (uint8_t)strtoul(p, nullptr, 10);
-    return true;
-}
-
-/**
- * @brief 7-argument overload for hourly archives (where tz_offset is unused).
- */
-static inline bool parse_aggregated_line(const char* line, uint32_t* ts,
-                                        float* avg, float* min_val, float* max_val, 
-                                        uint32_t* count, uint8_t* has_est) {
-    return parse_aggregated_line(line, ts, nullptr, avg, min_val, max_val, count, has_est);
 }
 
 /**
@@ -215,37 +108,6 @@ static uint32_t sanitize_roundtrip_interval(uint32_t raw_interval, const char* c
 }
 
 // ============================================================================
-// Path Building Functions (Schlank: /data/<dev_addr>/<key>/<archiv>.csv)
-// ============================================================================
-
-void data_storage_build_roundtrip_path(const char* channel_key, char* path, size_t path_size) {
-    char dev_addr[17], decoder[32], key[32];
-    if (parse_channel_key(channel_key, dev_addr, sizeof(dev_addr), decoder, sizeof(decoder), key, sizeof(key))) {
-        snprintf(path, path_size, "/data/%s/%s/roundtrip.csv", dev_addr, key);
-    } else {
-        path[0] = '\0';
-    }
-}
-
-void data_storage_build_hourly_path(const char* channel_key, char* path, size_t path_size) {
-    char dev_addr[17], decoder[32], key[32];
-    if (parse_channel_key(channel_key, dev_addr, sizeof(dev_addr), decoder, sizeof(decoder), key, sizeof(key))) {
-        snprintf(path, path_size, "/data/%s/%s/hourly.csv", dev_addr, key);
-    } else {
-        path[0] = '\0';
-    }
-}
-
-void data_storage_build_daily_path(const char* channel_key, char* path, size_t path_size) {
-    char dev_addr[17], decoder[32], key[32];
-    if (parse_channel_key(channel_key, dev_addr, sizeof(dev_addr), decoder, sizeof(decoder), key, sizeof(key))) {
-        snprintf(path, path_size, "/data/%s/%s/daily.csv", dev_addr, key);
-    } else {
-        path[0] = '\0';
-    }
-}
-
-// ============================================================================
 // Time Synchronization State & Guards
 // ============================================================================
 
@@ -262,39 +124,10 @@ uint8_t data_storage_get_time_flags(void) {
     return g_time_flags;
 }
 
-uint32_t data_storage_recover_last_archive_timestamp(void) {
-    if (!littlefs_driver_is_mounted() || g_channel_count == 0) return 0;
-    
-    uint32_t highest_ts = 0;
-    for (size_t i = 0; i < g_channel_count; i++) {
-        char path[128];
-        data_storage_build_roundtrip_path(g_channels[i].config.channel_key, path, sizeof(path));
-        
-        lfs_file_handle_t f = littlefs_driver_open_read(path);
-        if (!f) continue;
-
-        char line[128];
-        uint32_t last_file_ts = 0;
-        while (littlefs_driver_read_line(f, line, sizeof(line)) >= 0) {
-            uint32_t ts;
-            float val;
-            char unit[8];
-            uint8_t is_estimated;
-            if (parse_roundtrip_line(line, &ts, &val, unit, sizeof(unit), &is_estimated)) {
-                last_file_ts = ts;
-            }
-        }
-        littlefs_driver_close(f);
-        if (last_file_ts > highest_ts) {
-            highest_ts = last_file_ts;
-        }
-    }
-    return highest_ts;
-}
-
 // ============================================================================
 // Initialization & Loading from FAT32 Partition 1
 // ============================================================================
+
 
 void data_storage_init(SdFat32* sd) {
     g_sd = sd;
@@ -302,7 +135,204 @@ void data_storage_init(SdFat32* sd) {
     memset(g_channels, 0, sizeof(g_channels));
     g_time_valid = false;
     g_time_flags = 0;
-    Serial.println("[STORAGE] Data Storage Engine initialized.");
+    LogSerial.println("[STORAGE] Data Storage Engine initialized.");
+}
+
+/** JSON names of the retention levels, indexed by retention_level_t */
+static const char* const k_retention_names[RET_LEVEL_COUNT] = {
+    "single", "hours", "days", "weeks", "months", "years"
+};
+
+/**
+ * @brief Normalize a device address string ("05975dc9", "0x45") to 8 upper-case hex digits.
+ *        Must match the "%08X" format used by the telemetry paths calling data_storage_add_point().
+ */
+static bool normalize_dev_addr(const char* raw, char* out, size_t out_size) {
+    if (!raw || !raw[0] || !out || out_size < 9) return false;
+    char* end = nullptr;
+    unsigned long value = strtoul(raw, &end, 16); /* base 16 accepts an optional "0x" prefix */
+    if (end == raw || *end != '\0') return false;
+    snprintf(out, out_size, "%08lX", value);
+    return true;
+}
+
+/**
+ * @brief Open and parse /decoder/<name>.json (with legacy fallback directory).
+ */
+static bool load_decoder_doc(SdFat32* sd, const char* decoder, JsonDocument& doc) {
+    char path[128];
+    snprintf(path, sizeof(path), "/decoder/%s.json", decoder);
+    File32 file = sd->open(path, O_READ);
+    if (!file) {
+        snprintf(path, sizeof(path), "/lora_p2p_configs/decoder/%s.json", decoder);
+        file = sd->open(path, O_READ);
+    }
+    if (!file) {
+        LogSerial.printf("[STORAGE_WARN] Decoder file not found: %s.json\r\n", decoder);
+        return false;
+    }
+
+    /* Only the unit fields of the mappings are needed here: filtering keeps the heap footprint small */
+    StaticJsonDocument<96> filter;
+    JsonObject f_mapping = filter["mappings"].createNestedObject();
+    f_mapping["key"] = true;
+    f_mapping["unit"] = true;
+    f_mapping["target_unit"] = true;
+
+    DeserializationError err = deserializeJson(doc, file, DeserializationOption::Filter(filter));
+    file.close();
+    if (err) {
+        LogSerial.printf("[STORAGE_ERR] Failed to parse decoder %s: %s (free heap: %d B)\r\n",
+                      path, err.c_str(), rp2040.getFreeHeap());
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Resolve the storage unit of an archive key.
+ *        1. Decoder mapping with matching "key" ("target_unit", else "unit")
+ *        2. Device "virtual_decoder.<key>.unit"
+ * @return false if the key is neither a decoder key nor a virtual key of this device.
+ */
+static bool resolve_archive_unit(const JsonDocument* decoder_doc, JsonObjectConst device,
+                                 const char* key, char* unit_out, size_t unit_size) {
+    unit_out[0] = '\0';
+
+    if (decoder_doc) {
+        JsonArrayConst mappings = (*decoder_doc)["mappings"];
+        for (JsonObjectConst mapping : mappings) {
+            const char* m_key = mapping["key"] | "";
+            if (strcmp(m_key, key) != 0) continue;
+            const char* unit = mapping["target_unit"] | "";
+            if (!unit[0]) unit = mapping["unit"] | "";
+            strncpy(unit_out, unit, unit_size - 1);
+            unit_out[unit_size - 1] = '\0';
+            return true;
+        }
+    }
+
+    JsonObjectConst vd = device["virtual_decoder"][key];
+    if (!vd.isNull()) {
+        const char* unit = vd["unit"] | "";
+        strncpy(unit_out, unit, unit_size - 1);
+        unit_out[unit_size - 1] = '\0';
+        return true;
+    }
+    return false;
+}
+
+/**
+ * @brief Derive the effective retention (records to keep) of every archive level.
+ *
+ * The cascade reads each level from the next finer one (raw -> hour -> day).
+ * A finer level that is disabled in the configuration but required as source is therefore
+ * kept as a small staging level:
+ *   - raw:  2 hours of buckets when hourly aggregation is active
+ *   - hour: 26 entries when daily aggregation is active (covers 25 h DST days)
+ * Direct accumulation without staging levels is part of the planned NTTW engine.
+ */
+static void compute_keep_entries(data_channel_config_t* cfg) {
+    for (size_t lvl = 0; lvl < RET_LEVEL_COUNT; lvl++) {
+        cfg->keep_entries[lvl] = 0;
+    }
+
+    cfg->keep_entries[RET_DAYS] = cfg->retention[RET_DAYS];
+
+    uint16_t hours = cfg->retention[RET_HOURS];
+    if (cfg->keep_entries[RET_DAYS] > 0 && hours < 26) hours = 26;
+    cfg->keep_entries[RET_HOURS] = hours;
+
+    uint16_t single = cfg->retention[RET_SINGLE];
+    if (cfg->keep_entries[RET_HOURS] > 0) {
+        uint32_t staging = (2 * 3600) / cfg->storage_interval;
+        if (single < staging) single = (uint16_t)staging;
+    }
+    cfg->keep_entries[RET_SINGLE] = single;
+
+    if (cfg->retention[RET_WEEKS] || cfg->retention[RET_MONTHS] || cfg->retention[RET_YEARS]) {
+        LogSerial.printf("[STORAGE] %s: weeks/months/years retention configured but not aggregated yet\r\n",
+                      cfg->channel_key);
+    }
+}
+
+/**
+ * @brief Register all entries of the "archive" object of one parsed device JSON.
+ */
+static void register_device_archive(SdFat32* sd, JsonObjectConst device, const char* path) {
+    JsonObjectConst archive = device["archive"];
+    if (archive.isNull()) return; /* Archiving is opt-in per device */
+
+    const char* raw_dev_addr = device["dev_addr"] | "";
+    const char* decoder = device["decoder"] | "";
+    uint32_t report_interval = device["report_interval_sec"] | 300;
+
+    char dev_addr[17] = {0};
+    if (!normalize_dev_addr(raw_dev_addr, dev_addr, sizeof(dev_addr)) || !decoder[0]) {
+        LogSerial.printf("[STORAGE_WARN] Missing or invalid dev_addr/decoder in %s\r\n", path);
+        return;
+    }
+
+    DynamicJsonDocument decoder_doc(2048);
+    bool has_decoder = load_decoder_doc(sd, decoder, decoder_doc);
+
+    for (JsonPairConst entry : archive) {
+        const char* key = entry.key().c_str();
+        JsonObjectConst arc = entry.value();
+        if (!key[0] || arc.isNull()) continue;
+
+        data_channel_config_t config;
+        memset(&config, 0, sizeof(config));
+        snprintf(config.channel_key, sizeof(config.channel_key), "%s.%s.%s", dev_addr, decoder, key);
+        strncpy(config.dev_addr, dev_addr, sizeof(config.dev_addr) - 1);
+        strncpy(config.decoder, decoder, sizeof(config.decoder) - 1);
+        strncpy(config.key, key, sizeof(config.key) - 1);
+
+        if (!resolve_archive_unit(has_decoder ? &decoder_doc : nullptr, device, key,
+                                  config.unit, sizeof(config.unit))) {
+            LogSerial.printf("[STORAGE_WARN] %s: archive key '%s' is neither a decoder nor a virtual key, skipped\r\n",
+                          path, key);
+            continue;
+        }
+
+        if (arc.containsKey("interval_sec")) {
+            LogSerial.printf("[STORAGE_WARN] %s: 'interval_sec' is obsolete, use device 'report_interval_sec' "
+                             "or 'expected_interval_sec' (ignored)\r\n", config.channel_key);
+        }
+
+        /* Expected update interval of this key: keys sent with every packet (depth) follow the
+         * device transmit interval; sporadic keys (battery_soc) override it */
+        uint32_t raw_interval = arc["expected_interval_sec"] | report_interval;
+        config.roundtrip_interval = sanitize_roundtrip_interval(raw_interval, config.channel_key);
+        config.storage_interval = (config.roundtrip_interval > 300) ? 300 : config.roundtrip_interval;
+        config.tolerance_sec = arc["tolerance_sec"] | 15;
+        config.max_estimated_count = arc["max_estimated_count"] | 0;
+
+        JsonObjectConst quality = arc["quality"];
+        uint32_t solid_pct = quality["solid_pct"] | QUALITY_DEFAULT_SOLID_PCT;
+        uint32_t min_pct = quality["min_pct"] | QUALITY_DEFAULT_MIN_PCT;
+        if (solid_pct > 100) solid_pct = 100;
+        if (min_pct > solid_pct) min_pct = solid_pct;
+        config.solid_pct = (uint8_t)solid_pct;
+        config.min_pct = (uint8_t)min_pct;
+        config.use_estimated = quality["use_estimated"] | QUALITY_DEFAULT_USE_ESTIMATED;
+
+        JsonObjectConst retention = arc["retention"];
+        bool any_level = false;
+        for (size_t lvl = 0; lvl < RET_LEVEL_COUNT; lvl++) {
+            uint32_t entries = retention[k_retention_names[lvl]] | 0;
+            config.retention[lvl] = (entries > 0xFFFF) ? 0xFFFF : (uint16_t)entries;
+            if (entries > 0) any_level = true;
+        }
+        if (!any_level) {
+            LogSerial.printf("[STORAGE_WARN] %s: all retention levels are 0, nothing to store\r\n",
+                          config.channel_key);
+            continue;
+        }
+
+        compute_keep_entries(&config);
+        data_storage_register_channel(&config);
+    }
 }
 
 bool data_storage_load_devices(SdFat32* sd) {
@@ -311,6 +341,9 @@ bool data_storage_load_devices(SdFat32* sd) {
         return false;
     }
     g_sd = sd;
+
+    /* Queued records survive the reload: they reference channels by key hash and are
+     * written by process_buckets() once the channel is registered again */
     g_channel_count = 0;
 
     const char* dev_dirs[] = {"/devices/", "/lora_p2p_configs/devices/"};
@@ -325,11 +358,21 @@ bool data_storage_load_devices(SdFat32* sd) {
     }
 
     if (!active_dir) {
-        Serial.println("[STORAGE_WARN] Devices directory not found on FAT32 Partition 1!");
+        LogSerial.println("[STORAGE_WARN] Devices directory not found on FAT32 Partition 1!");
         return false;
     }
 
-    Serial.printf("[STORAGE] Scanning %s for device definitions...\r\n", active_dir);
+    LogSerial.printf("[STORAGE] Scanning %s for device archive definitions (free heap: %d B)...\r\n",
+                  active_dir, rp2040.getFreeHeap());
+
+    /* Parse only the fields the archive needs; device files can grow (keys, thresholds,
+     * geometry) without increasing the RAM needed here */
+    StaticJsonDocument<192> filter;
+    filter["dev_addr"] = true;
+    filter["decoder"] = true;
+    filter["report_interval_sec"] = true;
+    filter["archive"] = true;
+    filter["virtual_decoder"]["*"]["unit"] = true;
 
     FatFile entry;
     while (entry.openNext(&dir, O_READ)) {
@@ -338,107 +381,61 @@ bool data_storage_load_devices(SdFat32* sd) {
             entry.close();
             continue;
         }
-        
+
         if (strendswith(name, ".json")) {
             char path[128];
             snprintf(path, sizeof(path), "%s%s", active_dir, name);
 
             File32 file = sd->open(path, O_READ);
             if (!file) {
-                Serial.printf("[STORAGE_ERR] Cannot open device file: %s\r\n", path);
+                LogSerial.printf("[STORAGE_ERR] Cannot open device file: %s\r\n", path);
                 entry.close();
                 continue;
             }
 
-            DynamicJsonDocument doc(2048);
-            DeserializationError err = deserializeJson(doc, file);
+            DynamicJsonDocument doc(3072);
+            DeserializationError err = deserializeJson(doc, file, DeserializationOption::Filter(filter));
             file.close();
             if (err) {
-                Serial.printf("[STORAGE_ERR] JSON parse failed on %s: %s\r\n", path, err.c_str());
+                LogSerial.printf("[STORAGE_ERR] JSON parse failed on %s: %s (free heap: %d B)\r\n",
+                              path, err.c_str(), rp2040.getFreeHeap());
                 entry.close();
                 continue;
             }
 
-            const char* raw_dev_addr = doc["dev_addr"] | "";
-            const char* decoder = doc["decoder"] | "";
-
-            char dev_addr[17] = {0};
-            for (size_t c = 0; raw_dev_addr[c] && c < 16; c++) {
-                dev_addr[c] = (char)toupper((unsigned char)raw_dev_addr[c]);
-            }
-
-            if (dev_addr[0] && decoder[0]) {
-                data_storage_load_decoder(sd, dev_addr, decoder);
-            } else {
-                Serial.printf("[STORAGE_WARN] Missing dev_addr or decoder in %s\r\n", path);
-            }
+            register_device_archive(sd, doc.as<JsonObjectConst>(), path);
         }
         entry.close();
     }
     dir.close();
-    Serial.printf("[STORAGE] Device scan complete. Registered storage channels: %u\r\n", 
+    LogSerial.printf("[STORAGE] Device scan complete. Registered storage channels: %u\r\n",
                   (unsigned)g_channel_count);
     return (g_channel_count > 0);
 }
 
-void data_storage_load_decoder(SdFat32* sd, const char* dev_addr, const char* decoder) {
-    if (!sd || !dev_addr || !decoder) return;
+/**
+ * @brief Collects the newest real sample of the raw level (cold-start restore).
+ */
+typedef struct {
+    bool     found;
+    uint32_t ts;
+    float    value;
+} restore_ctx_t;
 
-    char path[128];
-    snprintf(path, sizeof(path), "/decoder/%s.json", decoder);
-    File32 file = sd->open(path, O_READ);
-    if (!file) {
-        snprintf(path, sizeof(path), "/lora_p2p_configs/decoder/%s.json", decoder);
-        file = sd->open(path, O_READ);
+static bool restore_visit(const void* record, void* ctx) {
+    const arc_raw_record_t* rec = (const arc_raw_record_t*)record;
+    restore_ctx_t* rc = (restore_ctx_t*)ctx;
+    if (rec->flag == RT_FLAG_REAL && (!rc->found || rec->ts >= rc->ts)) {
+        rc->found = true;
+        rc->ts = rec->ts;
+        rc->value = rec->value;
     }
-    if (!file) {
-        Serial.printf("[STORAGE_WARN] Decoder file not found: %s.json\r\n", decoder);
-        return;
-    }
-
-    DynamicJsonDocument doc(4096);
-    DeserializationError err = deserializeJson(doc, file);
-    file.close();
-    if (err) {
-        Serial.printf("[STORAGE_ERR] Failed to parse decoder %s: %s\r\n", path, err.c_str());
-        return;
-    }
-    if (!doc.containsKey("mappings")) {
-        Serial.printf("[STORAGE_WARN] Decoder %s has no 'mappings' key!\r\n", path);
-        return;
-    }
-
-    JsonArray mappings = doc["mappings"];
-    for (JsonObject mapping : mappings) {
-        const char* key = mapping["key"] | "";
-        if (!key[0]) continue;
-
-        bool store_roundtrip = mapping["store_roundtrip"] | false;
-        if (!store_roundtrip) continue;
-
-        data_channel_config_t config;
-        snprintf(config.channel_key, sizeof(config.channel_key), "%s.%s.%s", dev_addr, decoder, key);
-        strncpy(config.dev_addr, dev_addr, sizeof(config.dev_addr));
-        strncpy(config.decoder, decoder, sizeof(config.decoder));
-        strncpy(config.key, key, sizeof(config.key));
-        
-        config.store_longterm = mapping["store_longterm"] | false;
-        config.store_roundtrip = true;
-        
-        uint32_t raw_interval = mapping["roundtrip_interval_sec"] | 300;
-        config.roundtrip_interval = sanitize_roundtrip_interval(raw_interval, config.channel_key);
-        config.tolerance_sec = mapping["tolerance_sec"] | 15;
-
-        const char* unit = mapping["unit"] | "";
-        strncpy(config.unit, unit, sizeof(config.unit));
-
-        data_storage_register_channel(&config);
-    }
+    return true;
 }
 
 bool data_storage_register_channel(const data_channel_config_t* config) {
     if (!config || g_channel_count >= 64) return false;
-    
+
     for (size_t i = 0; i < g_channel_count; i++) {
         if (strcmp(g_channels[i].config.channel_key, config->channel_key) == 0) {
             return false;
@@ -447,92 +444,211 @@ bool data_storage_register_channel(const data_channel_config_t* config) {
 
     data_channel_t* channel = &g_channels[g_channel_count++];
     channel->config = *config;
-    
+    channel->key_hash = channel_key_hash(config->channel_key);
+    if (channel->config.storage_interval == 0) {
+        channel->config.storage_interval = (channel->config.roundtrip_interval > 300) ? 300 : channel->config.roundtrip_interval;
+    }
+
     channel->state.current_bucket = 0;
     channel->state.accumulator = 0.0;
     channel->state.sample_count = 0;
+    channel->state.last_rx_time = 0;
     channel->state.last_stored_time = 0;
     channel->state.last_value = 0.0f;
     channel->state.has_last_value = false;
+    /* Cold start: no substitute values until the first real packet resets the counter */
+    channel->state.consecutive_estimated = channel->config.max_estimated_count;
 
-    char roundtrip_path[128];
-    data_storage_build_roundtrip_path(config->channel_key, roundtrip_path, sizeof(roundtrip_path));
-    if (littlefs_driver_is_mounted()) {
-        littlefs_driver_ensure_dir(roundtrip_path);
+    const uint16_t* ke = channel->config.keep_entries;
+    const uint32_t keep[ARC_LEVEL_COUNT] = { ke[RET_SINGLE], ke[RET_HOURS], ke[RET_DAYS] };
+    arc_channel_setup(&channel->arc, channel->config.dev_addr, channel->config.key, keep);
+
+    /* Cold-start restore: continue holding the last real value of the archive, so a reboot
+     * within the expected interval leaves no gap (and sporadic keys keep their last value).
+     * consecutive_estimated stays at max: no substitutes are invented after a reboot. */
+    if (littlefs_driver_is_mounted() && arc_channel_scan(&channel->arc)) {
+        restore_ctx_t rc = {};
+        arc_scan_range(&channel->arc, ARC_LEVEL_RAW, 0, UINT32_MAX, restore_visit, &rc);
+        if (rc.found) {
+            channel->state.last_value = rc.value;
+            channel->state.last_rx_time = rc.ts;
+            channel->state.has_last_value = true;
+            LogSerial.printf("[STORAGE] %s: restored last value %.2f %s (ts=%lu)\r\n",
+                             channel->config.channel_key, rc.value, channel->config.unit,
+                             (unsigned long)rc.ts);
+        }
     }
 
-    Serial.printf("[STORAGE] Registered channel: %s (interval=%lu s, unit=%s)\r\n",
-                  config->channel_key, (unsigned long)config->roundtrip_interval, config->unit);
+    LogSerial.printf("[STORAGE] Registered channel: %s (expected=%lu s, grid=%lu s, unit=%s, max_est=%u, "
+                  "quality=%u/%u/%s, keep: raw=%u hour=%u day=%u)\r\n",
+                  config->channel_key, (unsigned long)channel->config.roundtrip_interval,
+                  (unsigned long)channel->config.storage_interval, config->unit,
+                  (unsigned)channel->config.max_estimated_count,
+                  (unsigned)channel->config.solid_pct, (unsigned)channel->config.min_pct,
+                  channel->config.use_estimated ? "est" : "real",
+                  (unsigned)ke[RET_SINGLE], (unsigned)ke[RET_HOURS], (unsigned)ke[RET_DAYS]);
     return true;
 }
 
 // ============================================================================
-// Low-Level Data Point Write Functions (LittleFS + RAM Fallback)
+// Archive Writes with RAM Queue (card removed / USB-MSC active)
 // ============================================================================
 
-static bool write_roundtrip_point(const char* channel_key, uint32_t timestamp, float value, const char* unit, bool is_estimated) {
-    char line[128];
-    snprintf(line, sizeof(line), "%lu,%.4f,%s,%u\n", (unsigned long)timestamp, value, unit, is_estimated ? 1 : 0);
+/**
+ * Records that cannot be written (LittleFS unmounted) are queued in a compact RAM ring
+ * and written as soon as LittleFS is back. When the ring is full the oldest record is
+ * dropped, so the most recent history survives a long card removal.
+ * Capacity: 1024 records (~28 KB) = ~8 h for 10 channels on a 5-minute grid.
+ * Records reference their channel by key hash, so they survive a config reload.
+ * The queue is drained in small portions by process_buckets() to keep the UART responsive.
+ */
+#define PENDING_CAPACITY 1024
+#define PENDING_FLUSH_PER_TICK 32
 
-    char path[128];
-    data_storage_build_roundtrip_path(channel_key, path, sizeof(path));
+typedef struct __attribute__((packed)) {
+    uint32_t channel_hash;                   /* channel_key_hash() of the owning channel */
+    uint8_t  level;                          /* arc_level_t */
+    uint8_t  data[sizeof(arc_agg_record_t)]; /* arc_raw_record_t or arc_agg_record_t */
+} pending_record_t;
 
-    if (littlefs_driver_is_mounted()) {
-        bool ok = littlefs_driver_append_line(path, line);
-        if (!ok) {
-            DBG_LFS_PRINTF("Write error on %s, queuing to RAM buffer...", path);
-            littlefs_buffer_append(path, (const uint8_t*)line, strlen(line), LFS_BUFFER_TYPE_SENSOR_DATA);
-        }
-        return ok;
-    } else {
-        DBG_LFS_PRINTF("LittleFS unmounted: queuing %s in RAM buffer...", path);
-        return littlefs_buffer_append(path, (const uint8_t*)line, strlen(line), LFS_BUFFER_TYPE_SENSOR_DATA);
+static pending_record_t g_pending[PENDING_CAPACITY];
+static size_t g_pending_head = 0;   /* Oldest queued record */
+static size_t g_pending_count = 0;
+static uint32_t g_pending_dropped = 0;
+
+static data_channel_t* find_channel_by_hash(uint32_t hash) {
+    for (size_t i = 0; i < g_channel_count; i++) {
+        if (g_channels[i].key_hash == hash) return &g_channels[i];
     }
+    return nullptr;
 }
 
-static bool write_aggregated_point(const char* channel_key, granularity_t gran, const data_aggregated_t* agg) {
+static void pending_push(uint32_t channel_hash, arc_level_t level, const void* record) {
+    if (g_pending_count >= PENDING_CAPACITY) {
+        g_pending_head = (g_pending_head + 1) % PENDING_CAPACITY;
+        g_pending_count--;
+        g_pending_dropped++;
+    }
+    pending_record_t* p = &g_pending[(g_pending_head + g_pending_count) % PENDING_CAPACITY];
+    p->channel_hash = channel_hash;
+    p->level = (uint8_t)level;
+    memcpy(p->data, record, arc_record_size(level));
+    g_pending_count++;
+}
+
+size_t data_storage_flush_pending(size_t max_records) {
+    if (g_pending_count == 0 || !littlefs_driver_is_mounted()) return 0;
+
+    size_t written = 0;
+    while (g_pending_count > 0 && (max_records == 0 || written < max_records)) {
+        pending_record_t* p = &g_pending[g_pending_head];
+        data_channel_t* ch = find_channel_by_hash(p->channel_hash);
+        /* Records of channels removed by a config change are dropped */
+        if (ch && !arc_append(&ch->arc, (arc_level_t)p->level, p->data)) {
+            break; /* Write failed: keep the record for the next attempt */
+        }
+        g_pending_head = (g_pending_head + 1) % PENDING_CAPACITY;
+        g_pending_count--;
+        written++;
+    }
+
+    if (written > 0) {
+        LogSerial.printf("[STORAGE] Flushed %u queued records (%u left, %lu dropped while offline)\r\n",
+                         (unsigned)written, (unsigned)g_pending_count, (unsigned long)g_pending_dropped);
+        if (g_pending_count == 0) g_pending_dropped = 0;
+    }
+    return written;
+}
+
+static bool archive_write(data_channel_t* channel, arc_level_t level, const void* record) {
+    /* Keep chronological order: while records are queued, new ones are queued behind them */
+    if (g_pending_count == 0 && arc_append(&channel->arc, level, record)) {
+        return true;
+    }
+
+    pending_push(channel->key_hash, level, record);
+    DBG_LFS_PRINTF("LittleFS unavailable: queued %s record of %s (%u pending)",
+                   (level == ARC_LEVEL_RAW) ? "raw" : (level == ARC_LEVEL_HOUR) ? "hour" : "day",
+                   channel->config.channel_key, (unsigned)g_pending_count);
+    return false;
+}
+
+static bool write_roundtrip_point(data_channel_t* channel, uint32_t timestamp, float value, uint8_t rt_flag) {
+    arc_raw_record_t rec;
+    rec.ts = timestamp;
+    rec.value = value;
+    rec.flag = rt_flag;
+    return archive_write(channel, ARC_LEVEL_RAW, &rec);
+}
+
+static bool write_aggregated_point(data_channel_t* channel, granularity_t gran, const data_aggregated_t* agg) {
     if (!agg) return false;
 
-    char line[128];
-    char path[128];
+    arc_agg_record_t rec;
+    rec.ts = agg->start_timestamp;
+    rec.avg = agg->avg_value;
+    rec.min = agg->min_value;
+    rec.max = agg->max_value;
+    rec.count = agg->count;
+    /* Local timezone offset in minutes (daily level; 0 for hourly UTC periods) */
+    rec.tz_offset_min = (int16_t)(agg->tz_offset_sec / 60);
+    rec.flags = agg->has_estimated ? ARC_AGG_FLAG_DEGRADED : 0;
 
-    if (gran == GRAN_HOURLY) {
-        snprintf(line, sizeof(line), "%lu,%.4f,%.4f,%.4f,%lu,%u\n", 
-                 (unsigned long)agg->start_timestamp,
-                 agg->avg_value,
-                 agg->min_value,
-                 agg->max_value,
-                 (unsigned long)agg->count,
-                 agg->has_estimated ? 1 : 0);
-        data_storage_build_hourly_path(channel_key, path, sizeof(path));
-    } else {
-        /* Store UTC start timestamp plus local timezone offset in seconds */
-        snprintf(line, sizeof(line), "%lu,%ld,%.4f,%.4f,%.4f,%lu,%u\n", 
-                 (unsigned long)agg->start_timestamp,
-                 (long)agg->tz_offset_sec,
-                 agg->avg_value,
-                 agg->min_value,
-                 agg->max_value,
-                 (unsigned long)agg->count,
-                 agg->has_estimated ? 1 : 0);
-        data_storage_build_daily_path(channel_key, path, sizeof(path));
-    }
-
-    if (littlefs_driver_is_mounted()) {
-        bool ok = littlefs_driver_append_line(path, line);
-        if (!ok) {
-            DBG_LFS_PRINTF("Failed write agg point to %s, buffering in RAM...", path);
-            littlefs_buffer_append(path, (const uint8_t*)line, strlen(line), LFS_BUFFER_TYPE_SENSOR_DATA);
-        }
-        return ok;
-    } else {
-        return littlefs_buffer_append(path, (const uint8_t*)line, strlen(line), LFS_BUFFER_TYPE_SENSOR_DATA);
-    }
+    return archive_write(channel, (gran == GRAN_HOURLY) ? ARC_LEVEL_HOUR : ARC_LEVEL_DAY, &rec);
 }
 
 // ============================================================================
 // Public API: RAM Accumulation & Bucket Flushing
 // ============================================================================
+
+static void flush_current_bucket(data_channel_t* channel) {
+    if (!channel || channel->state.current_bucket == 0) return;
+
+    uint32_t storage_interval = channel->config.storage_interval;
+    uint32_t tolerance = channel->config.tolerance_sec > 0 ? channel->config.tolerance_sec : 15;
+    uint32_t bucket_start = channel->state.current_bucket;
+    uint32_t bucket_end = bucket_start + storage_interval;
+
+    if (channel->state.sample_count > 0) {
+        /* Regular measured value (real) */
+        float avg = (float)(channel->state.accumulator / channel->state.sample_count);
+        bool ok = write_roundtrip_point(channel, bucket_start, avg, RT_FLAG_REAL);
+        DBG_LFS_PRINTF("Flush %s: %s -> %.2f %s (cnt=%u)", ok ? "SUCCESS" : "QUEUED",
+                       channel->config.channel_key, avg, channel->config.unit, channel->state.sample_count);
+
+        channel->state.last_stored_time = bucket_start;
+        channel->state.last_value = avg;
+        channel->state.has_last_value = true;
+        channel->state.consecutive_estimated = 0;
+    } else if (channel->state.has_last_value) {
+        /* Hold last valid value as non-estimated until expected next packet deadline expires
+         * (handles intervals > 300s as well as P2P relay jitter across bucket boundaries) */
+        const uint32_t p2p_jitter_allowance_sec = 6;
+        uint32_t deadline = channel->state.last_rx_time + channel->config.roundtrip_interval + tolerance + p2p_jitter_allowance_sec;
+        bool is_estimated = (channel->state.last_rx_time == 0) || (bucket_end > deadline);
+
+        if (is_estimated) {
+            /* Substitute value cap: after max_estimated_count substitutes, write nothing so the
+             * chart shows a real gap (DATA_FLAG_NO_DATA) instead of an endless flat line */
+            if (channel->state.consecutive_estimated >= channel->config.max_estimated_count) {
+                DBG_LFS_PRINTF("Gap for %s at ts=%lu (substitute limit %u reached)",
+                               channel->config.channel_key, (unsigned long)bucket_start,
+                               (unsigned)channel->config.max_estimated_count);
+                return;
+            }
+            channel->state.consecutive_estimated++;
+        }
+
+        write_roundtrip_point(channel, bucket_start, channel->state.last_value,
+                              is_estimated ? RT_FLAG_ESTIMATED : RT_FLAG_HOLD);
+        DBG_LFS_PRINTF("Hold value for %s at ts=%lu (val=%.2f, mode=%s, est=%u/%u)",
+                       channel->config.channel_key, (unsigned long)bucket_start,
+                       channel->state.last_value, is_estimated ? "ESTIMATED" : "VALID_HOLD",
+                       (unsigned)channel->state.consecutive_estimated,
+                       (unsigned)channel->config.max_estimated_count);
+        channel->state.last_stored_time = bucket_start;
+    }
+}
 
 void data_storage_add_point(
     const char* dev_addr,
@@ -556,19 +672,16 @@ void data_storage_add_point(
     if (idx < 0) return;
 
     data_channel_t* channel = &g_channels[idx];
-    if (!channel->config.store_roundtrip) return;
+    if (channel->config.keep_entries[RET_SINGLE] == 0) return;
 
-    /* Assign incoming value to RAM accumulator */
-    uint32_t target_bucket = timestamp - (timestamp % channel->config.roundtrip_interval);
+    /* Assign incoming value to RAM accumulator on storage_interval grid */
+    uint32_t storage_interval = channel->config.storage_interval;
+    uint32_t target_bucket = timestamp - (timestamp % storage_interval);
     
     if (channel->state.current_bucket != target_bucket) {
-        /* Edge Case: Flush missed if timestamp jumped unexpectedly */
-        if (channel->state.sample_count > 0) {
-            float avg = (float)(channel->state.accumulator / channel->state.sample_count);
-            write_roundtrip_point(channel->config.channel_key, channel->state.current_bucket, avg, channel->config.unit, false);
-            channel->state.last_stored_time = channel->state.current_bucket;
-            channel->state.last_value = avg;
-            channel->state.has_last_value = true;
+        /* Flush previous bucket if a boundary was crossed before periodic process_buckets() ran */
+        if (channel->state.current_bucket != 0) {
+            flush_current_bucket(channel);
         }
         channel->state.current_bucket = target_bucket;
         channel->state.accumulator = 0.0;
@@ -577,6 +690,7 @@ void data_storage_add_point(
 
     channel->state.accumulator += value;
     channel->state.sample_count++;
+    channel->state.last_rx_time = timestamp;
     DBG_LFS_PRINTF("Acc: %s added %.2f (cnt=%u) to bucket %lu", 
                    channel_key, value, channel->state.sample_count, (unsigned long)target_bucket);
 }
@@ -586,13 +700,18 @@ void data_storage_process_buckets(void) {
 
     uint32_t now = (uint32_t)time(NULL);
 
+    /* Write records queued while LittleFS was unavailable (bounded per tick) */
+    if (g_pending_count > 0) {
+        data_storage_flush_pending(PENDING_FLUSH_PER_TICK);
+    }
+
     for (size_t i = 0; i < g_channel_count; i++) {
         data_channel_t* channel = &g_channels[i];
-        if (!channel->config.store_roundtrip) continue;
+        if (channel->config.keep_entries[RET_SINGLE] == 0) continue;
 
-        uint32_t interval = channel->config.roundtrip_interval;
+        uint32_t storage_interval = channel->config.storage_interval;
         uint32_t tolerance = channel->config.tolerance_sec > 0 ? channel->config.tolerance_sec : 15;
-        uint32_t active_bucket = now - (now % interval);
+        uint32_t active_bucket = now - (now % storage_interval);
 
         /* Initial bucket setup */
         if (channel->state.current_bucket == 0) {
@@ -600,27 +719,9 @@ void data_storage_process_buckets(void) {
             continue;
         }
 
-        /* Flush bucket only after the interval has elapsed plus per-channel tolerance */
-        if (now >= (channel->state.current_bucket + interval + tolerance)) {
-            if (channel->state.sample_count > 0) {
-                /* Regular measured value (real) */
-                float avg = (float)(channel->state.accumulator / channel->state.sample_count);
-                bool ok = write_roundtrip_point(channel->config.channel_key, channel->state.current_bucket, 
-                                                avg, channel->config.unit, false);
-                DBG_LFS_PRINTF("Flush %s: %s -> %.2f %s (cnt=%u)", ok ? "SUCCESS" : "QUEUED", 
-                               channel->config.channel_key, avg, channel->config.unit, channel->state.sample_count);
-                
-                channel->state.last_stored_time = channel->state.current_bucket;
-                channel->state.last_value = avg;
-                channel->state.has_last_value = true;
-            } else if (channel->state.has_last_value) {
-                /* Missing packet timeout: write held value as estimated */
-                write_roundtrip_point(channel->config.channel_key, channel->state.current_bucket, 
-                                      channel->state.last_value, channel->config.unit, true);
-                DBG_LFS_PRINTF("Estimated missing packet for %s at ts=%lu",
-                               channel->config.channel_key, (unsigned long)channel->state.current_bucket);
-                channel->state.last_stored_time = channel->state.current_bucket;
-            }
+        /* Flush bucket only after the storage interval has elapsed plus per-channel tolerance */
+        if (now >= (channel->state.current_bucket + storage_interval + tolerance)) {
+            flush_current_bucket(channel);
 
             /* Advance to next cleanly aligned bucket */
             channel->state.current_bucket = active_bucket;
@@ -631,94 +732,124 @@ void data_storage_process_buckets(void) {
 }
 
 // ============================================================================
-// File Trimming & Aggregation Functions (LittleFS v2)
+// Aggregation Functions (raw -> hour -> day)
 // ============================================================================
 
-bool data_storage_trim_file(const char* path, uint32_t max_entries) {
-    if (!littlefs_driver_is_mounted() || !path || max_entries == 0) return false;
+/**
+ * @brief Quality model for aggregated periods (hours, days, query-time multi-hour buckets).
+ *
+ * coverage = covered samples / expected samples of the period, where a covered sample is a
+ * grid bucket with a real value or a valid hold (next packet not overdue). Substitute values
+ * (RT_FLAG_ESTIMATED) never count as coverage; with use_estimated they still enter the average.
+ *   coverage >= solid_pct -> regular value
+ *   coverage >= min_pct   -> value flagged ESTIMATED (50 % opacity in the GUI)
+ *   below min_pct         -> no entry (gap)
+ * Coverage propagates upwards: a day sums the covered samples of its hours.
+ */
+typedef enum {
+    AGG_QUALITY_GAP = 0,
+    AGG_QUALITY_DEGRADED,
+    AGG_QUALITY_SOLID
+} agg_quality_t;
 
-    lfs_file_handle_t f = littlefs_driver_open_read(path);
-    if (!f) return false;
+static agg_quality_t classify_coverage(const data_channel_config_t* cfg, uint32_t covered, uint32_t expected) {
+    uint32_t solid_pct = cfg ? cfg->solid_pct : QUALITY_DEFAULT_SOLID_PCT;
+    uint32_t min_pct = cfg ? cfg->min_pct : QUALITY_DEFAULT_MIN_PCT;
+    if (expected == 0) expected = 1;
 
-    #define TRIM_MAX_LINES 96
-    uint32_t limit = (max_entries <= TRIM_MAX_LINES) ? max_entries : TRIM_MAX_LINES;
-    static char s_stored_lines[TRIM_MAX_LINES][128];
-    size_t total_lines = 0;
-
-    char line[128];
-    while (littlefs_driver_read_line(f, line, sizeof(line)) >= 0) {
-        if (line[0] == '\0') continue;
-        strncpy(s_stored_lines[total_lines % limit], line, sizeof(s_stored_lines[0]) - 1);
-        s_stored_lines[total_lines % limit][sizeof(s_stored_lines[0]) - 1] = '\0';
-        total_lines++;
-    }
-    littlefs_driver_close(f);
-
-    if (total_lines <= limit) return true;
-
-    size_t start = total_lines % limit;
-    const char* write_ptrs[TRIM_MAX_LINES];
-    for (size_t i = 0; i < limit; i++) {
-        write_ptrs[i] = s_stored_lines[(start + i) % limit];
-    }
-
-    return littlefs_driver_rewrite_file(path, write_ptrs, limit);
+    uint32_t pct = (covered * 100U) / expected;
+    if (pct >= solid_pct) return AGG_QUALITY_SOLID;
+    if (pct >= min_pct) return AGG_QUALITY_DEGRADED;
+    return AGG_QUALITY_GAP;
 }
 
-static void aggregate_to_hourly(const char* channel_key) {
-    if (!littlefs_driver_is_mounted() || !channel_key) return;
+static const char* quality_name(agg_quality_t q) {
+    return (q == AGG_QUALITY_SOLID) ? "SOLID" : (q == AGG_QUALITY_DEGRADED) ? "ESTIMATED" : "GAP";
+}
 
-    char roundtrip_path[128];
-    char hourly_path[128];
-    data_storage_build_roundtrip_path(channel_key, roundtrip_path, sizeof(roundtrip_path));
-    data_storage_build_hourly_path(channel_key, hourly_path, sizeof(hourly_path));
+/** Accumulator shared by the aggregation visitors */
+typedef struct {
+    bool     use_estimated;
+    double   weighted_sum;
+    uint32_t weight_total;
+    uint32_t covered;
+    uint32_t estimated;
+    uint32_t periods;      /* Source records used (hours for a day) */
+    float    min_value;
+    float    max_value;
+} agg_acc_t;
+
+static void acc_add(agg_acc_t* acc, float value, uint32_t weight, float min_v, float max_v) {
+    if (acc->weight_total == 0 || min_v < acc->min_value) acc->min_value = min_v;
+    if (acc->weight_total == 0 || max_v > acc->max_value) acc->max_value = max_v;
+    acc->weighted_sum += (double)value * weight;
+    acc->weight_total += weight;
+}
+
+static bool raw_agg_visit(const void* record, void* ctx) {
+    const arc_raw_record_t* rec = (const arc_raw_record_t*)record;
+    agg_acc_t* acc = (agg_acc_t*)ctx;
+    if (rec->flag == RT_FLAG_ESTIMATED) {
+        acc->estimated++;
+        if (!acc->use_estimated) return true;
+    } else {
+        acc->covered++;
+    }
+    acc_add(acc, rec->value, 1, rec->value, rec->value);
+    return true;
+}
+
+static bool hour_agg_visit(const void* record, void* ctx) {
+    const arc_agg_record_t* rec = (const arc_agg_record_t*)record;
+    agg_acc_t* acc = (agg_acc_t*)ctx;
+    /* Weight by covered samples; an hour made only of substitutes (use_estimated) weighs 1 */
+    acc_add(acc, rec->avg, (rec->count > 0) ? rec->count : 1, rec->min, rec->max);
+    acc->covered += rec->count;
+    acc->periods++;
+    return true;
+}
+
+static void aggregate_to_hourly(data_channel_t* channel) {
+    if (!littlefs_driver_is_mounted() || !channel) return;
+    const data_channel_config_t* cfg = &channel->config;
 
     uint32_t now = (uint32_t)time(NULL);
     uint32_t current_hour = now - (now % 3600);
     uint32_t previous_hour = current_hour - 3600;
 
-    lfs_file_handle_t f = littlefs_driver_open_read(roundtrip_path);
-    if (!f) return;
+    /* Expected samples = grid buckets per hour */
+    uint32_t interval = (cfg->storage_interval > 0) ? cfg->storage_interval : 300;
+    uint32_t expected_points = 3600 / interval;
+    if (expected_points == 0) expected_points = 1;
+
+    agg_acc_t acc = {};
+    acc.use_estimated = cfg->use_estimated;
+    arc_scan_range(&channel->arc, ARC_LEVEL_RAW, previous_hour, current_hour, raw_agg_visit, &acc);
+
+    if (acc.weight_total == 0) return; /* Nothing usable in this hour: gap */
+
+    agg_quality_t q = classify_coverage(cfg, acc.covered, expected_points);
+    DBG_LFS_PRINTF("Hourly %s: covered=%lu/%lu, est=%lu -> %s",
+                   cfg->channel_key, (unsigned long)acc.covered, (unsigned long)expected_points,
+                   (unsigned long)acc.estimated, quality_name(q));
+    if (q == AGG_QUALITY_GAP) return;
 
     data_aggregated_t hourly = {0};
     hourly.start_timestamp = previous_hour;
-    bool has_data = false;
+    hourly.avg_value = (float)(acc.weighted_sum / acc.weight_total);
+    hourly.min_value = acc.min_value;
+    hourly.max_value = acc.max_value;
+    hourly.count = acc.covered;
+    hourly.has_estimated = (q == AGG_QUALITY_DEGRADED);
 
-    char line[128];
-    while (littlefs_driver_read_line(f, line, sizeof(line)) >= 0) {
-        uint32_t ts;
-        float val;
-        char unit[8];
-        uint8_t is_estimated;
-        if (parse_roundtrip_line(line, &ts, &val, unit, sizeof(unit), &is_estimated)) {
-            if (ts >= previous_hour && ts < current_hour) {
-                hourly.avg_value += val;
-                if (!has_data || val < hourly.min_value) hourly.min_value = val;
-                if (!has_data || val > hourly.max_value) hourly.max_value = val;
-                hourly.count++;
-                if (is_estimated) hourly.has_estimated = true;
-                has_data = true;
-            }
-        }
-    }
-    littlefs_driver_close(f);
-
-    if (has_data && hourly.count > 0) {
-        hourly.avg_value /= hourly.count;
-        write_aggregated_point(channel_key, GRAN_HOURLY, &hourly);
-        data_storage_trim_file(hourly_path, 48);
-        DBG_LFS_PRINTF("Hourly aggregated for %s: avg=%.2f, count=%lu",
-                       channel_key, hourly.avg_value, (unsigned long)hourly.count);
-    }
+    write_aggregated_point(channel, GRAN_HOURLY, &hourly);
+    DBG_LFS_PRINTF("Hourly aggregated for %s: avg=%.2f (min=%.2f, max=%.2f)",
+                   cfg->channel_key, hourly.avg_value, hourly.min_value, hourly.max_value);
 }
 
-static void aggregate_to_daily(const char* channel_key) {
-    if (!littlefs_driver_is_mounted() || !channel_key) return;
-
-    char hourly_path[128];
-    char daily_path[128];
-    data_storage_build_hourly_path(channel_key, hourly_path, sizeof(hourly_path));
-    data_storage_build_daily_path(channel_key, daily_path, sizeof(daily_path));
+static void aggregate_to_daily(data_channel_t* channel) {
+    if (!littlefs_driver_is_mounted() || !channel) return;
+    const data_channel_config_t* cfg = &channel->config;
 
     /* Calculate local midnight boundaries using active POSIX timezone */
     time_t now = time(NULL);
@@ -743,51 +874,44 @@ static void aggregate_to_daily(const char* channel_key) {
     else if (day_diff < -1) day_diff = 1;
     int32_t tz_offset_sec = (int32_t)(day_diff * 86400 + (l_tm.tm_hour - g_tm.tm_hour) * 3600 + (l_tm.tm_min - g_tm.tm_min) * 60);
 
-    lfs_file_handle_t f = littlefs_driver_open_read(hourly_path);
-    if (!f) return;
+    /* Expected samples of this local day (23 h / 25 h on DST switch days) */
+    uint32_t interval = (cfg->storage_interval > 0) ? cfg->storage_interval : 300;
+    uint32_t day_len = (uint32_t)(today_midnight - yesterday_midnight);
+    uint32_t expected_points = day_len / interval;
+
+    /* Hourly points in interval [yesterday 00:00 local .. today 00:00 local[ */
+    agg_acc_t acc = {};
+    arc_scan_range(&channel->arc, ARC_LEVEL_HOUR, (uint32_t)yesterday_midnight, (uint32_t)today_midnight,
+                   hour_agg_visit, &acc);
+
+    if (acc.periods == 0 || acc.weight_total == 0) return;
+
+    agg_quality_t q = classify_coverage(cfg, acc.covered, expected_points);
+    DBG_LFS_PRINTF("Daily %s: hours=%lu, covered=%lu/%lu -> %s", cfg->channel_key,
+                   (unsigned long)acc.periods, (unsigned long)acc.covered,
+                   (unsigned long)expected_points, quality_name(q));
+    if (q == AGG_QUALITY_GAP) return;
 
     data_aggregated_t daily = {0};
     daily.start_timestamp = (uint32_t)yesterday_midnight;
     daily.tz_offset_sec = tz_offset_sec;
-    bool has_data = false;
+    daily.avg_value = (float)(acc.weighted_sum / acc.weight_total);
+    daily.min_value = acc.min_value;
+    daily.max_value = acc.max_value;
+    daily.count = acc.covered;
+    daily.has_estimated = (q == AGG_QUALITY_DEGRADED);
 
-    char line[128];
-    while (littlefs_driver_read_line(f, line, sizeof(line)) >= 0) {
-        uint32_t start_ts;
-        int32_t dummy_tz = 0;
-        float avg, min_val, max_val;
-        uint32_t count;
-        uint8_t has_estimated;
-        if (parse_aggregated_line(line, &start_ts, &dummy_tz, &avg, &min_val, &max_val, &count, &has_estimated)) {
-            /* Hourly points in interval [yesterday 00:00 local .. today 00:00 local[ */
-            if (start_ts >= (uint32_t)yesterday_midnight && start_ts < (uint32_t)today_midnight) {
-                daily.avg_value += avg * count;
-                if (!has_data || min_val < daily.min_value) daily.min_value = min_val;
-                if (!has_data || max_val > daily.max_value) daily.max_value = max_val;
-                daily.count += count;
-                if (has_estimated) daily.has_estimated = true;
-                has_data = true;
-            }
-        }
-    }
-    littlefs_driver_close(f);
-
-    if (has_data && daily.count > 0) {
-        daily.avg_value /= daily.count;
-        write_aggregated_point(channel_key, GRAN_DAILY, &daily);
-        data_storage_trim_file(daily_path, 32);
-        DBG_LFS_PRINTF("Daily aggregated for %s: start=%lu, tz_off=%ld s, avg=%.2f, count=%lu",
-                       channel_key, (unsigned long)daily.start_timestamp, (long)daily.tz_offset_sec,
-                       daily.avg_value, (unsigned long)daily.count);
-    }
+    write_aggregated_point(channel, GRAN_DAILY, &daily);
+    DBG_LFS_PRINTF("Daily aggregated for %s: start=%lu, tz_off=%ld s, avg=%.2f",
+                   cfg->channel_key, (unsigned long)daily.start_timestamp, (long)daily.tz_offset_sec, daily.avg_value);
 }
 
 void data_storage_aggregate_hourly(void) {
     if (!data_storage_is_time_valid()) return;
 
     for (size_t i = 0; i < g_channel_count; i++) {
-        if (g_channels[i].config.store_longterm) {
-            aggregate_to_hourly(g_channels[i].config.channel_key);
+        if (g_channels[i].config.keep_entries[RET_HOURS] > 0) {
+            aggregate_to_hourly(&g_channels[i]);
         }
     }
 }
@@ -796,8 +920,8 @@ void data_storage_aggregate_daily(void) {
     if (!data_storage_is_time_valid()) return;
 
     for (size_t i = 0; i < g_channel_count; i++) {
-        if (g_channels[i].config.store_longterm) {
-            aggregate_to_daily(g_channels[i].config.channel_key);
+        if (g_channels[i].config.keep_entries[RET_DAYS] > 0) {
+            aggregate_to_daily(&g_channels[i]);
         }
     }
 }
@@ -806,66 +930,91 @@ void data_storage_aggregate_daily(void) {
 // Query Functions (Reading from LittleFS Partition 2)
 // ============================================================================
 
-static data_point_t* load_from_roundtrip(
-    const char* channel_key,
-    uint32_t start_timestamp,
-    uint32_t end_timestamp,
-    uint32_t interval_sec,
-    uint32_t max_points,
-    size_t* count
-) {
+/** Collects records of one level into a bounded data_point_t array */
+typedef struct {
+    data_point_t* points;
+    size_t        count;
+    size_t        capacity;
+    const char*   unit;
+} collect_ctx_t;
+
+static void set_point_unit(data_point_t* p, const char* unit) {
+    strncpy(p->unit, unit ? unit : "", sizeof(p->unit) - 1);
+    p->unit[sizeof(p->unit) - 1] = '\0';
+}
+
+static bool raw_collect_visit(const void* record, void* ctx) {
+    const arc_raw_record_t* rec = (const arc_raw_record_t*)record;
+    collect_ctx_t* cc = (collect_ctx_t*)ctx;
+    if (cc->count >= cc->capacity) return false;
+    data_point_t* p = &cc->points[cc->count++];
+    p->timestamp = rec->ts;
+    p->value = rec->value;
+    set_point_unit(p, cc->unit);
+    /* RT_FLAG_HOLD is a valid value (next packet not overdue yet) */
+    p->is_estimated = (rec->flag == RT_FLAG_ESTIMATED);
+    p->count = 0;
+    p->is_gap = false;
+    return true;
+}
+
+static bool agg_collect_visit(const void* record, void* ctx) {
+    const arc_agg_record_t* rec = (const arc_agg_record_t*)record;
+    collect_ctx_t* cc = (collect_ctx_t*)ctx;
+    if (cc->count >= cc->capacity) return false;
+    data_point_t* p = &cc->points[cc->count++];
+    p->timestamp = rec->ts;
+    p->value = rec->avg;
+    set_point_unit(p, cc->unit);
+    p->is_estimated = (rec->flags & ARC_AGG_FLAG_DEGRADED) != 0;
+    p->count = rec->count;
+    p->is_gap = false;
+    return true;
+}
+
+/**
+ * @brief Load all records of a level within [start, end[ (bounded by max_points).
+ */
+static data_point_t* load_level(data_channel_t* channel, arc_level_t level,
+                                uint32_t start_timestamp, uint32_t end_timestamp,
+                                size_t max_points, size_t* count) {
     *count = 0;
-    if (!littlefs_driver_is_mounted() || !channel_key || max_points == 0) return nullptr;
+    if (!channel || max_points == 0) return nullptr;
 
-    char path[128];
-    data_storage_build_roundtrip_path(channel_key, path, sizeof(path));
-    
-    lfs_file_handle_t f = littlefs_driver_open_read(path);
-    if (!f) {
-        DBG_LFS_PRINTF("File not found on LittleFS: %s", path);
+    data_point_t* points = (data_point_t*)malloc(max_points * sizeof(data_point_t));
+    if (!points) {
+        LogSerial.printf("[STORAGE_ERR] OOM loading %s (%lu bytes)\r\n", channel->config.channel_key,
+                         (unsigned long)(max_points * sizeof(data_point_t)));
         return nullptr;
     }
 
-    data_point_t* result = (data_point_t*)malloc(max_points * sizeof(data_point_t));
-    if (!result) {
-        littlefs_driver_close(f);
+    collect_ctx_t cc = { points, 0, max_points, channel->config.unit };
+    arc_scan_range(&channel->arc, level, start_timestamp, end_timestamp,
+                   (level == ARC_LEVEL_RAW) ? raw_collect_visit : agg_collect_visit, &cc);
+
+    DBG_LFS_PRINTF("%s/%s: Found %u points in range [%lu..%lu]", channel->arc.dir,
+                   (level == ARC_LEVEL_RAW) ? "raw" : (level == ARC_LEVEL_HOUR) ? "hour" : "day",
+                   (unsigned)cc.count, (unsigned long)start_timestamp, (unsigned long)end_timestamp);
+
+    if (cc.count == 0) {
+        free(points);
         return nullptr;
     }
+    *count = cc.count;
+    return points;
+}
 
-    size_t result_count = 0;
-    char line[128];
-    while (littlefs_driver_read_line(f, line, sizeof(line)) >= 0) {
-        uint32_t ts;
-        float val;
-        char unit[8];
-        uint8_t is_estimated;
-
-        if (parse_roundtrip_line(line, &ts, &val, unit, sizeof(unit), &is_estimated)) {
-            if (ts >= start_timestamp && ts <= (end_timestamp + 31) && result_count < max_points) {
-                result[result_count].timestamp = ts;
-                result[result_count].value = val;
-                strncpy(result[result_count].unit, unit, sizeof(result[result_count].unit));
-                result[result_count].is_estimated = (is_estimated != 0);
-                result_count++;
-            }
-        }
-    }
-    littlefs_driver_close(f);
-
-    DBG_LFS_PRINTF("%s: Found %u points in range [%lu..%lu]",
-                   path, (unsigned)result_count, (unsigned long)start_timestamp, (unsigned long)end_timestamp);
-
-    if (result_count == 0) {
-        free(result);
-        return nullptr;
-    }
-
-    *count = result_count;
-    return result;
+static void set_gap(data_point_t* p, uint32_t ts) {
+    p->timestamp = ts;
+    p->value = 0.0f;
+    p->unit[0] = '\0';
+    p->is_estimated = false;
+    p->count = 0;
+    p->is_gap = true;
 }
 
 static data_point_t* load_and_aggregate_roundtrip(
-    const char* channel_key,
+    data_channel_t* channel,
     uint32_t start_timestamp,
     uint32_t end_timestamp,
     uint32_t interval_sec,
@@ -873,10 +1022,16 @@ static data_point_t* load_and_aggregate_roundtrip(
     size_t* count
 ) {
     *count = 0;
-    if (!channel_key || max_points == 0) return nullptr;
+    if (!channel || max_points == 0) return nullptr;
+
+    /* Grid records needed for the requested window (+1 bucket margin) */
+    uint32_t grid = (channel->config.storage_interval > 0) ? channel->config.storage_interval : 300;
+    size_t raw_capacity = (size_t)((end_timestamp - start_timestamp) / grid) + 2;
+    if (raw_capacity > 400) raw_capacity = 400;
 
     size_t raw_count = 0;
-    data_point_t* raw_points = load_from_roundtrip(channel_key, start_timestamp, end_timestamp, interval_sec, 1000, &raw_count);
+    data_point_t* raw_points = load_level(channel, ARC_LEVEL_RAW, start_timestamp, end_timestamp,
+                                          raw_capacity, &raw_count);
 
     data_point_t* result = (data_point_t*)malloc(max_points * sizeof(data_point_t));
     if (!result) {
@@ -884,8 +1039,8 @@ static data_point_t* load_and_aggregate_roundtrip(
         return nullptr;
     }
 
-    const data_channel_config_t* cfg = data_storage_get_config(channel_key);
-    const char* default_unit = cfg ? cfg->unit : "";
+    const data_channel_state_t* live_state = &channel->state;
+    const char* default_unit = channel->config.unit;
 
     size_t result_count = 0;
     uint32_t current_bucket = start_timestamp - (start_timestamp % interval_sec);
@@ -901,28 +1056,35 @@ static data_point_t* load_and_aggregate_roundtrip(
         float sum = 0.0f;
         uint32_t bucket_count = 0;
         bool has_estimated = false;
-        const char* unit_ptr = default_unit;
 
         while (k < raw_count && raw_points[k].timestamp < (current_bucket + interval_sec)) {
             sum += raw_points[k].value;
             bucket_count++;
             if (raw_points[k].is_estimated) has_estimated = true;
-            if (raw_points[k].unit[0] != '\0') unit_ptr = raw_points[k].unit;
             k++;
         }
 
-        result[result_count].timestamp = current_bucket;
+        /* Fallback to unflushed RAM accumulator if query arrives right on the bucket boundary */
+        if (bucket_count == 0 && live_state->sample_count > 0 &&
+            live_state->current_bucket >= current_bucket &&
+            live_state->current_bucket < (current_bucket + interval_sec)) {
+            sum = (float)live_state->accumulator;
+            bucket_count = live_state->sample_count;
+            has_estimated = false;
+        }
+
         if (bucket_count > 0) {
-            result[result_count].value = sum / (float)bucket_count;
-            strncpy(result[result_count].unit, unit_ptr, sizeof(result[result_count].unit) - 1);
-            result[result_count].unit[sizeof(result[result_count].unit) - 1] = '\0';
-            result[result_count].is_estimated = has_estimated;
+            data_point_t* p = &result[result_count];
+            p->timestamp = current_bucket;
+            p->value = sum / (float)bucket_count;
+            set_point_unit(p, default_unit);
+            p->is_estimated = has_estimated;
+            p->count = bucket_count;
+            p->is_gap = false;
             j = k;
         } else {
-            /* Missing 5-minute interval: flag as empty gap */
-            result[result_count].value = 0.0f;
-            result[result_count].unit[0] = '\0';
-            result[result_count].is_estimated = false;
+            /* Missing grid interval: flag as empty gap */
+            set_gap(&result[result_count], current_bucket);
         }
 
         result_count++;
@@ -935,69 +1097,18 @@ static data_point_t* load_and_aggregate_roundtrip(
 }
 
 static data_point_t* load_from_hourly(
-    const char* channel_key,
+    data_channel_t* channel,
     uint32_t start_timestamp,
     uint32_t end_timestamp,
     uint32_t max_points,
     size_t* count
 ) {
-    *count = 0;
-    if (!littlefs_driver_is_mounted() || !channel_key || max_points == 0) return nullptr;
-
-    char path[128];
-    data_storage_build_hourly_path(channel_key, path, sizeof(path));
-    
-    lfs_file_handle_t f = littlefs_driver_open_read(path);
-    if (!f) {
-        DBG_LFS_PRINTF("File not found on LittleFS: %s", path);
-        return nullptr;
-    }
-
-    data_point_t* result = (data_point_t*)malloc(max_points * sizeof(data_point_t));
-    if (!result) {
-        littlefs_driver_close(f);
-        return nullptr;
-    }
-
-    size_t result_count = 0;
-    char line[128];
-    while (littlefs_driver_read_line(f, line, sizeof(line)) >= 0) {
-        uint32_t start_ts;
-        float avg, min_val, max_val;
-        uint32_t count_val;
-        uint8_t has_estimated;
-
-        if (parse_aggregated_line(line, &start_ts, &avg, &min_val, &max_val, &count_val, &has_estimated)) {
-            if (start_ts >= start_timestamp && start_ts <= (end_timestamp + 31) && result_count < max_points) {
-                result[result_count].timestamp = start_ts;
-                result[result_count].value = avg;
-                const data_channel_config_t* cfg = data_storage_get_config(channel_key);
-                if (cfg) {
-                    strncpy(result[result_count].unit, cfg->unit, sizeof(result[result_count].unit));
-                } else {
-                    result[result_count].unit[0] = '\0';
-                }
-                result[result_count].is_estimated = (has_estimated != 0);
-                result_count++;
-            }
-        }
-    }
-    littlefs_driver_close(f);
-
-    DBG_LFS_PRINTF("%s: Found %u points in range [%lu..%lu]",
-                   path, (unsigned)result_count, (unsigned long)start_timestamp, (unsigned long)end_timestamp);
-
-    if (result_count == 0) {
-        free(result);
-        return nullptr;
-    }
-
-    *count = result_count;
-    return result;
+    /* Hourly records sit exactly on the hour; the end tolerance keeps the last slot */
+    return load_level(channel, ARC_LEVEL_HOUR, start_timestamp, end_timestamp + 31, max_points, count);
 }
 
 static data_point_t* load_and_aggregate_hourly(
-    const char* channel_key,
+    data_channel_t* channel,
     uint32_t start_timestamp,
     uint32_t end_timestamp,
     uint32_t interval_sec,
@@ -1005,10 +1116,10 @@ static data_point_t* load_and_aggregate_hourly(
     size_t* count
 ) {
     *count = 0;
-    if (!channel_key || max_points == 0) return nullptr;
+    if (!channel || max_points == 0) return nullptr;
 
     size_t raw_count = 0;
-    data_point_t* raw_points = load_from_hourly(channel_key, start_timestamp, end_timestamp, 200, &raw_count);
+    data_point_t* raw_points = load_level(channel, ARC_LEVEL_HOUR, start_timestamp, end_timestamp, 400, &raw_count);
 
     data_point_t* result = (data_point_t*)malloc(max_points * sizeof(data_point_t));
     if (!result) {
@@ -1016,16 +1127,16 @@ static data_point_t* load_and_aggregate_hourly(
         return nullptr;
     }
 
-    const data_channel_config_t* cfg = data_storage_get_config(channel_key);
-    const char* default_unit = cfg ? cfg->unit : "";
+    const data_channel_config_t* cfg = &channel->config;
 
     size_t result_count = 0;
     uint32_t current_bucket = start_timestamp - (start_timestamp % interval_sec);
     size_t j = 0;
 
-    /* For 2-hour intervals, we expect 2 hourly points per bucket */
-    uint32_t expected_hourly_points = interval_sec / 3600;
-    if (expected_hourly_points == 0) expected_hourly_points = 1;
+    /* Expected grid samples per multi-hour bucket (e.g. 2 h at 300 s grid = 24) */
+    uint32_t grid = (cfg->storage_interval > 0) ? cfg->storage_interval : 300;
+    uint32_t expected_samples = interval_sec / grid;
+    if (expected_samples == 0) expected_samples = 1;
 
     /* Loop strictly over all requested bucket slots to guarantee exact max_points */
     while (result_count < max_points && current_bucket < end_timestamp) {
@@ -1034,36 +1145,34 @@ static data_point_t* load_and_aggregate_hourly(
         }
 
         size_t k = j;
-        float sum = 0.0f;
-        uint32_t b_count = 0;
-        bool has_estimated = false;
-        const char* unit_ptr = default_unit;
+        double weighted_sum = 0.0;
+        uint32_t weight_total = 0;
+        uint32_t covered = 0;
 
         while (k < raw_count && raw_points[k].timestamp < (current_bucket + interval_sec)) {
-            sum += raw_points[k].value;
-            b_count++;
-            if (raw_points[k].is_estimated) has_estimated = true;
-            if (raw_points[k].unit[0] != '\0') unit_ptr = raw_points[k].unit;
+            uint32_t weight = (raw_points[k].count > 0) ? raw_points[k].count : 1;
+            weighted_sum += (double)raw_points[k].value * weight;
+            weight_total += weight;
+            covered += raw_points[k].count;
             k++;
         }
+        j = k;
 
-        result[result_count].timestamp = current_bucket;
-        if (b_count > 0) {
-            result[result_count].value = sum / (float)b_count;
-            strncpy(result[result_count].unit, unit_ptr, sizeof(result[result_count].unit) - 1);
-            result[result_count].unit[sizeof(result[result_count].unit) - 1] = '\0';
+        /* Same quality model as the archived hours/days (coverage of grid samples) */
+        agg_quality_t q = (weight_total > 0) ? classify_coverage(cfg, covered, expected_samples)
+                                             : AGG_QUALITY_GAP;
 
-            /* If hours are missing within this 2h bucket, mark as estimated (50% transparent)! */
-            if (b_count < expected_hourly_points) {
-                has_estimated = true;
-            }
-            result[result_count].is_estimated = has_estimated;
-            j = k;
+        if (q != AGG_QUALITY_GAP) {
+            data_point_t* p = &result[result_count];
+            p->timestamp = current_bucket;
+            p->value = (float)(weighted_sum / weight_total);
+            set_point_unit(p, cfg->unit);
+            p->is_estimated = (q == AGG_QUALITY_DEGRADED);
+            p->count = covered;
+            p->is_gap = false;
         } else {
-            /* Blackout / gap slot: full 2 hours missing, flag as empty gap */
-            result[result_count].value = 0.0f;
-            result[result_count].unit[0] = '\0';
-            result[result_count].is_estimated = false;
+            /* Blackout / gap slot: coverage below min_pct, flag as empty gap */
+            set_gap(&result[result_count], current_bucket);
         }
 
         result_count++;
@@ -1076,50 +1185,23 @@ static data_point_t* load_and_aggregate_hourly(
 }
 
 static data_point_t* load_from_daily(
-    const char* channel_key,
+    data_channel_t* channel,
     uint32_t start_timestamp,
     uint32_t end_timestamp,
     uint32_t max_points,
     size_t* count
 ) {
     *count = 0;
-    if (!channel_key || max_points == 0) return nullptr;
+    if (!channel || max_points == 0) return nullptr;
 
     data_point_t* result = (data_point_t*)malloc(max_points * sizeof(data_point_t));
     if (!result) return nullptr;
 
-    const data_channel_config_t* cfg = data_storage_get_config(channel_key);
-    const char* default_unit = cfg ? cfg->unit : "";
-
-    /* 1. Read existing daily archive entries into temporary buffer */
-    #define MAX_RAW_DAILY 32
-    data_point_t raw_daily[MAX_RAW_DAILY];
+    /* 1. Read daily archive entries of the window (+/- 2 h for DST shifted midnights) */
     size_t raw_count = 0;
-
-    char path[128];
-    data_storage_build_daily_path(channel_key, path, sizeof(path));
-    lfs_file_handle_t f = littlefs_driver_open_read(path);
-    if (f) {
-        char line[128];
-        while (littlefs_driver_read_line(f, line, sizeof(line)) >= 0 && raw_count < MAX_RAW_DAILY) {
-            uint32_t start_ts;
-            int32_t tz_off = 0;
-            float avg, min_val, max_val;
-            uint32_t count_val;
-            uint8_t has_estimated;
-
-            if (parse_aggregated_line(line, &start_ts, &tz_off, &avg, &min_val, &max_val, &count_val, &has_estimated)) {
-                raw_daily[raw_count].timestamp = start_ts;
-                raw_daily[raw_count].value = avg;
-                raw_daily[raw_count].is_estimated = (has_estimated != 0);
-                strncpy(raw_daily[raw_count].unit, default_unit, sizeof(raw_daily[raw_count].unit) - 1);
-                raw_daily[raw_count].unit[sizeof(raw_daily[raw_count].unit) - 1] = '\0';
-                raw_count++;
-            }
-        }
-        littlefs_driver_close(f);
-        DBG_LFS_PRINTF("%s: Found %u points in daily archive", path, (unsigned)raw_count);
-    }
+    uint32_t from_ts = (start_timestamp > 7200) ? start_timestamp - 7200 : 0;
+    data_point_t* raw_daily = load_level(channel, ARC_LEVEL_DAY, from_ts, end_timestamp + 7200,
+                                         max_points + 4, &raw_count);
 
     /* 2. Grid-locked iteration over calendar days ending at local midnight */
     time_t ref_time = (time_t)end_timestamp;
@@ -1139,24 +1221,20 @@ static data_point_t* load_from_daily(
         ltm_slot.tm_isdst = -1;
         time_t slot_midnight = mktime(&ltm_slot);
 
-        result[i].timestamp = (uint32_t)slot_midnight;
-        result[i].value = 0.0f;
-        result[i].unit[0] = '\0';
-        result[i].is_estimated = false;
+        set_gap(&result[i], (uint32_t)slot_midnight);
 
         /* Match archive record within 2 hours tolerance (covers DST shifts) */
         for (size_t r = 0; r < raw_count; r++) {
             long diff = (long)raw_daily[r].timestamp - (long)slot_midnight;
             if (diff >= -7200 && diff <= 7200) {
-                result[i].value = raw_daily[r].value;
-                strncpy(result[i].unit, raw_daily[r].unit, sizeof(result[i].unit) - 1);
-                result[i].unit[sizeof(result[i].unit) - 1] = '\0';
-                result[i].is_estimated = raw_daily[r].is_estimated;
+                result[i] = raw_daily[r];
+                result[i].timestamp = (uint32_t)slot_midnight;
                 break;
             }
         }
     }
 
+    if (raw_daily) free(raw_daily);
     *count = max_points;
     return result;
 }
@@ -1179,28 +1257,35 @@ data_point_t* data_storage_query(
         return nullptr;
     }
 
-    const data_channel_config_t* cfg = data_storage_get_config(channel_key);
-    bool has_longterm = cfg ? cfg->store_longterm : false;
+    int32_t idx = find_channel(channel_key);
+    if (idx < 0) {
+        *count = 0;
+        return nullptr;
+    }
+    data_channel_t* channel = &g_channels[idx];
+    bool has_hourly = channel->config.keep_entries[RET_HOURS] > 0;
+    bool has_daily = channel->config.keep_entries[RET_DAYS] > 0;
 
     /* Sub-hourly query: aggregate roundtrip on bucket grid */
-    if (interval_sec < 3600 || !has_longterm) {
+    if (interval_sec < 3600 || !has_hourly) {
         *actual_interval_sec = interval_sec;
-        return load_and_aggregate_roundtrip(channel_key, start_timestamp, end_timestamp, *actual_interval_sec, max_points, count);
+        return load_and_aggregate_roundtrip(channel, start_timestamp, end_timestamp, *actual_interval_sec, max_points, count);
     }
     /* Exactly 1 hour requested: load directly from hourly archive */
     else if (interval_sec == 3600) {
         *actual_interval_sec = 3600;
-        return load_from_hourly(channel_key, start_timestamp, end_timestamp, max_points, count);
+        return load_from_hourly(channel, start_timestamp, end_timestamp, max_points, count);
     }
-    /* Multi-hour aggregation (e.g. 2h, 4h, 6h): aggregate from hourly archive */
-    else if (interval_sec < 86400) {
+    /* Multi-hour aggregation (e.g. 2h, 4h, 6h): aggregate from hourly archive.
+     * Also used for daily steps when the channel keeps no daily archive. */
+    else if (interval_sec < 86400 || !has_daily) {
         *actual_interval_sec = interval_sec;
-        return load_and_aggregate_hourly(channel_key, start_timestamp, end_timestamp, interval_sec, max_points, count);
+        return load_and_aggregate_hourly(channel, start_timestamp, end_timestamp, interval_sec, max_points, count);
     }
     /* Daily or multi-day intervals: load from daily archive */
     else {
         *actual_interval_sec = 86400;
-        return load_from_daily(channel_key, start_timestamp, end_timestamp, max_points, count);
+        return load_from_daily(channel, start_timestamp, end_timestamp, max_points, count);
     }
 }
 
@@ -1258,7 +1343,7 @@ chart_data_point_t* data_storage_query_chart(
         chart_pts[i].flags = 0;
 
         /* Empty slot (gap from power outage or missing history) */
-        if (raw_pts[i].value == 0.0f && !raw_pts[i].is_estimated && raw_pts[i].unit[0] == '\0') {
+        if (raw_pts[i].is_gap) {
             chart_pts[i].flags = DATA_FLAG_NO_DATA;
         } else {
             if (raw_pts[i].is_estimated) {

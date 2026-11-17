@@ -2,6 +2,7 @@
 #include "indicator_enabler.h"
 #if CONFIG_GUI_CONFIG_EXTERN
 #include "sd_model.h"
+#include "alarm/alarm_evaluator.h"
 #endif
 
 int indicator_model_init(void) {
@@ -60,4 +61,9 @@ int indicator_model_init(void) {
     /* Initialize SD card storage backend model */
     sd_model_init();
 #endif
+
+alarm_model_init();
+alarm_evaluator_init();
+
+return 0;
 }

@@ -18,6 +18,8 @@
  */
 
 #include "virtual_decoder.hpp"
+#include "data_storage.hpp"
+#include "lorasensors.hpp"
 #include "debug_log.hpp"
 #include "indicator_rp2040.hpp"
 #include "units.h"
@@ -29,12 +31,15 @@
 // Static State
 // ============================================================================
 
-#define MAX_VIRTUAL_DECODERS 16
+#define MAX_VIRTUAL_DECODERS 24
+/* Blackboard holds source values (e.g. depth) and computed outputs of all devices */
+#define MAX_VD_OUTPUTS 32
 
 static virtual_decoder_t g_virtual_decoders[MAX_VIRTUAL_DECODERS];
 static size_t g_virtual_decoder_count = 0;
 
 typedef struct {
+    uint32_t dev_addr;   /* Owning device: identical keys of different devices never mix */
     char key[32];
     char unit[16];
     float value;
@@ -42,25 +47,27 @@ typedef struct {
     bool valid;
 } vd_output_t;
 
-static vd_output_t g_vd_outputs[MAX_VIRTUAL_DECODERS];
+static vd_output_t g_vd_outputs[MAX_VD_OUTPUTS];
 static size_t g_vd_output_count = 0;
 
 // ============================================================================
 // Helper Functions
 // ============================================================================
 
-static virtual_decoder_t* find_virtual_decoder(const char* output_key) {
+static virtual_decoder_t* find_virtual_decoder(uint32_t dev_addr, const char* output_key) {
     for (size_t i = 0; i < g_virtual_decoder_count; i++) {
-        if (strncmp(g_virtual_decoders[i].config.output_key, output_key, sizeof(g_virtual_decoders[i].config.output_key)) == 0) {
+        if (g_virtual_decoders[i].config.dev_addr == dev_addr &&
+            strncmp(g_virtual_decoders[i].config.output_key, output_key, sizeof(g_virtual_decoders[i].config.output_key)) == 0) {
             return &g_virtual_decoders[i];
         }
     }
     return nullptr;
 }
 
-static void store_vd_output(const char* key, const char* unit, float value, uint32_t timestamp) {
+static void store_vd_output(uint32_t dev_addr, const char* key, const char* unit, float value, uint32_t timestamp) {
     for (size_t i = 0; i < g_vd_output_count; i++) {
-        if (strncmp(g_vd_outputs[i].key, key, sizeof(g_vd_outputs[i].key)) == 0) {
+        if (g_vd_outputs[i].dev_addr == dev_addr &&
+            strncmp(g_vd_outputs[i].key, key, sizeof(g_vd_outputs[i].key)) == 0) {
             g_vd_outputs[i].value = value;
             g_vd_outputs[i].timestamp = timestamp;
             if (unit) strncpy(g_vd_outputs[i].unit, unit, sizeof(g_vd_outputs[i].unit) - 1);
@@ -68,7 +75,8 @@ static void store_vd_output(const char* key, const char* unit, float value, uint
             return;
         }
     }
-    if (g_vd_output_count < MAX_VIRTUAL_DECODERS) {
+    if (g_vd_output_count < MAX_VD_OUTPUTS) {
+        g_vd_outputs[g_vd_output_count].dev_addr = dev_addr;
         strncpy(g_vd_outputs[g_vd_output_count].key, key, sizeof(g_vd_outputs[g_vd_output_count].key) - 1);
         g_vd_outputs[g_vd_output_count].key[sizeof(g_vd_outputs[g_vd_output_count].key) - 1] = '\0';
         if (unit) strncpy(g_vd_outputs[g_vd_output_count].unit, unit, sizeof(g_vd_outputs[g_vd_output_count].unit) - 1);
@@ -76,12 +84,16 @@ static void store_vd_output(const char* key, const char* unit, float value, uint
         g_vd_outputs[g_vd_output_count].timestamp = timestamp;
         g_vd_outputs[g_vd_output_count].valid = true;
         g_vd_output_count++;
+    } else {
+        DBG_LORA_PRINTF("Virtual decoder blackboard full (%u entries): '%s' of 0x%08lX dropped",
+                        (unsigned)MAX_VD_OUTPUTS, key, (unsigned long)dev_addr);
     }
 }
 
-static bool get_vd_output(const char* key, float* value, uint32_t* timestamp, char* out_unit = nullptr) {
+static bool get_vd_output(uint32_t dev_addr, const char* key, float* value, uint32_t* timestamp, char* out_unit = nullptr) {
     for (size_t i = 0; i < g_vd_output_count; i++) {
-        if (g_vd_outputs[i].valid && strncmp(g_vd_outputs[i].key, key, sizeof(g_vd_outputs[i].key)) == 0) {
+        if (g_vd_outputs[i].valid && g_vd_outputs[i].dev_addr == dev_addr &&
+            strncmp(g_vd_outputs[i].key, key, sizeof(g_vd_outputs[i].key)) == 0) {
             if (value) *value = g_vd_outputs[i].value;
             if (timestamp) *timestamp = g_vd_outputs[i].timestamp;
             if (out_unit) strncpy(out_unit, g_vd_outputs[i].unit, 15);
@@ -140,7 +152,19 @@ static void parse_rate_unit(const char* rate_unit, char* out_qty, size_t qty_len
 static float calc_volume(const geometry_config_t& geo, float depth_cm) {
     if (geo.max_depth_cm <= 0.0f) return 0.0f;
 
-    float valid_depth = fminf(geo.max_depth_cm, fmaxf(0.0f, depth_cm));
+    // Mode 2 = Drop: Do not calculate volume when overfilled
+    if (geo.cap_max == 2 && depth_cm > geo.max_depth_cm) {
+        return NAN;
+    }
+
+    float valid_depth = fmaxf(0.0f, depth_cm);
+
+    // Mode 1 = Clamp: limit to  max_depth_cm
+    if (geo.cap_max == 1 && valid_depth > geo.max_depth_cm) {
+        valid_depth = geo.max_depth_cm;
+    }
+    // Mode 0 = Pass-Through: valid_depth stays uncapped
+
     float volume_m3 = 0.0f;
 
     switch (geo.type) {
@@ -245,8 +269,8 @@ static float calc_derivative(virtual_decoder_t* decoder, float current_value,
 // Cascading Processing
 // ============================================================================
 
-static bool process_virtual_decoders(PacketSerial* ps, uint32_t dev_addr, uint32_t fcnt, 
-                                    const char* trigger_key, uint32_t timestamp) {
+static bool process_virtual_decoders(uint32_t dev_addr, uint32_t fcnt, 
+                                     const char* trigger_key, uint32_t timestamp) {
     bool produced_output = false;
     char updated_keys[MAX_VIRTUAL_DECODERS + 1][32];
     size_t updated_count = 0;
@@ -266,6 +290,8 @@ static bool process_virtual_decoders(PacketSerial* ps, uint32_t dev_addr, uint32
         for (size_t i = 0; i < g_virtual_decoder_count; i++) {
             virtual_decoder_t* decoder = &g_virtual_decoders[i];
             if (!decoder->enabled || decoder_processed[i]) continue;
+            /* Only decoders of the device that delivered the trigger value */
+            if (decoder->config.dev_addr != dev_addr) continue;
 
             bool needs_calc = false;
             for (uint8_t j = 0; j < decoder->config.source_key_count; j++) {
@@ -287,7 +313,7 @@ static bool process_virtual_decoders(PacketSerial* ps, uint32_t dev_addr, uint32
             for (uint8_t j = 0; j < decoder->config.source_key_count; j++) {
                 const char* s_key = decoder->config.source_keys[j];
                 // Read input directly from global blackboard (g_vd_outputs)
-                if (get_vd_output(s_key, &source_values[j], &source_timestamps[j], source_units[j])) {
+                if (get_vd_output(dev_addr, s_key, &source_values[j], &source_timestamps[j], source_units[j])) {
                     // Ready
                 } else {
                     all_available = false;
@@ -360,10 +386,10 @@ static bool process_virtual_decoders(PacketSerial* ps, uint32_t dev_addr, uint32
                     break;
             }
 
-            if (!should_compute) continue;
+            if (!should_compute || isnan(result) || isinf(result)) continue;
 
-            // Store result ONLY in global blackboard
-            store_vd_output(decoder->config.output_key, decoder->config.unit, result, result_ts);
+            // Store result in global blackboard for cascading dependent decoders
+            store_vd_output(dev_addr, decoder->config.output_key, decoder->config.unit, result, result_ts);
 
             if (updated_count < (MAX_VIRTUAL_DECODERS + 1)) {
                 strncpy(updated_keys[updated_count], decoder->config.output_key, sizeof(updated_keys[0]) - 1);
@@ -378,42 +404,16 @@ static bool process_virtual_decoders(PacketSerial* ps, uint32_t dev_addr, uint32
             DBG_LORA_PRINTF("Virtual decoder computed %s = %.4f %s",
                            decoder->config.output_key, result, decoder->config.unit);
 
-            if (ps) {
-                uint8_t tx_buf[64];
-                size_t idx = 0;
-                
-                /* Select packet type: local I2C (< 0x01000000) vs external LoRa */
-                uint8_t pkt_id = (dev_addr < 0x01000000) ? 
-                                 static_cast<uint8_t>(PKT_TYPE_LOCAL_TELEMETRY) : 
-                                 static_cast<uint8_t>(PKT_TYPE_LORA_TELEMETRY);
-                tx_buf[idx++] = pkt_id;
-                
-                memcpy(&tx_buf[idx], &dev_addr, 4); idx += 4;
-                memcpy(&tx_buf[idx], &fcnt, 4); idx += 4;
-                tx_buf[idx++] = 0; // float type
-                tx_buf[idx++] = 0; // measurement context
+            /* Enqueue newly calculated virtual value to central UART transmission queue */
+            telemetry_tx_enqueue(dev_addr, fcnt, decoder->config.output_key, decoder->config.unit, result);
 
-                size_t key_len = strlen(decoder->config.output_key) + 1;
-                if (idx + key_len <= sizeof(tx_buf)) {
-                    memcpy(&tx_buf[idx], decoder->config.output_key, key_len);
-                    idx += key_len;
-                }
-
-                size_t unit_len = strlen(decoder->config.unit) + 1;
-                if (idx + unit_len <= sizeof(tx_buf)) {
-                    memcpy(&tx_buf[idx], decoder->config.unit, unit_len);
-                    idx += unit_len;
-                }
-
-                if (idx + sizeof(float) <= sizeof(tx_buf)) {
-                    memcpy(&tx_buf[idx], &result, sizeof(float));
-                    idx += sizeof(float);
-                }
-
-                uint8_t checksum = 0;
-                for (size_t j = 0; j < idx; j++) checksum ^= tx_buf[j];
-                tx_buf[idx++] = checksum;
-                ps->send(tx_buf, idx);
+            /* Archive virtual keys listed in the device's "archive" block (e.g. volume, flowrate) */
+            const lora_device_config_t* dev = lorasensors_find_device(dev_addr);
+            if (dev) {
+                char dev_addr_str[16];
+                snprintf(dev_addr_str, sizeof(dev_addr_str), "%08lX", (unsigned long)dev_addr);
+                data_storage_add_point(dev_addr_str, dev->decoder, decoder->config.output_key,
+                                       result_ts, result, decoder->config.unit);
             }
         }
     } while (any_computed);
@@ -433,7 +433,7 @@ void virtual_decoder_init(void) {
 }
 
 void virtual_decoder_clear_outputs(void) {
-    for (size_t i = 0; i < MAX_VIRTUAL_DECODERS; i++) g_vd_outputs[i].valid = false;
+    for (size_t i = 0; i < MAX_VD_OUTPUTS; i++) g_vd_outputs[i].valid = false;
     g_vd_output_count = 0;
     for (size_t i = 0; i < g_virtual_decoder_count; i++) {
         for (uint8_t j = 0; j < MAX_SOURCE_KEYS; j++) g_virtual_decoders[i].state.has_last_value[j] = false;
@@ -443,11 +443,11 @@ void virtual_decoder_clear_outputs(void) {
 bool virtual_decoder_register(const virtual_decoder_config_t* config) {
     if (!config || g_virtual_decoder_count >= MAX_VIRTUAL_DECODERS) return false;
 
-    for (size_t i = 0; i < g_virtual_decoder_count; i++) {
-        if (strncmp(g_virtual_decoders[i].config.output_key, config->output_key, 32) == 0) {
-            g_virtual_decoders[i].config = *config;
-            return true;
-        }
+    /* Re-registration (config reload) updates the entry of the same device only */
+    virtual_decoder_t* existing = find_virtual_decoder(config->dev_addr, config->output_key);
+    if (existing) {
+        existing->config = *config;
+        return true;
     }
 
     virtual_decoder_t* decoder = &g_virtual_decoders[g_virtual_decoder_count++];
@@ -457,21 +457,24 @@ bool virtual_decoder_register(const virtual_decoder_config_t* config) {
     return true;
 }
 
-bool virtual_decoder_process(const char* key, float value, uint32_t timestamp) {
-    return virtual_decoder_process_and_send((PacketSerial*)nullptr, nullptr, 0, 0, key, value, timestamp, nullptr);
+bool virtual_decoder_process(uint32_t dev_addr, uint32_t fcnt, const char* key,
+                            float value, uint32_t timestamp, const char* source_unit) {
+    if (!key) return false;
+
+    // Cache source value and unit on the blackboard
+    store_vd_output(dev_addr, key, source_unit, value, timestamp);
+
+    // Process cascade
+    return process_virtual_decoders(dev_addr, fcnt, key, timestamp);
 }
 
-bool virtual_decoder_get_output(const char* output_key, float* value, char* unit) {
-    return get_vd_output(output_key, value, nullptr, unit);
+bool virtual_decoder_get_output(uint32_t dev_addr, const char* output_key, float* value, char* unit) {
+    return get_vd_output(dev_addr, output_key, value, nullptr, unit);
 }
 
 bool virtual_decoder_process_and_send(PacketSerial* ps, const char* device_name, uint32_t dev_addr, uint32_t fcnt, 
                                        const char* key, float value, uint32_t timestamp, const char* source_unit) {
-    if (!key) return false;
-
-    // Cache source value and unit on the blackboard
-    store_vd_output(key, source_unit, value, timestamp);
-
-    // Process cascade
-    return process_virtual_decoders(ps, dev_addr, fcnt, key, timestamp);
+    (void)ps;
+    (void)device_name;
+    return virtual_decoder_process(dev_addr, fcnt, key, value, timestamp, source_unit);
 }

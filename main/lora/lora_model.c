@@ -16,95 +16,12 @@
 #include "rp2040.h"
 #include "mbedtls/aes.h"
 #include "mbedtls/cmac.h"
+#include "alarm/alarm_evaluator.h"
+#include "gui_header.h"
 
 static const char *TAG = "lora_model";
 static int16_t s_last_noise_floor = -100;
 bool s_time_synced_via_ntp = false;
-
-/* ── Packed Mirror Structs matching RP2040 Layout ──────────────────────── */
-
-typedef struct __attribute__((packed)) {
-    uint8_t trigger_fport;      /* Trigger FPort match (e.g. 13) */
-    uint8_t trigger_prefix;     /* Trigger byte prefix (e.g. 0x55) */
-    bool    trigger_encrypted;  /* False if payload on trigger FPort is unencrypted */
-    uint8_t target_fport;       /* Target FPort for downlink (e.g. 85) */
-    uint8_t payload_len;        /* Length of payload_bytes */
-    uint8_t payload_bytes[16];  /* Raw command bytes (e.g. FF 84 00) */
-    uint8_t max_retries;        /* Maximum retries, e.g. 3 */
-    bool    valid;              /* Whether reaction rule is active */
-} lora_device_reaction_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t fport;           /* Target FPort (e.g. 13) */
-    uint8_t encryption_mode; /* 0=full, 1=none, 2=partial */
-    uint8_t cipher_offset;   /* Offset where AES CTR starts (e.g. 1) */
-    uint8_t key_type;        /* 0=app_skey, 1=nwk_skey */
-    uint8_t payload_offset;  /* Offset where parser starts reading TLV (e.g. 1) */
-    bool    valid;           /* Rule active */
-} lora_fport_config_t;
-
-#define MAX_LUT_POINTS 16
-
-typedef enum {
-    TANK_TYPE_NONE = 0,
-    TANK_TYPE_RECTANGLE,
-    TANK_TYPE_CYLINDER_VERTICAL,
-    TANK_TYPE_CYLINDER_HORIZONTAL,
-    TANK_TYPE_CONE_FRUSTUM,
-    TANK_TYPE_LUT
-} tank_type_t;
-
-typedef struct {
-    float depth_cm;
-    float liters;
-} lut_point_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t     type;
-    float       max_depth_cm;
-    float       width_cm;
-    float       length_cm;
-    float       diameter_cm;
-    float       dish_height_cm;
-    float       bottom_diameter_cm;
-    float       top_diameter_cm;
-    float       height_cm;
-    float       cone_compensation;
-    lut_point_t lut[MAX_LUT_POINTS];
-    uint8_t     lut_count;
-} tank_geometry_t;
-
-typedef struct __attribute__((packed)) {
-    char unit_system[16];
-    char volume_unit[16];
-} tank_display_config_t;
-
-typedef struct __attribute__((packed)) {
-    char                   device_name[32];
-    char                   medium[16];
-    bool                   enabled;
-    uint32_t               dev_addr;
-    char                   dev_sn[32];
-    char                   dev_eui[32];
-    uint8_t                nwk_skey[16];
-    uint8_t                app_skey[16];
-    char                   decoder[32];
-    int32_t                raw_offset_mm;
-    lora_device_reaction_t reaction;
-    uint32_t               fcnt_down;
-    lora_fport_config_t    fport_cfg;
-    tank_geometry_t        geometry;     /* Synchronize layout with RP2040 lorasensors.hpp */
-    tank_display_config_t  display_cfg;  /* Synchronize layout with RP2040 lorasensors.hpp */
-} lora_device_config_t;
-
-#define MAX_LORA_DEVICES 16
-#define MAX_TX_QUEUE_SIZE 8
-#define DUP_CACHE_SIZE 16
-
-typedef struct {
-    uint32_t dev_addr;
-    uint16_t fcnt;
-} lora_dup_entry_t;
 
 static lora_global_config_t g_rf_cfg;
 static lora_device_config_t g_devices[MAX_LORA_DEVICES];
@@ -113,6 +30,47 @@ static bool                 g_radio_active = false;
 
 static lora_dup_entry_t     s_dup_cache[DUP_CACHE_SIZE];
 static uint8_t              s_dup_idx = 0;
+
+
+/* ── Device & Peer Runtime Tracking Tables ──────────────────────────────── */
+
+static lora_device_status_t s_device_status[MAX_LORA_DEVICES];
+static lora_p2p_peer_t      s_peer_table[MAX_LORA_PEERS];
+static size_t               s_peer_count = 0;
+
+/**
+ * @brief Record or refresh a P2P Mesh peer in the tracking table.
+ */
+static void _record_p2p_peer(uint32_t dev_addr, int16_t rssi, int8_t snr, uint8_t ttl) {
+    uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    uint32_t now_utc = (uint32_t)time(NULL);
+
+    /* Search existing entry for this relayed sensor stream */
+    for (size_t i = 0; i < s_peer_count; i++) {
+        if (s_peer_table[i].valid && s_peer_table[i].last_dev_relayed == dev_addr) {
+            s_peer_table[i].last_seen_ms = now_ms;
+            s_peer_table[i].last_seen_ts = now_utc;
+            s_peer_table[i].last_rssi = rssi;
+            s_peer_table[i].last_snr = snr;
+            s_peer_table[i].last_ttl = ttl;
+            s_peer_table[i].packet_count++;
+            return;
+        }
+    }
+
+    /* Allocate new peer slot */
+    if (s_peer_count < MAX_LORA_PEERS) {
+        size_t idx = s_peer_count++;
+        s_peer_table[idx].last_dev_relayed = dev_addr;
+        s_peer_table[idx].last_seen_ms = now_ms;
+        s_peer_table[idx].last_seen_ts = now_utc;
+        s_peer_table[idx].last_rssi = rssi;
+        s_peer_table[idx].last_snr = snr;
+        s_peer_table[idx].last_ttl = ttl;
+        s_peer_table[idx].packet_count = 1;
+        s_peer_table[idx].valid = true;
+    }
+}
 
 /* ── Anti-Looping Duplicate Cache Helpers ───────────────────────────────── */
 
@@ -625,10 +583,10 @@ static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) 
 
             /* Synchronize local RTC if time is valid and device is not synced via NTP */
             if (remote_utc > 1700000000 && !s_time_synced_via_ntp) {
-            extern void time_service_apply_sync(uint32_t utc_sec, uint8_t flag);
-            time_service_apply_sync(remote_utc, 0x01);
-            ESP_LOGI(TAG, "RTC & RP2040 synced via P2P Time: %lu", (unsigned long)remote_utc);
-        }
+                extern void time_service_apply_sync(uint32_t utc_sec, uint8_t flag);
+                time_service_apply_sync(remote_utc, 0x01);
+                ESP_LOGI(TAG, "RTC & RP2040 synced via P2P Time: %lu", (unsigned long)remote_utc);
+            }
         }
         Radio.RxBoosted(0);
         return;
@@ -647,6 +605,33 @@ static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) 
 
         ESP_LOGI(TAG, "P2P RETRANSMIT frame received for DevAddr: 0x%08lX (FCnt: %u, TTL: %u, Size: %u)",
                  (unsigned long)rx_dev_addr, fcnt, ttl, (unsigned)tlv_len);
+
+        /* DevAddr whitelist check: only accept retransmitted frames for known enabled devices */
+        int matched_idx = -1;
+        for (uint8_t i = 0; i < g_device_count; i++) {
+            if (g_devices[i].enabled && g_devices[i].dev_addr == rx_dev_addr) {
+                matched_idx = (int)i;
+                break;
+            }
+        }
+        if (matched_idx < 0) {
+            ESP_LOGW(TAG, "Ignored P2P RETRANSMIT from unknown DevAddr: 0x%08lX", (unsigned long)rx_dev_addr);
+            Radio.RxBoosted(0);
+            return;
+        }
+
+        /* Update device runtime status and record P2P peer activity BEFORE duplicate check */
+        lora_device_status_t *st = &s_device_status[matched_idx];
+        st->last_seen_ms = now_ms;
+        st->last_seen_ts = (uint32_t)time(NULL);
+        st->last_rssi = rssi;
+        st->last_snr = snr;
+        st->last_fcnt = fcnt;
+        st->rx_count++;
+        st->is_p2p_relayed = true;
+        st->state = LORA_DEV_ST_ONLINE;
+
+        _record_p2p_peer(rx_dev_addr, rssi, snr, ttl);
 
         /* STEP 1: Process timestamp FIRST before evaluating duplicate cache */
         if (remote_utc > 1700000000 && !s_time_synced_via_ntp) {
@@ -704,9 +689,11 @@ static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) 
                                 (uint32_t)payload[1];
 
         const lora_device_config_t *matched = NULL;
+        int matched_idx = -1;
         for (uint8_t i = 0; i < g_device_count; i++) {
             if (g_devices[i].enabled && g_devices[i].dev_addr == rx_dev_addr) {
                 matched = &g_devices[i];
+                matched_idx = (int)i;
                 break;
             }
         }
@@ -714,6 +701,18 @@ static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) 
         if (matched) {
             ESP_LOGI(TAG, "MATCH FOUND: Device '%s' (Decoder: %s)",
                      matched->device_name, matched->decoder);
+
+            /* Update device runtime status */
+            uint16_t fcnt_hint = (size >= 8) ? (payload[6] | (payload[7] << 8)) : 0;
+            lora_device_status_t *st = &s_device_status[matched_idx];
+            st->last_seen_ms = now_ms;
+            st->last_seen_ts = (uint32_t)time(NULL);
+            st->last_rssi = rssi;
+            st->last_snr = snr;
+            st->last_fcnt = fcnt_hint;
+            st->rx_count++;
+            st->is_p2p_relayed = false;
+            st->state = LORA_DEV_ST_ONLINE;
         } else {
             ESP_LOGW(TAG, "Ignored frame from unknown DevAddr: 0x%08lX", (unsigned long)rx_dev_addr);
         }
@@ -885,7 +884,6 @@ void lora_model_on_rp2040_cfg_received(const uint8_t *buf, size_t len) {
     if (len < 2) return;
 
     uint8_t valid_cfg = buf[1];
-
     if (!valid_cfg) {
         ESP_LOGW(TAG, "RP2040 reported NO valid LoRa config available on MicroSD.");
         g_radio_active = false;
@@ -902,19 +900,12 @@ void lora_model_on_rp2040_cfg_received(const uint8_t *buf, size_t len) {
     memcpy(&g_rf_cfg, &buf[idx], sizeof(lora_global_config_t));
     idx += sizeof(lora_global_config_t);
 
-    g_device_count = buf[idx++];
-    if (g_device_count > MAX_LORA_DEVICES) g_device_count = MAX_LORA_DEVICES;
+    uint8_t expected_devices = buf[idx];
 
+    /* Reset device array and alarm evaluator in preparation for incoming streamed chunks */
+    g_device_count = 0;
     memset(g_devices, 0, sizeof(g_devices));
-    for (uint8_t i = 0; i < g_device_count; i++) {
-        if (idx + sizeof(lora_device_config_t) > len) break;
-        memcpy(&g_devices[i], &buf[idx], sizeof(lora_device_config_t));
-        idx += sizeof(lora_device_config_t);
-        
-        ESP_LOGI(TAG, "Loaded Device [%u]: Name='%s', DevAddr=0x%08lX (Reaction: %s)",
-                 i, g_devices[i].device_name, (unsigned long)g_devices[i].dev_addr,
-                 g_devices[i].reaction.valid ? "ACTIVE" : "NONE");
-    }
+    alarm_evaluator_clear_rules();
 
     lora_model_apply_rf_config();
 
@@ -927,12 +918,91 @@ void lora_model_on_rp2040_cfg_received(const uint8_t *buf, size_t len) {
 
     /* Start SNTP if Wi-Fi is connected */
     sntp_service_start(g_rf_cfg.time_cfg.ntp_server);
+
+    ESP_LOGI(TAG, "Globals loaded. Expecting %u streamed devices from RP2040...", expected_devices);
+}
+
+void lora_model_on_rp2040_device_received(const uint8_t *buf, size_t len) {
+    if (len < 3 + sizeof(lora_device_config_t)) {
+        ESP_LOGE(TAG, "Device chunk truncated: got %u bytes", (unsigned)len);
+        return;
+    }
+
+    uint8_t dev_idx = buf[1];
+    uint8_t total_devs = buf[2];
+
+    if (dev_idx >= MAX_LORA_DEVICES) {
+        ESP_LOGW(TAG, "Device index %u exceeds max limit (%d)", dev_idx, MAX_LORA_DEVICES);
+        return;
+    }
+
+    /* Copy device configuration */
+    memcpy(&g_devices[dev_idx], &buf[3], sizeof(lora_device_config_t));
+    if (dev_idx + 1 > g_device_count) {
+        g_device_count = dev_idx + 1;
+    }
+
+    const lora_device_config_t *dev = &g_devices[dev_idx];
+
+    /* Initialize runtime status for watchdog tracking */
+    lora_device_status_t *st = &s_device_status[dev_idx];
+    memset(st, 0, sizeof(lora_device_status_t));
+    st->dev_addr = dev->dev_addr;
+    strlcpy(st->name, dev->device_name, sizeof(st->name));
+    
+    /* Nominal interval from device JSON "report_interval_sec" (RP2040 defaults it to 300 s) */
+    st->interval_sec = (dev->report_interval_sec > 0) ? dev->report_interval_sec : 300;
+    st->timeout_sec = (uint32_t)(st->interval_sec * 2.025f);
+    st->state = LORA_DEV_ST_WAITING;
+    st->last_seen_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+
+    ESP_LOGI(TAG, "Loaded Streamed Device [%u/%u]: Name='%s', DevAddr=0x%08lX (Watchdog Timeout: %lu s)",
+             dev_idx + 1, total_devs, dev->device_name, (unsigned long)dev->dev_addr, (unsigned long)st->timeout_sec);
+
+    /* Register dynamic thresholds for autonomous alarm evaluator */
+    for (uint8_t t = 0; t < dev->threshold_count; t++) {
+        const lora_threshold_config_t *th = &dev->thresholds[t];
+        if (!th->valid) continue;
+
+        /* If threshold is percentage-based, calculate physical value for live background evaluation */
+        float eval_val = th->threshold_val;
+        float eval_hyst = th->hysteresis_val;
+        if (th->is_percent) {
+            float ref_min = 0.0f;
+            float ref_max = (dev->geometry.max_depth_cm > 0.0f) ? dev->geometry.max_depth_cm : 100.0f;
+            for (uint8_t l = 0; l < dev->limit_count; l++) {
+                if (dev->limits[l].valid && strcmp(dev->limits[l].key, th->key) == 0) {
+                    ref_min = dev->limits[l].val_min;
+                    ref_max = dev->limits[l].val_max;
+                    break;
+                }
+            }
+            float span = ref_max - ref_min;
+            eval_val = ref_min + (th->threshold_val / 100.0f) * span;
+            eval_hyst = (th->hysteresis_val / 100.0f) * span;
+        }
+
+        alarm_eval_rule_t rule = {
+            .dev_addr = dev->dev_addr,
+            .severity = (alarm_severity_t)th->severity,
+            .op = (threshold_op_t)th->op,
+            .threshold_val = eval_val,
+            .hysteresis_val = eval_hyst,
+            .damping = th->damping,
+            .buzzer_mode = th->buzzer_mode
+        };
+        strlcpy(rule.source_name, dev->device_name, sizeof(rule.source_name));
+        strlcpy(rule.rule_id, th->rule_id, sizeof(rule.rule_id));
+        strlcpy(rule.key, th->key, sizeof(rule.key));
+
+        alarm_evaluator_register_rule(&rule);
+    }
 }
 
 void lora_model_update(void) {
-    if (g_radio_active) {
-        uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 
+    if (g_radio_active) {
         /* Direct SX1262 Hardware IRQ Register Inspection (Raw RF Diagnostic) */
         uint16_t irq = SX126xGetIrqStatus();
         if (irq != 0) {
@@ -1031,7 +1101,6 @@ void lora_model_update(void) {
         if (now_ms - last_rssi_check >= 3000) {
             last_rssi_check = now_ms;
             s_last_noise_floor = Radio.Rssi(MODEM_LORA);
-            //ESP_LOGI(TAG, "SX1262 Heartbeat: Active Listening... (Noise Floor RSSI: %d dBm)", s_last_noise_floor);
 
             struct view_data_lora_diag diag_evt = {
                 .rssi = 0,
@@ -1043,4 +1112,90 @@ void lora_model_update(void) {
             esp_event_post_to(view_event_handle, VIEW_EVENT_BASE, VIEW_EVENT_LORA_DIAG_DATA, &diag_evt, sizeof(diag_evt), portMAX_DELAY);
         }
     }
+
+    /* Device Watchdog & Header Status Aggregator (Runs every 5 seconds) */
+    static uint32_t last_watchdog_check = 0;
+    if (now_ms - last_watchdog_check >= 5000) {
+        last_watchdog_check = now_ms;
+
+        if (g_device_count == 0 || !g_radio_active) {
+            gui_header_update_lora(LORA_STATUS_UNINIT);
+        } else {
+            bool has_timeout = false;
+            bool has_waiting = false;
+
+            for (uint8_t i = 0; i < g_device_count; i++) {
+                lora_device_status_t *st = &s_device_status[i];
+                uint32_t elapsed_sec = (now_ms - st->last_seen_ms) / 1000;
+
+                if (st->last_seen_ts == 0) {
+                    /* Never received a packet since boot */
+                    if (elapsed_sec > st->timeout_sec) {
+                        st->state = LORA_DEV_ST_TIMEOUT;
+                        has_timeout = true;
+                    } else {
+                        st->state = LORA_DEV_ST_WAITING;
+                        has_waiting = true;
+                    }
+                } else {
+                    /* Active tracking */
+                    if (elapsed_sec > st->timeout_sec) {
+                        st->state = LORA_DEV_ST_TIMEOUT;
+                        has_timeout = true;
+                    } else {
+                        st->state = LORA_DEV_ST_ONLINE;
+                    }
+                }
+            }
+
+            /* Priority evaluation for header icon: Red (Timeout) > Orange (Waiting) > Green (Active) */
+            if (has_timeout) {
+                gui_header_update_lora(LORA_STATUS_TIMEOUT);
+            } else if (has_waiting) {
+                gui_header_update_lora(LORA_STATUS_WAITING);
+            } else {
+                gui_header_update_lora(LORA_STATUS_ACTIVE);
+            }
+        }
+    }
+}
+
+size_t lora_model_get_device_status_count(void) {
+    return g_device_count;
+}
+
+const lora_device_status_t* lora_model_get_device_status(size_t index) {
+    if (index >= g_device_count) return NULL;
+    return &s_device_status[index];
+}
+
+size_t lora_model_get_peer_count(void) {
+    return s_peer_count;
+}
+
+const lora_p2p_peer_t* lora_model_get_peer(size_t index) {
+    if (index >= s_peer_count) return NULL;
+    return &s_peer_table[index];
+}
+
+void lora_model_set_device_interval(uint32_t dev_addr, uint32_t interval_sec) {
+    for (uint8_t i = 0; i < g_device_count; i++) {
+        if (s_device_status[i].dev_addr == dev_addr) {
+            s_device_status[i].interval_sec = (interval_sec > 0) ? interval_sec : 300;
+            s_device_status[i].timeout_sec = (uint32_t)(s_device_status[i].interval_sec * 2.025f);
+            ESP_LOGI(TAG, "Updated Watchdog interval for 0x%08lX: %lu s (Timeout: %lu s)",
+                     (unsigned long)dev_addr, (unsigned long)s_device_status[i].interval_sec,
+                     (unsigned long)s_device_status[i].timeout_sec);
+            break;
+        }
+    }
+}
+
+lora_device_config_t* lora_model_get_device_by_addr(uint32_t dev_addr) {
+    for (size_t i = 0; i < g_device_count; i++) {
+        if (g_devices[i].enabled && g_devices[i].dev_addr == dev_addr) {
+            return &g_devices[i];
+        }
+    }
+    return NULL;
 }

@@ -349,8 +349,8 @@ void chart_query_scheduler_update(void) {
 
             uint32_t interval = sub->interval_sec;
             
-            /* Jitter-safe trigger: >= 18s into interval (15s RP2040 tolerance + 3s buffer) */
-            if ((now_sec % interval) >= 18) {
+            /* Jitter-safe trigger: >= 22s into interval (15s RP2040 tolerance + 7s flush buffer) */
+            if ((now_sec % interval) >= 22) {
                 uint32_t target_bucket = (uint32_t)(now_sec - (now_sec % interval));
 
                 /* Avoid duplicate enqueues if already requested for this bucket */
@@ -399,4 +399,29 @@ void chart_query_scheduler_update(void) {
     }
 
     xSemaphoreGive(s_sched_mutex);
+}
+
+bool chart_query_scheduler_trigger_poll(uint32_t dev_addr, const char *key, uint8_t zone_idx) {
+    if (!key || !s_sched_mutex) return false;
+
+    xSemaphoreTake(s_sched_mutex, portMAX_DELAY);
+
+    for (size_t i = 0; i < CHART_SCHEDULER_MAX_SUBSCRIPTIONS; i++) {
+        if (s_subs[i].sub_id >= 0 &&
+            s_subs[i].dev_addr == dev_addr &&
+            s_subs[i].zone_idx == zone_idx &&
+            strcmp(s_subs[i].key, key) == 0) {
+            
+            _trigger_immediate_subscription_query((int8_t)i);
+            xSemaphoreGive(s_sched_mutex);
+            ESP_LOGI(TAG, "Manual poll enqueued: dev=0x%08lX, key='%s', zone=%u",
+                     (unsigned long)dev_addr, key, zone_idx);
+            return true;
+        }
+    }
+
+    xSemaphoreGive(s_sched_mutex);
+    ESP_LOGW(TAG, "Manual poll failed: No subscription for dev=0x%08lX, key='%s', zone=%u",
+             (unsigned long)dev_addr, key, zone_idx);
+    return false;
 }

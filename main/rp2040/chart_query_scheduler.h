@@ -19,7 +19,7 @@ extern "C" {
 
 #define CHART_SCHEDULER_MAX_SUBSCRIPTIONS  64
 #define CHART_SCHEDULER_QUEUE_SIZE        16
-#define CHART_QUERY_TIMEOUT_MS            600
+#define CHART_QUERY_TIMEOUT_MS            2500
 #define CHART_SUB_MAX_POINTS              32
 
 /**
@@ -120,6 +120,16 @@ void chart_query_scheduler_on_response(uint8_t req_id, uint8_t status, uint32_t 
  * @brief Periodic worker called every second (handles wall-clock grid triggers, FIFO dispatch, and timeouts).
  */
 void chart_query_scheduler_update(void);
+
+/**
+ * @brief Manually triggers an immediate query for a specific registered subscription.
+ *
+ * @param dev_addr Device address.
+ * @param key Telemetry key (e.g. "depth").
+ * @param zone_idx Target zone index (0=daily, 1=hourly, 2=sub-hourly).
+ * @return True if a matching subscription was found and enqueued.
+ */
+bool chart_query_scheduler_trigger_poll(uint32_t dev_addr, const char *key, uint8_t zone_idx);
 
 #ifdef __cplusplus
 }

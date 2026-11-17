@@ -4,6 +4,8 @@
 #include "view_data.h"
 #include "gui_header.h"
 #include "gui_footer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #if CONFIG_GUI_CONFIG_EXTERN
 #include "sd_view.h"
@@ -22,6 +24,7 @@ int indicator_view_init(void) {
 	settings_view_init();
 
 #ifdef CISTERN_VIEW_H
+	//vTaskDelay(pdMS_TO_TICKS(1300));
 	cistern_view_init();
 #endif
 
@@ -30,7 +33,7 @@ int indicator_view_init(void) {
 #endif
 
 #ifdef SENSOR_H
-	view_sensor_init();
+	//view_sensor_init();
 #endif
 
 #ifdef WIFI_H
@@ -38,7 +41,7 @@ int indicator_view_init(void) {
 #endif
 
 #ifdef HA_H
-	indicator_ha_view_init();
+	//indicator_ha_view_init();
 #endif
 
 #if CONFIG_LORA_ENABLE

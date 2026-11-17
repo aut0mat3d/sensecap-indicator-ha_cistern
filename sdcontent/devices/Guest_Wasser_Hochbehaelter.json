@@ -4,6 +4,7 @@
   "enabled": true,
   "dev_addr": "05975dc9",
   "decoder": "EM500-SWL",
+  "report_interval_sec": 300,
   "offsets": {
     "depth": {"value": 50, "unit": "mm" }
   },
@@ -13,7 +14,8 @@
       "type": "rectangle",
       "width": { "value": 200, "unit": "cm" },
       "length": { "value": 200, "unit": "cm" },
-      "max_depth": { "value": 140, "unit": "cm" }
+      "max_depth": { "value": 120, "unit": "cm" },
+      "cap_max": 1
     },
     "level_gain": {
       "source_key": "depth",
@@ -34,20 +36,74 @@
       "key": "depth",
       "severity": "danger",
       "value_percent": 15.0,
+      "direction": "falling",
       "damping": 0,
       "hysteresis_percent": 3.0,
       "buzzer_mode": "intermittent"
+    },
+    {
+      "id": "warn_high",
+      "key": "depth",
+      "severity": "warning",
+      "value_percent": 110.0,
+      "direction": "rising",
+      "damping": 0,
+      "hysteresis_percent": 3.0,
+      "buzzer_mode": "off"
     },
     {
       "id": "alarm_frate",
       "key": "flowrate",
       "severity": "danger",
       "value_threshold": -2.0,
+      "direction": "falling",
       "damping": 2,
       "hysteresis": 0.4,
       "buzzer_mode": "intermittent"
+    },
+    {
+      "id": "warn_battery",
+      "key": "battery_soc",
+      "severity": "warning",
+      "value_threshold": 15.0,
+      "direction": "falling",
+      "damping": 0,
+      "hysteresis": 1.0,
+      "buzzer_mode": "off"
+    },
+    {
+      "id": "alarm_battery",
+      "key": "battery_soc",
+      "severity": "warning",
+      "value_threshold": 5.0,
+      "direction": "falling",
+      "damping": 0,
+      "hysteresis": 1.0,
+      "buzzer_mode": "intermittent"
     }
   ],
+  "limits": {
+    "depth": {
+      "val_min": 0,
+      "val_max": 120,
+      "cap_min": 1,
+      "cap_max": 2
+    }
+  },
+  "archive": {
+    "depth": {
+      "tolerance_sec": 15,
+      "max_estimated_count": 3,
+      "quality": { "solid_pct": 66, "min_pct": 10, "use_estimated": false },
+      "retention": { "single": 144, "hours": 48, "days": 32, "weeks": 0, "months": 0, "years": 0 }
+    },
+    "battery_soc": {
+      "expected_interval_sec": 86400,
+      "tolerance_sec": 15,
+      "max_estimated_count": 0,
+      "retention": { "single": 0, "hours": 24, "days": 31, "weeks": 0, "months": 36, "years": 10 }
+    }
+  },
   "display_config": {
     "unit_system": "metric",
     "volume_unit": "m3"

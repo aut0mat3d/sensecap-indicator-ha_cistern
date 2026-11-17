@@ -10,6 +10,8 @@
 #include "nav.h"
 #include "sdkconfig.h"
 #include "view_data.h"
+#include "alarm_view.h"
+#include "gui/i18n/gui_i18n.h"
 
 #if CONFIG_LORA_ENABLE
 #include "lora_diag_view.h"
@@ -150,7 +152,7 @@ static void settings_refresh_ip_label(void) {
         snprintf(buf, sizeof(buf), "IP: " IPSTR, IP2STR(&ip_info.ip));
         lv_label_set_text(s_settings_ip_label, buf);
     } else {
-        lv_label_set_text(s_settings_ip_label, "IP: not connected");
+        lv_label_set_text(s_settings_ip_label, gui_i18n_get("settings.ip_none"));
     }
 }
 
@@ -168,11 +170,15 @@ static void settings_open_wifi(lv_event_t *e) { if (lv_event_get_code(e) == LV_E
 static void settings_open_display(lv_event_t *e) { if (lv_event_get_code(e) == LV_EVENT_CLICKED) settings_post_screen(SCREEN_DISPLAY_MODAL); }
 static void settings_open_broker(lv_event_t *e) { if (lv_event_get_code(e) == LV_EVENT_CLICKED) settings_post_screen(SCREEN_BROKER_MODAL); }
 static void settings_open_lora_diag(lv_event_t *e) { if (lv_event_get_code(e) == LV_EVENT_CLICKED) lora_diag_view_show(); }
+static void settings_open_alarms(lv_event_t *e) { if (lv_event_get_code(e) == LV_EVENT_CLICKED) alarm_view_show(); }
 static void settings_on_back(lv_event_t *e) { if (lv_event_get_code(e) == LV_EVENT_CLICKED) settings_hide_modal(); }
 
 void settings_view_show(void) {
     if (!s_settings_modal) return;
-    settings_refresh_ip_label();
+    
+    /* Dynamically reload texts just in case the language changed */
+    if (s_settings_ip_label) settings_refresh_ip_label();
+    
     if (s_settings_tileview) {
         lv_tileview_set_tile_by_index(s_settings_tileview, 0, 0, LV_ANIM_OFF);
     }
@@ -208,7 +214,8 @@ static void settings_create_card(lv_obj_t *parent, int32_t x, int32_t y, lv_colo
 
     lv_obj_t *title = lv_label_create(card);
     lv_label_set_text(title, label);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, LV_PART_MAIN | LV_STATE_DEFAULT);
+    /* Enforce C99 clean font linkage with fallback for umlauts */
+    lv_obj_set_style_text_font(title, &ui_font_font0, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_color(title, lv_color_white(), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_align(title, LV_ALIGN_CENTER);
     lv_obj_set_y(title, 35);
@@ -258,27 +265,32 @@ static void settings_create_modal(void) {
     lv_obj_set_style_radius(s_settings_tile2, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(s_settings_tile2, 0, LV_PART_MAIN);
 
-    settings_create_card(s_settings_tile1, 80, 150, lv_color_hex(0x4EACE4), "WiFi", LV_SYMBOL_WIFI, settings_open_wifi);
-    settings_create_card(s_settings_tile1, 250, 150, lv_color_hex(0xEEBF41), "Display", LV_SYMBOL_IMAGE, settings_open_display);
+    /* ── Tile 1 (Base View) ── */
+    settings_create_card(s_settings_tile1, 80, 150, lv_color_hex(0xEEBF41), gui_i18n_get("settings.display"), LV_SYMBOL_IMAGE, settings_open_display);
+    settings_create_card(s_settings_tile1, 250, 150, lv_color_hex(0xE74C3C), gui_i18n_get("settings.alarms"), LV_SYMBOL_WARNING, settings_open_alarms);
 
 #if CONFIG_GUI_CONFIG_EXTERN
-    settings_create_card(s_settings_tile1, 80, 310, lv_color_hex(0x27AE60), "SD Card", LV_SYMBOL_SAVE, settings_format_sd_cb);
-    settings_create_card(s_settings_tile1, 250, 310, lv_color_hex(0xE66D39), "Broker", LV_SYMBOL_SETTINGS, settings_open_broker);
+    settings_create_card(s_settings_tile1, 80, 310, lv_color_hex(0x27AE60), gui_i18n_get("settings.sdcard"), LV_SYMBOL_SAVE, settings_format_sd_cb);
+    settings_create_card(s_settings_tile1, 250, 310, lv_color_hex(0x4EACE4), gui_i18n_get("settings.wifi"), LV_SYMBOL_WIFI, settings_open_wifi);
 #else
     lv_obj_t *broker = lv_button_create(s_settings_tile1);
     lv_obj_set_size(broker, 300, 60);
     lv_obj_set_pos(broker, 90, 330);
-    settings_style_card(broker, lv_color_hex(0xE66D39));
-    lv_obj_add_event_cb(broker, settings_open_broker, LV_EVENT_CLICKED, NULL);
+    settings_style_card(broker, lv_color_hex(0x4EACE4)); /* Blued out fallback */
+    lv_obj_add_event_cb(broker, settings_open_wifi, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *broker_label = lv_label_create(broker);
-    lv_label_set_text(broker_label, "Change MQTT Broker Address");
+    lv_label_set_text(broker_label, gui_i18n_get("settings.wifi"));
+    lv_obj_set_style_text_font(broker_label, &ui_font_font0, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_color(broker_label, lv_color_white(), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_center(broker_label);
 #endif
 
-    settings_create_card(s_settings_tile2, 80, 150, lv_color_hex(0x8E44AD), "LoRa Diag", LV_SYMBOL_SETTINGS, settings_open_lora_diag);
+    /* ── Tile 2 (Secondary Navigation) ── */
+    settings_create_card(s_settings_tile2, 80, 150, lv_color_hex(0xE66D39), gui_i18n_get("settings.broker"), LV_SYMBOL_SETTINGS, settings_open_broker);
+    settings_create_card(s_settings_tile2, 250, 150, lv_color_hex(0x8E44AD), gui_i18n_get("settings.lora_diag"), LV_SYMBOL_LIST, settings_open_lora_diag);
 
+    /* ── Header Construction ── */
     lv_obj_t *header = lv_obj_create(s_settings_modal);
     lv_obj_set_size(header, CONFIG_LCD_EVB_SCREEN_WIDTH, 85);
     lv_obj_set_align(header, LV_ALIGN_TOP_MID);
@@ -288,7 +300,7 @@ static void settings_create_modal(void) {
     lv_obj_set_style_pad_all(header, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     lv_obj_t *back = lv_button_create(header);
-    lv_obj_set_size(back, 100, 50);
+    lv_obj_set_size(back, 110, 45);
     lv_obj_set_pos(back, 10, 17);
     lv_obj_set_style_bg_opa(back, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(back, lv_color_hex(0x2a3036), LV_PART_MAIN | LV_STATE_PRESSED);
@@ -300,19 +312,22 @@ static void settings_create_modal(void) {
     lv_obj_add_event_cb(back, settings_on_back, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *back_label = lv_label_create(back);
-    lv_label_set_text(back_label, LV_SYMBOL_LEFT " Back");
+    char buf_back[32];
+    snprintf(buf_back, sizeof(buf_back), "%s %s", LV_SYMBOL_LEFT, gui_i18n_get("common.back"));
+    lv_label_set_text(back_label, buf_back);
+    lv_obj_set_style_text_font(back_label, &ui_font_font0, LV_PART_MAIN | LV_STATE_DEFAULT); /* Enforce umlaute */
     lv_obj_set_style_text_color(back_label, lv_color_hex(0xe7ecef), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_center(back_label);
 
     lv_obj_t *title = lv_label_create(header);
-    lv_label_set_text(title, "Settings");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_label_set_text(title, gui_i18n_get("common.settings"));
+    lv_obj_set_style_text_font(title, &ui_font_font0, LV_PART_MAIN | LV_STATE_DEFAULT); /* Replaced raw montserrat_24 */
     lv_obj_set_style_text_color(title, lv_color_white(), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_align(title, LV_ALIGN_BOTTOM_MID);
 
     s_settings_ip_label = lv_label_create(s_settings_modal);
-    lv_label_set_text(s_settings_ip_label, "IP: not connected");
-    lv_obj_set_style_text_font(s_settings_ip_label, &lv_font_montserrat_20, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_label_set_text(s_settings_ip_label, gui_i18n_get("settings.ip_none"));
+    lv_obj_set_style_text_font(s_settings_ip_label, &ui_font_font0, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_color(s_settings_ip_label, lv_color_hex(0xe7ecef), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_align(s_settings_ip_label, LV_ALIGN_TOP_MID);
     lv_obj_set_y(s_settings_ip_label, 105);
@@ -320,10 +335,6 @@ static void settings_create_modal(void) {
 
 int settings_view_init(void) {
     lv_port_sem_take();
-
-    /* NOTE: Legacy per-tile header generation removed. 
-     * The unified persistent header is now handled via gui_header_init() */
-
     settings_create_modal();
     lv_port_sem_give();
 

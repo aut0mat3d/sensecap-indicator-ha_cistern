@@ -6,12 +6,14 @@
  */
 
 #include "units.h"
+#include "debug_log.hpp"
 #include "sdcard.hpp"
 #include <ArduinoJson.h>
 #include <SdFat.h>
 #include <string.h>
 #include <stdlib.h>
 #include <strings.h>
+#include <math.h>
 
 // ============================================================================
 // Built-in units database (complete fallback including flow_rate & speed)
@@ -99,7 +101,7 @@ static DynamicJsonDocument* _get_units_doc(void) {
         s_units_doc = new DynamicJsonDocument(16384);
         DeserializationError error = deserializeJson(*s_units_doc, s_builtin_units_json);
         if (error) {
-            Serial.println("[UNITS] Error parsing builtin units database");
+            LogSerial.println("[UNITS] Error parsing builtin units database");
             delete s_units_doc;
             s_units_doc = nullptr;
             return nullptr;
@@ -176,10 +178,10 @@ bool units_init(const char* units_json_path) {
                 file.close();
                 if (!err) {
                     s_units_initialized = true;
-                    Serial.printf("[UNITS] Loaded %s from MicroSD.\r\n", units_json_path);
+                    LogSerial.printf("[UNITS] Loaded %s from MicroSD.\r\n", units_json_path);
                     return true;
                 }
-                Serial.printf("[UNITS] JSON Error in %s (%s). Using fallback.\r\n", units_json_path, err.c_str());
+                LogSerial.printf("[UNITS] JSON Error in %s (%s). Using fallback.\r\n", units_json_path, err.c_str());
                 delete s_units_doc;
                 s_units_doc = nullptr;
             }
@@ -252,7 +254,8 @@ float units_convert(float value, const char* from_unit, const char* to_unit) {
     float to_factor   = to_entry["factor"] | 1.0f;
     if (to_factor == 0.0f) return value;
 
-    return value * (from_factor / to_factor);
+    float result = value * (from_factor / to_factor);
+    return roundf(result * 1000000.0f) / 1000000.0f;
 }
 
 bool units_exists(const char* unit) {

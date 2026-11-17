@@ -50,27 +50,21 @@
       "datatype": "uint8",
       "target_type": "float",
       "context": "diagnostic",
-      "corr_factor": 1.0,
-      "store_longterm": true,
-      "store_roundtrip": true,
-      "roundtrip_interval_sec": 3600,
-      "tolerance_sec": 15
+      "corr_factor": 1.0
     },
     {
       "fport": 0,
       "channel": "0x03",
       "type": "0x77",
       "key": "depth",
+      "val_min": -1,
+      "val_max": 500,
       "unit": "cm",
       "target_unit": "cm",
       "datatype": "uint16_le",
       "target_type": "float",
       "context": "measurement",
-      "corr_factor": 1.0,
-      "store_longterm": true,
-      "store_roundtrip": true,
-      "roundtrip_interval_sec": 300,
-      "tolerance_sec": 15
+      "corr_factor": 1.0
     },
     {
       "fport": 0,

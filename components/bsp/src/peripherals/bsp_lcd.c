@@ -196,13 +196,13 @@ esp_err_t bsp_lcd_init(void)
                 .vsync_pulse_width = brd->VSYNC_PULSE_WIDTH,
                 .flags.pclk_active_neg = brd->PCLK_ACTIVE_NEG,
             },
-            .bounce_buffer_size_px = brd->LCD_WIDTH * 10,
+            .bounce_buffer_size_px = brd->LCD_WIDTH * 30,
             .flags.fb_in_psram = 1,
 #if CONFIG_LCD_AVOID_TEAR
             .flags.double_fb = 1,
 #endif
         };
-        esp_lcd_new_rgb_panel(&panel_config, &panel_handle);
+        ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&panel_config, &panel_handle));
     }
 #endif
     if (LCD_IFACE_RGB != brd->LCD_IFACE) {

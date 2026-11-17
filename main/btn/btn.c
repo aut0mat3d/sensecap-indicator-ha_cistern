@@ -3,6 +3,8 @@
 #include "bsp_btn.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "alarm_model.h"
+#include "alarm_view.h"
 #include <nvs.h>
 #include <nvs_flash.h>
 
@@ -42,6 +44,24 @@ static void _btn_click_callback(void *arg) {
         esp_restart();
         return;
     }
+
+    /* 1. Prioritize active unhandled alarms */
+    if (alarm_has_active_unacknowledged()) {
+        ESP_LOGI(TAG, "click, executing configured alarm hardware button behavior");
+        alarm_view_handle_hw_button();
+
+        /* Ensure display backlight is turned on if user pressed button while screen was off */
+        if (!indicator_display_st_get()) {
+            ESP_LOGI(TAG, "turning on display backlight for alarm inspection");
+            st = 1;
+            esp_event_post_to(view_event_handle, VIEW_EVENT_BASE, VIEW_EVENT_SCREEN_CTRL, &st,
+                              sizeof(st), portMAX_DELAY);
+            indicator_display_on();
+        }
+        return;
+    }
+
+    /* 2. Normal display backlight toggle (no active alarms pending) */
     if (indicator_display_st_get()) {
         ESP_LOGI(TAG, "click, off");
         indicator_display_off();

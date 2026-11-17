@@ -4,7 +4,7 @@
  */
 
 #include "sdcard.hpp"
-#include "littlefs_buffer.hpp"
+#include "debug_log.hpp"
 #include "littlefs_driver.hpp"
 #include <ArduinoJson.h>
 
@@ -216,11 +216,14 @@ static bool msc_start_stop_cb(uint8_t power_condition, bool start, bool load_eje
     if (load_eject && !start) {
         g_usb_msc_active = false;
         usb_msc.setUnitReady(false);
-        Serial.println("TinyUSB MSC Mode: Ejected by PC host!\r\n");
+        LogSerial.println("TinyUSB MSC Mode: Ejected by PC host!\r\n");
 
         /* Re-initialize SdFat to read freshly flushed sectors from PC */
         SdSpiConfig spi_config(SD_PIN_CS, DEDICATED_SPI, SD_SCK_MHZ(24), (SpiPort_t*)&SPI1);
         g_sd_initialized = sd.begin(spi_config);
+
+        /* Trigger configuration reload in main loop */
+        g_config_reload_pending = true;
 
         /* Push updated state immediately to ESP32 */
         g_sd_card_event_triggered = true;
@@ -329,24 +332,25 @@ void sd_card_msc_toggle(bool enable) {
         usb_msc.setCapacity(sd.card()->sectorCount(), 512);
         usb_msc.setUnitReady(true); /* Signal medium insertion to PC */
         g_usb_msc_active = true;
-        Serial.println("TinyUSB MSC Mode: ENABLED\r\n");
+        LogSerial.println("TinyUSB MSC Mode: ENABLED\r\n");
     } else {
         usb_msc.setUnitReady(false); /* Signal medium removal to PC */
         g_usb_msc_active = false;
-        Serial.println("TinyUSB MSC Mode: DISABLED\r\n");
+        LogSerial.println("TinyUSB MSC Mode: DISABLED\r\n");
 
         /* Re-initialize SdFat to re-read VBR/FAT modified by PC! */
         SdSpiConfig spi_config(SD_PIN_CS, DEDICATED_SPI, SD_SCK_MHZ(24), (SpiPort_t*)&SPI1);
         g_sd_initialized = sd.begin(spi_config);
+
+        /* Trigger configuration reload in main loop */
+        g_config_reload_pending = true;
     }
 
     /* Push updated MSC state immediately to ESP32 */
     g_sd_card_event_triggered = true;
 
-    /* Flush pending sensor records buffered in RAM while PC held exclusive SD lock */
-    if (!enable && littlefs_driver_is_mounted()) {
-        littlefs_buffer_flush_all();
-    }
+    /* Archive records queued in RAM while the PC held the exclusive SD lock are written
+     * in small portions by data_storage_process_buckets() (keeps the UART link responsive) */
 }
 
 void sd_card_get_info(uint8_t &is_present, uint8_t &is_usb_mounted, int8_t &state, uint32_t &capacity_mb, char* volume_label) {
@@ -456,7 +460,7 @@ void sd_card_get_info(uint8_t &is_present, uint8_t &is_usb_mounted, int8_t &stat
         if (auto_repair_file.open("/.volume_label", O_WRITE | O_CREAT | O_TRUNC)) {
             auto_repair_file.write(g_expected_label, strlen(g_expected_label));
             auto_repair_file.close();
-            Serial.println("SD Health Check: Self-healed missing /.volume_label file.\r\n");
+            LogSerial.println("SD Health Check: Self-healed missing /.volume_label file.\r\n");
         }
     }
 
@@ -535,7 +539,7 @@ void sd_card_update(PacketSerial &packetSerial) {
                 memcpy(&res_buf[8], volume_label, 11);
 
                 packetSerial.send(res_buf, 19);
-                Serial.printf("SD Card Event Pushed! State: %d, Label: %s\r\n", state, volume_label);
+                LogSerial.printf("SD Card Event Pushed! State: %d, Label: %s\r\n", state, volume_label);
 
                 /* Signal main loop to reload LoRa config files from SD */
                 g_config_reload_pending = true;
@@ -548,25 +552,25 @@ void sd_card_update(PacketSerial &packetSerial) {
 
     /* HARDWARE GUARD: Abort format immediately if card was physically pulled */
     if (digitalRead(SD_PIN_DET) != LOW) {
-        Serial.println("SD Format Error: Card physically removed during operation!\r\n");
+        LogSerial.println("SD Format Error: Card physically removed during operation!\r\n");
         g_fmt_state = FMT_ERROR;
     }
 
     /* GLOBAL TIMEOUT GUARD (12 Seconds Total Limit) */
     if (millis() - g_fmt_total_start_ms > FMT_TOTAL_TIMEOUT_MS) {
-        Serial.println("SD Format Error: Global timeout reached!\r\n");
+        LogSerial.println("SD Format Error: Global timeout reached!\r\n");
         g_fmt_state = FMT_ERROR;
     }
 
     /* PER-STEP TIMEOUT GUARD (3 Seconds max per step) */
     if (millis() - g_fmt_step_start_ms > FMT_BUSY_TIMEOUT_MS && g_fmt_state != FMT_WAIT_NAND_BUSY) {
-        Serial.printf("SD Format Error: Step %d timed out!\r\n", g_fmt_state);
+        LogSerial.printf("SD Format Error: Step %d timed out!\r\n", g_fmt_state);
         g_fmt_state = FMT_ERROR;
     }
 
     switch (g_fmt_state) {
         case FMT_START:
-         Serial.printf("SD Format: Starting machine for type=%d, label=%s\r\n", g_fmt_type, g_fmt_target_label);
+         LogSerial.printf("SD Format: Starting machine for type=%d, label=%s\r\n", g_fmt_type, g_fmt_target_label);
 
          if (!g_sd_initialized) {
              sd_card_init();
@@ -580,7 +584,7 @@ void sd_card_update(PacketSerial &packetSerial) {
          g_fmt_step_start_ms = millis();
          if (g_fmt_type == 0) {
              /* Format LittleFS Partition 2 directly */
-             Serial.println("[SD_FORMAT] Formatting LittleFS partition 2...");
+             LogSerial.println("[SD_FORMAT] Formatting LittleFS partition 2...");
              bool ok = littlefs_driver_format();
              g_fmt_state = ok ? FMT_SUCCESS : FMT_ERROR;
          } else {
@@ -589,28 +593,28 @@ void sd_card_update(PacketSerial &packetSerial) {
          break;
 
         case FMT_WRITE_INITIAL_MBR:
-            Serial.println("SD Format Step 1: Writing initial MBR at Sector 0...\r\n");
+            LogSerial.println("SD Format Step 1: Writing initial MBR at Sector 0...\r\n");
             g_fmt_step_start_ms = millis();
             if (write_custom_mbr(131072, 4325376)) {
                 g_fmt_state = FMT_RUN_FAT_FORMATTER;
             } else {
-                Serial.println("SD Format Error: MBR write failed!\r\n");
+                LogSerial.println("SD Format Error: MBR write failed!\r\n");
                 g_fmt_state = FMT_ERROR;
             }
             break;
 
         case FMT_RUN_FAT_FORMATTER: {
-            Serial.println("SD Format Step 2: Formatting Partition 1 (2.06GB FAT32)...\r\n");
+            LogSerial.println("SD Format Step 2: Formatting Partition 1 (2.06GB FAT32)...\r\n");
             PartitionBlockDevice part1(sd.card(), 131072, 4325376);
             FatFormatter fatFormatter;
             uint8_t sec_buf[512];
             g_fmt_step_start_ms = millis();
-            if (fatFormatter.format(&part1, sec_buf, &Serial)) {
-                Serial.println("SD Format Step 2 OK: FatFormatter finished.\r\n");
+            if (fatFormatter.format(&part1, sec_buf, &LogSerial)) {
+                LogSerial.println("SD Format Step 2 OK: FatFormatter finished.\r\n");
                 g_fmt_step_start_ms = millis();
                 g_fmt_state = FMT_WAIT_NAND_BUSY;
             } else {
-                Serial.println("SD Format Error: FatFormatter failed!\r\n");
+                LogSerial.println("SD Format Error: FatFormatter failed!\r\n");
                 g_fmt_state = FMT_ERROR;
             }
             break;
@@ -628,7 +632,7 @@ void sd_card_update(PacketSerial &packetSerial) {
             break;
 
         case FMT_PATCH_MBR_AND_VBR: {
-            Serial.println("SD Format Step 3: Patching MBR and VBR Volume Label...\r\n");
+            LogSerial.println("SD Format Step 3: Patching MBR and VBR Volume Label...\r\n");
             
             uint8_t sec_buf[512];
             uint32_t rel_start = 0;
@@ -644,22 +648,22 @@ void sd_card_update(PacketSerial &packetSerial) {
             g_fmt_step_start_ms = millis();
             if (write_custom_mbr(p1_actual_start, p1_actual_size)) {
                 if (apply_fat32_volume_label(p1_actual_start, g_fmt_target_label)) {
-                    Serial.println("SD Format Step 3 OK: VBR Label patched.\r\n");
+                    LogSerial.println("SD Format Step 3 OK: VBR Label patched.\r\n");
                     g_fmt_step_start_ms = millis();
                     g_fmt_state = FMT_MOUNT_FAT32;
                 } else {
-                    Serial.println("SD Format Error: Failed to patch VBR volume label!\r\n");
+                    LogSerial.println("SD Format Error: Failed to patch VBR volume label!\r\n");
                     g_fmt_state = FMT_ERROR;
                 }
             } else {
-                Serial.println("SD Format Error: Failed to re-write MBR!\r\n");
+                LogSerial.println("SD Format Error: Failed to re-write MBR!\r\n");
                 g_fmt_state = FMT_ERROR;
             }
             break;
         }
 
         case FMT_MOUNT_FAT32: {
-            Serial.println("SD Format Step 4: Mounting Partition 1 in SdFat...\r\n");
+            LogSerial.println("SD Format Step 4: Mounting Partition 1 in SdFat...\r\n");
             SdSpiConfig spi_config(SD_PIN_CS, DEDICATED_SPI, SD_SCK_MHZ(24), (SpiPort_t*)&SPI1);
             g_fmt_step_start_ms = millis();
             if (sd.begin(spi_config)) {
@@ -667,14 +671,14 @@ void sd_card_update(PacketSerial &packetSerial) {
                 g_fmt_step_start_ms = millis();
                 g_fmt_state = FMT_CREATE_HANDSHAKE_FILE;
             } else {
-                Serial.println("SD Format Error: Partition 1 mount failed!\r\n");
+                LogSerial.println("SD Format Error: Partition 1 mount failed!\r\n");
                 g_fmt_state = FMT_ERROR;
             }
             break;
         }
 
         case FMT_CREATE_HANDSHAKE_FILE: {
-         Serial.println("SD Format Step 5: Creating /.volume_label file...\r\n");
+         LogSerial.println("SD Format Step 5: Creating /.volume_label file...\r\n");
          FatFile label_file;
          g_fmt_step_start_ms = millis();
          if (label_file.open("/.volume_label", O_WRITE | O_CREAT | O_TRUNC)) {
@@ -684,20 +688,20 @@ void sd_card_update(PacketSerial &packetSerial) {
              sd_card_set_expected_label(g_fmt_target_label);
 
              /* Format Partition 2 with LittleFS structure */
-             Serial.println("SD Format Step 5b: Formatting LittleFS Partition 2...\r\n");
+             LogSerial.println("SD Format Step 5b: Formatting LittleFS Partition 2...\r\n");
              littlefs_driver_format();
 
              g_fmt_step_start_ms = millis();
              g_fmt_state = FMT_VERIFY;
          } else {
-             Serial.println("SD Format Error: Failed to create /.volume_label file!\r\n");
+             LogSerial.println("SD Format Error: Failed to create /.volume_label file!\r\n");
              g_fmt_state = FMT_ERROR;
          }
          break;
      }
 
         case FMT_VERIFY: {
-            Serial.println("SD Format Step 6: Verifying format integrity...\r\n");
+            LogSerial.println("SD Format Step 6: Verifying format integrity...\r\n");
             uint8_t present = 0, usb_mounted = 0;
             int8_t verify_state = SD_STATE_UNCHECKED;
             uint32_t capacity_mb = 0;
@@ -707,10 +711,10 @@ void sd_card_update(PacketSerial &packetSerial) {
             sd_card_get_info(present, usb_mounted, verify_state, capacity_mb, volume_label);
 
             if (verify_state == SD_STATE_VALID_FAT32_LFS) {
-                Serial.println("SD Format Verification PASSED: Dual-Partition & Labels fully verified!\r\n");
+                LogSerial.println("SD Format Verification PASSED: Dual-Partition & Labels fully verified!\r\n");
                 g_fmt_state = FMT_SUCCESS;
             } else {
-                Serial.printf("SD Format Verification FAILED: Post-format state was %d!\r\n", verify_state);
+                LogSerial.printf("SD Format Verification FAILED: Post-format state was %d!\r\n", verify_state);
                 g_fmt_state = FMT_ERROR;
             }
             break;
@@ -720,7 +724,7 @@ void sd_card_update(PacketSerial &packetSerial) {
             uint8_t res_buf[2] = { static_cast<uint8_t>(PKT_TYPE_RES_SD_FORMAT), 1 };
             packetSerial.send(res_buf, sizeof(res_buf));
             g_sd_card_event_triggered = true;
-            Serial.println("Non-Blocking Dual-Partition Format completed successfully!\r\n");
+            LogSerial.println("Non-Blocking Dual-Partition Format completed successfully!\r\n");
             g_fmt_state = FMT_IDLE;
             break;
         }
@@ -730,7 +734,7 @@ void sd_card_update(PacketSerial &packetSerial) {
             uint8_t res_buf[2] = { static_cast<uint8_t>(PKT_TYPE_RES_SD_FORMAT), 0 };
             packetSerial.send(res_buf, sizeof(res_buf));
             g_sd_card_event_triggered = true;
-            Serial.println("Non-Blocking Dual-Partition Format failed.\r\n");
+            LogSerial.println("Non-Blocking Dual-Partition Format failed.\r\n");
             g_fmt_state = FMT_IDLE;
             break;
         }

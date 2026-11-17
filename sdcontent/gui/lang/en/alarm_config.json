@@ -18,5 +18,9 @@
     "muted": "Muted",
     "retriggered": "Retriggered",
     "acknowledged": "Acknowledged"
+  },
+  "button": {
+    "hw_button_behavior": "MUTE_TIME",
+    "mute_duration_sec": 7200
   }
 }

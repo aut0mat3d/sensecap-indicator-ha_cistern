@@ -1,173 +1,107 @@
 # AGENTS.md - SenseCAP Indicator Cistern & Sensor System
 
-## 1. Project Overview & Architecture
+Firmware for the dual-MCU **SenseCAP Indicator** (D1 / D1L / D1Pro): a resilient telemetry, display and
+monitoring system for tanks and sensors (LoRaWAN sensors, LoRa P2P mesh, onboard I2C sensors, SD card archive).
 
-Firmware for the **Dual-MCU SenseCAP Indicator** (D1 / D1L / D1Pro) deployed as a resilient telemetry, display, and monitoring system[cite: 1, 15].
+Detailed, code-verified maps (read these before larger changes):
+
+| Document | Content |
+|---|---|
+| [docs_extensions_n_changes/overview/OVERVIEW_ESP32.md](docs_extensions_n_changes/overview/OVERVIEW_ESP32.md) | ESP32 boot sequence, modules, widgets |
+| [docs_extensions_n_changes/overview/OVERVIEW_RP2040.md](docs_extensions_n_changes/overview/OVERVIEW_RP2040.md) | RP2040 core split, files, data path |
+| [docs_extensions_n_changes/overview/OVERVIEW_SDCARD.md](docs_extensions_n_changes/overview/OVERVIEW_SDCARD.md) | SD card layout, decoder vs. device JSON, `archive` schema |
+| [docs_extensions_n_changes/overview/OVERVIEW_DATAFLOW.md](docs_extensions_n_changes/overview/OVERVIEW_DATAFLOW.md) | End-to-end flows, P2P frame types, complete UART packet table |
+
+Keep these documents in sync when changing architecture, protocol or JSON schemas.
+
+---
+
+## 1. Architecture
 
 ```
-                     ┌──────────────────────────────────────────┐
-                     │          MicroSD Card (SPI1)             │
-                     ├────────────────────┬─────────────────────┤
-                     │ Partition 1: FAT32 │ Partition 2: LittleFS│
-                     │  Configs, Decoders,│  Rolling Archives:   │
-                     │  GUI JSONs, Lang   │  roundtrip/hourly/  │
-                     │  (/config, /gui)   │  daily.csv          │
-                     └─────────┬──────────┴──────────┬──────────┘
-                               │                     │
-                               ▼                     ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│ RP2040 Co-Processor (FreeRTOS / Earle Philhower Core)                   │
-├────────────────────────────────────────────────────────────────────────┤
-│ • Core 0: Real-time Grove I2C polling & autonomous Alarm Buzzer Engine │
-│ • Core 1: SPI1 MicroSD Driver (MBR Dual-Partitioning)                  │
-│ • Storage: Write-Through RAM Buffer (64 KB) + LittleFS Aggregation      │
-│ • Telemetry: IPSO-TLV Decoders, Virtual Decoders (volume/flowrate)     │
-│ • Time: POSIX timezone support, local midnight daily aggregation       │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │ UART Link (COBS / PacketSerial @ 921600 Baud)
-                                    ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│ ESP32-S3 Primary Processor (ESP-IDF v5.x)                              │
-├────────────────────────────────────────────────────────────────────────┤
-│ • SX1262 LoRa Radio: LoRaWAN 1.0.x decryption & LoRa P2P Mesh Engine   │
-│ • Time Sync: NTP Client + P2P Time Broadcast (Master/Slave Mesh)       │
-│ • Display: LVGL 9 rendering engine                                     │
-│ • Telemetry Cache: In-memory RAM State Cache                           │
-│ • Alarms: Headless background Alarm Evaluation Task                    │
-│ • GUI Engine: Dynamic JSON-driven multi-page Tileview (-n .. 0 .. +n)   │
-└────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────── MicroSD (SPI, owned by RP2040) ───────────────────────────────┐
+│ Partition 1 FAT32: /config, /decoder, /devices, /gui     │ Partition 2 LittleFS: /data archive │
+└──────────────────────────────────────────────┬───────────────────────────────────────────────┘
+                                               ▼
+┌ RP2040 co-processor (PlatformIO, Arduino / Earle Philhower core) ─────────────────────────────┐
+│ Core 0: I2C sensors (SCD41, SGP40, SHT41/AHT20, light), buzzer/alarm pattern state machine    │
+│ Core 1: UART link, SD state machine (MBR, format, USB-MSC, hot reload), config parsing,       │
+│         IPSO-TLV decoding, virtual decoders (per device), archive engine (data_storage)       │
+└──────────────────────────────────────────────┬───────────────────────────────────────────────┘
+                                               │ UART 921600 Bd, COBS (PacketSerial), XOR checksum
+┌ ESP32-S3 main processor (ESP-IDF 5.x, LVGL 9, FreeRTOS) ──────────────────────────────────────┐
+│ SX1262: LoRaWAN decryption (master) + P2P mesh (retransmit, time broadcast, claim)            │
+│ Time: SNTP / P2P time / last saved time on LittleFS; headless alarm evaluator; LVGL GUI       │
+└───────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
----
-
-## 2. Current Implementation Status (October 2026)
-
-### Verified & Active Features
-* **Storage Engine (RP2040)**:
-  * Non-blocking LittleFS on Partition 2[cite: 2, 21].
-  * Write-Through RAM Buffer (64 KB) prevents SPI timeouts and system freezes during SD card removal[cite: 12, 13, 21].
-  * Immediate unmount upon card ejection (`SD_PIN_DET != LOW`)[cite: 21].
-  * Grid-aligned aggregation: Sub-hourly (configurable, e.g., 300 s), Hourly (3600 s), and Daily (local midnight aligned via POSIX `TZ` with 7-column CSV format including UTC offset)[cite: 19, 21].
-* **LoRa P2P Mesh & Decryption (ESP32)**:
-  * Master Nodes: Decrypt sensor payloads with LoRaWAN session keys (`app_skey`) and retransmit decrypted raw TLVs via P2P Mesh (AES-CTR with shared `mesh.aes_key`)[cite: 25, 28].
-  * Slave / Listener Nodes: Run without sensor keys (`app_skey == 0`). Direct sensor uplinks are ignored (no zero-key garbage decryption, no duplicate cache poisoning, no blind retransmission). Await decrypted P2P retransmit from Master[cite: 27, 28].
-  * Automatic Time-Mesh: Master broadcasts UTC time (standalone type `0x03` or piggybacked on retransmit type `0x02`). Slaves sync system time without Wi-Fi/NTP[cite: 28].
-* **Virtual Decoder Engine (RP2040)**:
-  * Dynamic mathematical calculations: Tank Volume (rectangle, vertical/horizontal cylinder, cone frustum, LUT), Derivative Gain (`cm/h`), and Flowrate (`m³/h`)[cite: 14, 27].
-  * Unit conversion pipeline based on `/config/units.json`[cite: 14, 25].
-* **LVGL 9 Widget System (ESP32)**:
-  * `horiz_bargraph`: Horizontal multi-zone bar chart with dynamic scaling, transparent gaps (`DATA_FLAG_NO_DATA`), 50% opacity for estimated/partial buckets (`DATA_FLAG_ESTIMATED`), and red alarm bars (`DATA_FLAG_ALARM_DANGER`)[cite: 1, 22].
-  * Standard 31-slot layout: Zone 0 (7 days @ 86400 s) + Zone 1 (12x 2h @ 7200 s) + Zone 2 (11x 5m @ 300 s) + Zone 3 (1 live value)[cite: 1, 28].
-  * `vert_graph`: Vertical bar indicator for levels/percentages with threshold markings[cite: 16].
-  * `text_widget`: Dynamic multi-binding text tile with automatic unit conversion[cite: 16].
+* **Master node:** has the sensor session keys, decrypts uplinks, forwards the decrypted frame to the RP2040 (`0x36`) and retransmits it via P2P (type `0x02`, mesh AES-CTR, piggybacked UTC).
+* **Listener node:** no keys (`app_skey` all zero). Ignores direct sensor uplinks and only uses the master's P2P retransmit.
+* **GUI:** `main/display/cistern_view.c` is today's static start page. Target: pages generated from JSON on SD (`/gui/pages/*.json`) using the generic widgets in `main/gui/`. Settings, Wi-Fi, LoRa diagnostics, SD management, alarm list and display settings stay builtin.
 
 ---
 
-## 3. Architecture Roadmap: Dynamic GUI & Telemetry Framework
-
-The legacy hardcoded view (`main/display/cistern_view.c`) is being refactored into a declarative, JSON-driven GUI framework[cite: 16, 31].
-
-### Core Architectural Layers
-
-#### Layer 1: Headless Alarm Engine (24/7 Autonomous)
-* Completely decoupled from UI rendering or active page state[cite: 27].
-* Parses `thresholds` from `/devices/*.json` at boot[cite: 27].
-* Evaluates all incoming telemetry (LoRa, P2P, I2C, MQTT) against thresholds, damping counters, and hysteresis[cite: 14, 27].
-* Directly triggers buzzer patterns via UART packet `0xA6` (`CMD_ALARM_SET`) to the RP2040[cite: 11].
-* Sets `DATA_FLAG_ALARM_DANGER` in the RAM State Cache[cite: 22].
-
-#### Layer 2: Global RAM State Cache & Event Broker
-* Flat in-memory table storing the latest state for up to 64 telemetry keys:
-  * `key`, `value`, `unit`, `timestamp`, `flags`, `is_valid`.
-* When a page opens, all live widgets populate immediately from this cache (< 1 ms, zero load delay)[cite: 1].
-* An event broker routes incoming live values exclusively to widgets on the **currently visible page**[cite: 1].
-
-#### Layer 3: Multi-Page Tileview (-n .. 0 .. +n)
-* Implemented using LVGL 9 `lv_tileview` for horizontal swipe navigation.
-* Lifecycle events:
-  * `PAGE_ON_LEAVE`: Unsubscribes widgets from the Event Broker (0% CPU load for hidden pages).
-  * `PAGE_ON_ENTER`:
-    1. Subscribes active widgets to the Event Broker.
-    2. Populates widgets instantly from the RAM State Cache[cite: 1].
-    3. Triggers historical chart archive queries[cite: 1].
-
-#### Layer 4: Smart Bucket Scheduler (Grid-Synchronized Querying)
-* Solves UART bus saturation for high-frequency telemetry (e.g., MQTT updates every 10 s):
-  * **Live updates**: Real-time values update text tiles, vertical bars, and Zone 3 (live bar) on every packet[cite: 1, 16].
-  * **Archive queries**: Chart widgets query LittleFS archives **only when crossing bucket boundaries**:
-    $$\text{bucket}_{\text{current}} = \text{timestamp} - (\text{timestamp} \pmod{\text{interval\_sec}})$$
-    Archive requests are dispatched only if $\text{bucket}_{\text{current}} > \text{bucket}_{\text{last\_queried}}$[cite: 21].
-
-#### Layer 5: Declarative JSON Page Builder
-* Pages are defined in `/gui/pages/<page_name>.json`[cite: 2].
-* Contains layout, widget types, coordinates, bindings, and zone configurations[cite: 1].
-* Instantiated dynamically via `widget_factory_create()`[cite: 1].
-
----
-
-## 4. Directory Structure & File Rules
+## 2. Directory Structure
 
 ```
-├── main/                       # ESP32-S3 Firmware (ESP-IDF)
-│   ├── display/                # Legacy views & screen handlers
-│   ├── gui/                    # Reusable LVGL 9 widgets (horiz_bargraph, vert_graph, text_widget)
-│   ├── lora/                   # SX1262 driver, LoRaWAN decryption, P2P Mesh engine
-│   ├── rp2040/                 # UART host interface to RP2040
-│   └── wifi/                   # Wi-Fi & SNTP service
-├── rp2040/                     # RP2040 Co-Processor Firmware (PlatformIO)
-│   ├── include/                # Umbrella headers & interface contracts
-│   └── src/                    # Data storage, LittleFS driver, sensor drivers, virtual decoders
-├── sdcontent/                  # MicroSD Card Partition 1 Reference Content (TRACKED IN GIT)
-│   ├── config/                 # System globals, LoRa mesh, units configuration
-│   ├── decoder/                # IPSO-TLV JSON decoders (e.g. EM500-SWL.json)
-│   ├── devices/                # Device configurations & tank geometry JSONs
-│   └── gui/                    # i18n dictionaries & media standards
-├── docs_extensions_n_changes/  # Architectural specs & hardware documentation
-├── SDbackup/                   # PRIVATE BACKUP FOLDER (STRICTLY GIT-IGNORED - DO NOT TOUCH)
-└── tmp/                        # TEMPORARY EXPERIMENTAL CODE (STRICTLY GIT-IGNORED - DO NOT TOUCH)
+├── main/                  ESP32-S3 firmware (ESP-IDF component, all module folders globbed in CMakeLists.txt)
+│   ├── alarm/             alarm evaluator (thresholds), alarm model + list view
+│   ├── display/           cistern_view (static start page), backlight / sleep
+│   ├── gui/               reusable LVGL 9 widgets, header/footer, i18n (builtin EN + DE)
+│   ├── lora/              SX1262 model, LoRaWAN crypto, P2P mesh, LoRa diagnostics page
+│   ├── rp2040/            UART link + chart_query_scheduler
+│   └── ...                btn, cmd, ha, mqtt, nav, sdcard, sensor, settings, storage, util, wifi
+├── rp2040/                RP2040 firmware (PlatformIO): code in rp2040/src and rp2040/include
+├── sdcontent/             reference content of SD partition 1 (tracked in git, dummy keys only)
+├── docs_extensions_n_changes/   architecture docs (overview/ is current; old/ is archived)
+├── SDbackup/              PRIVATE backup of a test unit SD card - never read into commits, never modify
+└── tmp/                   private experiments - never modify, never commit
 ```
 
----
-
-## 5. Agent Behavioral & Development Rules (MANDATORY)
-
-### Code Style & Formatting
-* **Preserve existing comments**: Never delete or rewrite existing comments unless directly modifying that logic.
-* **New comments in English**: Write all new comments, function headers, and log messages in English.
-* **No stubs or placeholders**: Do not leave empty functions, placeholder TODOs, or mock returns.
-* **Complete context**: Deliver full updated functions or clear, unambiguous diffs. Never provide code blocks stripped of their surrounding scope.
-* **Naming conventions**:
-  * C: `snake_case` for functions/variables, `SCREAMING_SNAKE_CASE` for macros/enums.
-  * C++: `camelCase` for methods/members, `PascalCase` for classes/types.
-
-### MicroSD & Storage Protection
-* **NEVER stage or commit `SDbackup/` or `tmp/`**.
-* **NEVER store real LoRaWAN AppSKey/NwkSKey in `sdcontent/`**. Use dummy keys (e.g., `4A6F696E...`) for reference files[cite: 25, 27].
-* **SD Card Removal Safety**: Always verify that write routines check `littlefs_driver_is_mounted()` and fallback to `littlefs_buffer_append()` without triggering SPI hardware timeouts[cite: 13, 21].
-
-### LoRa & Mesh Rules
-* **No blind retransmits**: Nodes without valid keys must never retransmit unparsed frames[cite: 28].
-* **No zero-key decryption**: Never call `lorawan_cipher_payload` with an all-zero key[cite: 28].
-* **Time-first processing**: When receiving P2P retransmit frames (type `0x02`), extract and apply the piggybacked UTC timestamp **before** checking the duplicate cache[cite: 28].
+`main/ARCHITECTURE_PRE-FORK.md` describes the upstream Seeed firmware before the fork; treat it as historical.
 
 ---
 
-## 6. UART Protocol Reference (ESP32 <-> RP2040 @ 921600 Baud)
+## 3. Rules (mandatory)
 
-| Packet Type | ID | Direction | Payload Structure / Description |
-| :--- | :--- | :--- | :--- |
-| `CMD_SD_GET_INFO` | `0x30` | ESP32 $\rightarrow$ RP2040 | Request SD card status, capacity, and label[cite: 11] |
-| `RES_SD_INFO` | `0x31` | RP2040 $\rightarrow$ ESP32 | `present(1B)`, `msc(1B)`, `state(1B)`, `mb(4B)`, `label(11B)`[cite: 11] |
-| `CMD_PUSH_LORA_CFG` | `0x35` | RP2040 $\rightarrow$ ESP32 | Global RF config + array of active devices from SD[cite: 11, 28] |
-| `CMD_LORA_RAW_FRAME` | `0x36` | ESP32 $\rightarrow$ RP2040 | `DevAddr(4B)`, `RSSI(2B)`, `SNR(1B)`, `Len(1B)`, `Payload(NB)`[cite: 11] |
-| `CMD_SET_TIME_CFG` | `0x37` | ESP32 $\rightarrow$ RP2040 | `posix_tz[64]`, `time_format[8]` (Applies `TZ` and writes SD)[cite: 11, 15] |
-| `CMD_SYNC_TIME` | `0x3A` | ESP32 $\rightarrow$ RP2040 | `utc_ts(4B)`, `flags(1B)` (Syncs RP2040 RTC and saves LittleFS)[cite: 11, 15] |
-| `CMD_GET_CHART_DATA` | `0x3B` | ESP32 $\rightarrow$ RP2040 | Zone archive query: `req_id`, `dev_addr`, `key`, `start`, `end`, `step`, `pts`[cite: 11, 15] |
-| `RES_CHART_DATA` | `0x3C` | RP2040 $\rightarrow$ ESP32 | `req_id(1B)`, `status(1B)`, `step(4B)`, `count(2B)`, `chart_data_point_t[]`[cite: 11, 15] |
-| `CMD_GET_TIME` | `0x3D` | ESP32 $\rightarrow$ RP2040 | Request last saved timestamp from LittleFS[cite: 11, 15] |
-| `RES_TIME` | `0x3E` | RP2040 $\rightarrow$ ESP32 | `last_utc_ts(4B)` (Used for offline clock recovery)[cite: 11, 15] |
-| `CMD_ALARM_SET` | `0xA6` | ESP32 $\rightarrow$ RP2040 | `tON_ms(2B)`, `tOFF_ms(2B)` (Hardware buzzer control)[cite: 11, 15] |
-| `CMD_ALARM_MUTE` | `0xA7` | ESP32 $\rightarrow$ RP2040 | `mute_sec(4B)`[cite: 11, 15] |
-| `CMD_ALARM_REARM` | `0xA8` | ESP32 $\rightarrow$ RP2040 | Rearm muted buzzer[cite: 11, 15] |
-| `LORA_TELEMETRY` | `0xBB` | RP2040 $\rightarrow$ ESP32 | Dynamic decoded telemetry: `DevAddr`, `FCnt`, `Key`, `Unit`, `Value`[cite: 11, 14] |
-| `LOCAL_TELEMETRY` | `0xBC` | RP2040 $\rightarrow$ ESP32 | Onboard Grove sensor readings (SCD41, SHT41, SGP40, Light)[cite: 11, 14] |
+### Language & style
+* Code identifiers, comments and log messages: **English**.
+* Existing comments in other languages (German, Chinese) are translated when touched; their content is kept. Never delete existing comments unless the logic they describe changes.
+* Builtin GUI languages are English and German: every new user-visible string needs entries in `main/gui/i18n/gui_i18n_builtin_en.c` **and** `_de.c`. Further languages come from `/gui/lang/<lang>/*.json` on SD.
+* C: `snake_case` functions/variables, `SCREAMING_SNAKE_CASE` macros/enums. C++: `camelCase` methods, `PascalCase` types.
+* No stubs, placeholder TODOs or mock returns. Deliver complete functions.
+
+### SD card JSON roles
+* `decoder/*.json` = **hardware abstraction** of a sensor model, shared by every device using that hardware. Only payload decoding belongs here (mappings, datatypes, fport/encryption, commands, reactions).
+* `devices/*.json` = **one measuring installation**: address, keys, decoder reference, offsets, `virtual_decoder`, `thresholds`, `limits`, `display_config`, `archive`. Everything application-specific goes here, never into a decoder.
+* Everything derived from a device (virtual decoder values, archive channels, alarms, telemetry) is always bound to its `dev_addr`. Identical keys of different devices must never mix.
+
+### Storage & time safety
+* Never store real LoRaWAN keys in `sdcontent/`; use dummy keys.
+* Archive writes go through `data_storage` → `archive_store` (segmented binary files). When LittleFS is unavailable records are queued in RAM and written later in small portions; never block on SPI when the card is removed, never block the UART loop with long flushes.
+* RP2040 console output goes through `LogSerial` (non-blocking); never use `Serial.print*` directly (a terminal that stops reading would stall both cores).
+* There is no hardware RTC. Archive writes and time-dependent logic require a synchronized or recovered time (`data_storage_is_time_valid()` on the RP2040, `alarm_time_is_valid()` on the ESP32). Never work with the epoch start time after a reboot.
+* RP2040 RAM is limited (~150 KB of 264 KB statically used). Parse SD JSON with ArduinoJson **filters** and small documents; avoid large heap allocations and new big static tables.
+
+### LoRa & mesh
+* No blind retransmits: nodes without valid keys never retransmit unparsed frames.
+* Never call `lorawan_cipher_payload` with an all-zero key.
+* P2P retransmit (type `0x02`): apply the piggybacked UTC **before** the duplicate check.
+
+### Git
+* Never stage or commit `SDbackup/` or `tmp/`.
+* Commit only when asked.
+
+---
+
+## 4. Build
+
+* ESP32: ESP-IDF 5.x from the repository root (`idf.py build`).
+* RP2040: `cd rp2040 && pio run` (PlatformIO env `indicator_rp2040`).
+
+---
+
+## 5. UART protocol
+
+The complete, code-verified packet table lives in [OVERVIEW_DATAFLOW.md](docs_extensions_n_changes/overview/OVERVIEW_DATAFLOW.md) §6.
+Packet IDs are defined twice and must stay identical: `main/rp2040/rp2040.h` and `rp2040/include/indicator_rp2040.hpp`.

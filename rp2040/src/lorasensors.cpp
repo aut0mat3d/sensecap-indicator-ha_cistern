@@ -12,16 +12,24 @@
 #include <time.h>
 #include "units.h"
 
-// 1. Generic device offset table in RAM (preserves lora_device_config_t binary layout)
-#define MAX_DEVICE_OFFSETS 4
+// Generic device offset table in RAM (preserves lora_device_config_t binary layout)
 typedef struct {
     char  key[24];
     float value;
     char  unit[16];
     bool  valid;
 } device_offset_t;
-
 static device_offset_t g_device_offsets[MAX_LORA_DEVICES][MAX_DEVICE_OFFSETS];
+
+typedef struct {
+    char    key[24];
+    float   val_min;
+    float   val_max;
+    uint8_t cap_min; /* 0 = Drop, 1 = Clamp, 2 = Pass-Through */
+    uint8_t cap_max; /* 0 = Drop, 1 = Clamp, 2 = Pass-Through */
+    bool    valid;
+} device_limit_t;
+static device_limit_t g_device_limits[MAX_LORA_DEVICES][MAX_DEVICE_LIMITS];
 
 static lora_global_config_t g_global_cfg = {
     .rf_frequency_hz = 868300000,
@@ -38,6 +46,10 @@ static size_t               g_device_count = 0;
 
 static lora_decoder_t       g_decoders[MAX_LORA_DECODERS];
 static size_t               g_decoder_count = 0;
+
+static inline double round_6dp(double val) {
+    return round(val * 1000000.0) / 1000000.0;
+}
 
 static uint8_t parse_hex_u8(const char* str) {
     if (!str) return 0;
@@ -215,7 +227,7 @@ static int8_t lorasensors_get_or_load_decoder(SdFat32 &sd, const char* decoder_n
     }
 
     if (g_decoder_count >= MAX_LORA_DECODERS) {
-        Serial.println("RP2040 Error: Maximum RAM decoder limit reached!");
+        LogSerial.println("RP2040 Error: Maximum RAM decoder limit reached!");
         return -1;
     }
 
@@ -250,7 +262,7 @@ static int8_t lorasensors_get_or_load_decoder(SdFat32 &sd, const char* decoder_n
     }
 
     if (!file) {
-        Serial.printf("RP2040 Error: Cannot decode! Decoder file '/decoder/%s.json' missing on SD card!\r\n",
+        LogSerial.printf("RP2040 Error: Cannot decode! Decoder file '/decoder/%s.json' missing on SD card!\r\n",
                       decoder_name);
         return -1;
     }
@@ -261,7 +273,7 @@ static int8_t lorasensors_get_or_load_decoder(SdFat32 &sd, const char* decoder_n
     file.close();
 
     if (err) {
-        Serial.printf("RP2040 Error: Failed to parse '/decoder/%s.json' (%s)\r\n",
+        LogSerial.printf("RP2040 Error: Failed to parse '/decoder/%s.json' (%s)\r\n",
                       decoder_name, err.c_str());
         return -1;
     }
@@ -310,6 +322,17 @@ static int8_t lorasensors_get_or_load_decoder(SdFat32 &sd, const char* decoder_n
 
             strncpy(r.datatype, rule["datatype"] | "uint8", sizeof(r.datatype) - 1);
             strncpy(r.context, rule["context"] | "measurement", sizeof(r.context) - 1);
+            
+            if (rule.containsKey("val_min") && rule.containsKey("val_max")) {
+                r.val_min = rule["val_min"].as<float>();
+                r.val_max = rule["val_max"].as<float>();
+                r.has_bounds = true;
+            } else {
+                r.val_min = 0.0f;
+                r.val_max = 0.0f;
+                r.has_bounds = false;
+            }
+            
             if (rule.containsKey("scale")) {
                 r.scale = rule["scale"] | 1.0f;
             } else if (rule.containsKey("corr_factor")) {
@@ -474,30 +497,97 @@ void lora_telemetry_send_dynamic(PacketSerial& ps, uint32_t dev_addr, uint32_t f
     ps.send(tx_buf, idx);
 }
 
-void lorasensors_push_config_to_esp32(PacketSerial &ps, bool valid_cfg) {
-    static uint8_t tx_buf[2048];
-    size_t idx = 0;
-
-    tx_buf[idx++] = 0x35;
-    tx_buf[idx++] = valid_cfg ? 1 : 0;
-
-    if (valid_cfg) {
-        memcpy(&tx_buf[idx], &g_global_cfg, sizeof(lora_global_config_t));
-        idx += sizeof(lora_global_config_t);
-
-        tx_buf[idx++] = static_cast<uint8_t>(g_device_count);
-
-        for (size_t i = 0; i < g_device_count; i++) {
-            if (idx + sizeof(lora_device_config_t) > sizeof(tx_buf)) break;
-            memcpy(&tx_buf[idx], &g_devices[i], sizeof(lora_device_config_t));
-            idx += sizeof(lora_device_config_t);
-        }
-        Serial.printf("RP2040: Pushed valid config & %u devices to ESP32-S3\r\n", (unsigned)g_device_count);
-    } else {
-        Serial.printf("RP2040: Pushed NO_CONFIG status to ESP32-S3\r\n");
+void lorasensors_push_globals(PacketSerial &ps, bool valid_cfg) {
+    if (!valid_cfg) {
+        uint8_t no_cfg_buf[2] = { PKT_TYPE_PUSH_LORA_CFG, 0 };
+        ps.send(no_cfg_buf, sizeof(no_cfg_buf));
+        LogSerial.printf("RP2040: Pushed NO_CONFIG status to ESP32-S3\r\n");
+        return;
     }
 
-    ps.send(tx_buf, idx);
+    /* Packet 0x35: Globals + Expected Device Count (~163 bytes) */
+    uint8_t glob_buf[2 + sizeof(lora_global_config_t) + 1];
+    glob_buf[0] = PKT_TYPE_PUSH_LORA_CFG;
+    glob_buf[1] = 1;
+    memcpy(&glob_buf[2], &g_global_cfg, sizeof(lora_global_config_t));
+    glob_buf[2 + sizeof(lora_global_config_t)] = static_cast<uint8_t>(g_device_count);
+    ps.send(glob_buf, sizeof(glob_buf));
+
+    LogSerial.printf("RP2040: Pushed Globals (0x35) with %u devices announced\r\n", (unsigned)g_device_count);
+}
+
+bool lorasensors_stream_single_device(PacketSerial &ps, size_t dev_idx) {
+    if (dev_idx >= g_device_count) {
+        return false; /* All devices sent */
+    }
+
+    /* Packet 0x3F: Stream single device chunk (~772 bytes) */
+    uint8_t dev_buf[3 + sizeof(lora_device_config_t)];
+    dev_buf[0] = PKT_TYPE_PUSH_LORA_DEV;
+    dev_buf[1] = static_cast<uint8_t>(dev_idx);
+    dev_buf[2] = static_cast<uint8_t>(g_device_count);
+    memcpy(&dev_buf[3], &g_devices[dev_idx], sizeof(lora_device_config_t));
+    ps.send(dev_buf, sizeof(dev_buf));
+
+    LogSerial.printf("RP2040: Streamed Device [%u/%u]: '%s' (0x%08lX)\r\n",
+                  (unsigned)(dev_idx + 1), (unsigned)g_device_count,
+                  g_devices[dev_idx].device_name, (unsigned long)g_devices[dev_idx].dev_addr);
+
+    return (dev_idx + 1 < g_device_count);
+}
+
+/**
+ * @brief Resolves the engineering unit for a threshold key from virtual decoders or loaded decoder rules.
+ * 
+ * @param doc Device JSON document (used to inspect virtual_decoder definitions)
+ * @param dec_idx Index of cached RAM decoder for this device (-1 if none)
+ * @param key Telemetry key (e.g. "depth", "flowrate", "battery_soc")
+ * @param is_percent True if threshold was defined with value_percent
+ * @param out_unit Destination buffer for unit string
+ * @param max_len Maximum length of out_unit buffer
+ */
+static void _resolve_threshold_unit(const JsonDocument &doc, int8_t dec_idx, const char *key, 
+                                     bool is_percent, char *out_unit, size_t max_len) {
+    if (!key || !out_unit || max_len == 0) return;
+
+    /* 1. Percentage-based thresholds always use "%" */
+    if (is_percent) {
+        strncpy(out_unit, "%", max_len - 1);
+        out_unit[max_len - 1] = '\0';
+        return;
+    }
+
+    /* 2. Check virtual decoders defined in the same device JSON */
+    if (doc.containsKey("virtual_decoder")) {
+        JsonObjectConst v_dec = doc["virtual_decoder"];
+        if (v_dec.containsKey(key)) {
+            JsonObjectConst target_vd = v_dec[key];
+            const char *vd_unit = target_vd["unit"] | "";
+            if (vd_unit && vd_unit[0] != '\0') {
+                strncpy(out_unit, vd_unit, max_len - 1);
+                out_unit[max_len - 1] = '\0';
+                return;
+            }
+        }
+    }
+
+    /* 3. Check loaded hardware decoder rules (mappings) */
+    if (dec_idx >= 0 && dec_idx < static_cast<int8_t>(g_decoder_count)) {
+        const lora_decoder_t &dec = g_decoders[dec_idx];
+        for (uint8_t r = 0; r < dec.rule_count; r++) {
+            if (strcmp(dec.rules[r].key, key) == 0) {
+                const char *u = (strlen(dec.rules[r].target_unit) > 0) 
+                                ? dec.rules[r].target_unit 
+                                : dec.rules[r].unit;
+                strncpy(out_unit, u, max_len - 1);
+                out_unit[max_len - 1] = '\0';
+                return;
+            }
+        }
+    }
+
+    /* 4. Fallback if no matching unit found */
+    out_unit[0] = '\0';
 }
 
 bool lorasensors_load_all(SdFat32 &sd) {
@@ -505,6 +595,7 @@ bool lorasensors_load_all(SdFat32 &sd) {
     g_decoder_count = 0;
     memset(g_device_decoder_map, -1, sizeof(g_device_decoder_map));
     memset(g_device_offsets, 0, sizeof(g_device_offsets));
+    memset(g_device_limits, 0, sizeof(g_device_limits));
 
     // Initialize units database from SD with builtin fallback
     units_init("/config/units.json");
@@ -543,15 +634,15 @@ bool lorasensors_load_all(SdFat32 &sd) {
                 g_global_cfg.time_cfg.p2p_sync_enabled = tcfg["p2p_time_sync_enabled"] | true;
             }
 
-            Serial.printf("RP2040: Loaded /config/globals.json (Lang: %s, TZ: %s, NTP: %s)\r\n",
+            LogSerial.printf("RP2040: Loaded /config/globals.json (Lang: %s, TZ: %s, NTP: %s)\r\n",
                           g_global_cfg.time_cfg.language,
                           g_global_cfg.time_cfg.posix_timezone,
                           g_global_cfg.time_cfg.ntp_server);
         } else {
-            Serial.printf("RP2040 Error: Failed to parse /config/globals.json (%s)\r\n", err.c_str());
+            LogSerial.printf("RP2040 Error: Failed to parse /config/globals.json (%s)\r\n", err.c_str());
         }
     } else {
-        Serial.println("RP2040 Warning: /config/globals.json not found, using system defaults.");
+        LogSerial.println("RP2040 Warning: /config/globals.json not found, using system defaults.");
     }
 
     /* 1b. Parse /config/lora_globals.json (LoRa RF & Mesh Settings) */
@@ -588,23 +679,23 @@ bool lorasensors_load_all(SdFat32 &sd) {
                 g_global_cfg.mesh.broadcast_ttl = mesh["broadcast_ttl"] | 2;
             }
 
-            Serial.printf("RP2040: Loaded /config/lora_globals.json (Freq: %lu Hz, SF: %u, Sync: 0x%02X, Mesh: %s, NetID: 0x%04X)\r\n",
+            LogSerial.printf("RP2040: Loaded /config/lora_globals.json (Freq: %lu Hz, SF: %u, Sync: 0x%02X, Mesh: %s, NetID: 0x%04X)\r\n",
                           g_global_cfg.rf_frequency_hz,
                           g_global_cfg.rf_spreading_factor,
                           g_global_cfg.sync_word,
                           g_global_cfg.mesh.enabled ? "ACTIVE" : "DISABLED",
                           g_global_cfg.mesh.network_id);
         } else {
-            Serial.printf("RP2040 Error: Failed to parse /config/lora_globals.json (%s)\r\n", err.c_str());
+            LogSerial.printf("RP2040 Error: Failed to parse /config/lora_globals.json (%s)\r\n", err.c_str());
         }
     } else {
-        Serial.println("RP2040 Info: /config/lora_globals.json not present (LoRa RF mesh disabled or defaults active).");
+        LogSerial.println("RP2040 Info: /config/lora_globals.json not present (LoRa RF mesh disabled or defaults active).");
     }
 
     /* 2. Scan /devices/ directory for *.json files */
     File32 dev_dir = sd.open("/devices/");
     if (!dev_dir || !dev_dir.isDir()) {
-        Serial.println("RP2040 Warning: Directory /devices/ missing!");
+        LogSerial.println("RP2040 Warning: Directory /devices/ missing!");
         return sys_glob_ok;
     }
 
@@ -638,7 +729,7 @@ bool lorasensors_load_all(SdFat32 &sd) {
                     bool is_new_device = false;
                     if (target_idx < 0) {
                         if (g_device_count >= MAX_LORA_DEVICES) {
-                            Serial.println("RP2040 Warning: Maximum device limit reached during merging!");
+                            LogSerial.println("RP2040 Warning: Maximum device limit reached during merging!");
                             entry.close();
                             break;
                         }
@@ -659,6 +750,17 @@ bool lorasensors_load_all(SdFat32 &sd) {
                     }
                     if (doc.containsKey("medium")) {
                         strncpy(dev.medium, doc["medium"] | "water", sizeof(dev.medium) - 1);
+                    }
+                    /* Configured transmit interval of the sensor. Basis for packet-loss detection
+                     * (ESP32 watchdog) and the expected update interval of archived keys. */
+                    {
+                        uint32_t report_interval = doc["report_interval_sec"] | 300;
+                        if (report_interval < 60 || report_interval > 86400) {
+                            LogSerial.printf("RP2040 Warning: report_interval_sec=%lu out of range (60..86400), using 300\r\n",
+                                             (unsigned long)report_interval);
+                            report_interval = 300;
+                        }
+                        dev.report_interval_sec = report_interval;
                     }
                     if (doc.containsKey("dev_sn")) {
                         strncpy(dev.dev_sn, doc["dev_sn"] | "", sizeof(dev.dev_sn) - 1);
@@ -753,11 +855,12 @@ bool lorasensors_load_all(SdFat32 &sd) {
                     }
 
                     bool has_keys = (dev.app_skey[0] || dev.app_skey[1] || dev.app_skey[15]);
-                    Serial.printf("RP2040: Loaded Device [%d]: '%s' (DevAddr: 0x%08X, Decoder: '%s' -> RAM Index: %d, HasKeys: %s)\r\n",
+                    LogSerial.printf("RP2040: Loaded Device [%d]: '%s' (DevAddr: 0x%08X, Decoder: '%s' -> RAM Index: %d, HasKeys: %s)\r\n",
                                   target_idx, dev.device_name, dev.dev_addr, dev.decoder,
                                   g_device_decoder_map[target_idx], has_keys ? "YES" : "NO");
-
+                    
                     /* Load offsets from device JSON */
+                    dev.offset_count = 0;
                     JsonObject offsets = doc["offsets"];
                     if (offsets) {
                         size_t off_idx = 0;
@@ -775,10 +878,120 @@ bool lorasensors_load_all(SdFat32 &sd) {
                                 strncpy(g_device_offsets[target_idx][off_idx].unit, u, sizeof(g_device_offsets[target_idx][off_idx].unit) - 1);
                                 g_device_offsets[target_idx][off_idx].valid = true;
 
+                                /* Mirror into packed device struct for ESP32 UART streaming (0x3F) */
+                                lora_offset_config_t &dev_off = dev.offsets[dev.offset_count++];
+                                memset(&dev_off, 0, sizeof(lora_offset_config_t));
+                                strncpy(dev_off.key, off_key, sizeof(dev_off.key) - 1);
+                                dev_off.value = val;
+                                strncpy(dev_off.unit, u, sizeof(dev_off.unit) - 1);
+                                dev_off.valid = true;
+
                                 if (strcmp(off_key, "depth") == 0) {
                                     dev.raw_offset_mm = static_cast<int32_t>(units_convert(val, u, "mm"));
                                 }
                                 off_idx++;
+                            }
+                        }
+                    }
+
+                    /* Load thresholds from device JSON */
+                    dev.threshold_count = 0;
+                    JsonArray thresholds = doc["thresholds"];
+                    if (thresholds) {
+                        for (JsonObject t_item : thresholds) {
+                            if (dev.threshold_count >= MAX_THRESHOLDS_PER_DEVICE) break;
+                            lora_threshold_config_t &th = dev.thresholds[dev.threshold_count++];
+                            memset(&th, 0, sizeof(lora_threshold_config_t));
+
+                            strncpy(th.rule_id, t_item["id"] | "", sizeof(th.rule_id) - 1);
+                            strncpy(th.key, t_item["key"] | "", sizeof(th.key) - 1);
+
+                            /* Parse severity enum */
+                            const char* sev = t_item["severity"] | "danger";
+                            if (strcasecmp(sev, "warning") == 0) th.severity = 1;
+                            else if (strcasecmp(sev, "info") == 0) th.severity = 2;
+                            else th.severity = 0; /* ALARM_SEVERITY_DANGER */
+
+                            /* Parse buzzer mode enum */
+                            const char* bm = t_item["buzzer_mode"] | "intermittent";
+                            if (strcasecmp(bm, "continuous") == 0) th.buzzer_mode = 1;
+                            else if (strcasecmp(bm, "off") == 0) th.buzzer_mode = 2;
+                            else th.buzzer_mode = 0; /* ALARM_BUZZER_INTERMITTENT */
+
+                            th.damping = t_item["damping"] | 0;
+
+                            /* Retain exact value and hysteresis format as defined in JSON (no premature scaling!) */
+                            if (t_item.containsKey("value_percent")) {
+                                th.is_percent = true;
+                                th.threshold_val = t_item["value_percent"] | 0.0f;
+                                th.hysteresis_val = t_item["hysteresis_percent"] | 2.0f;
+                            } else {
+                                th.is_percent = false;
+                                th.threshold_val = t_item.containsKey("value_threshold") 
+                                                   ? (t_item["value_threshold"] | 0.0f) 
+                                                   : (t_item["value"] | 0.0f);
+                                th.hysteresis_val = fabsf(t_item.containsKey("hysteresis") 
+                                                          ? (t_item["hysteresis"] | 0.5f) 
+                                                          : (t_item["hysteresis_percent"] | 0.5f));
+                            }
+
+                            /* Dynamically resolve engineering unit from virtual decoder or decoder mappings */
+                            _resolve_threshold_unit(doc, dec_idx, th.key, th.is_percent, th.unit, sizeof(th.unit));
+
+                            /* Parse threshold direction explicitly ("falling" / "rising") */
+                            if (t_item.containsKey("direction")) {
+                                const char* dir = t_item["direction"] | "falling";
+                                if (strcasecmp(dir, "falling") == 0) {
+                                    th.op = 0; /* THRESHOLD_OP_LESS_THAN (<) */
+                                } else {
+                                    th.op = 1; /* THRESHOLD_OP_GREATER_THAN (>) */
+                                }
+                            } else {
+                                /* Legacy fallback heuristic if no direction is specified */
+                                if (strstr(th.rule_id, "low") || strstr(th.rule_id, "min") || th.threshold_val < 0.0f) {
+                                    th.op = 0; /* THRESHOLD_OP_LESS_THAN */
+                                } else {
+                                    th.op = 1; /* THRESHOLD_OP_GREATER_THAN */
+                                }
+                            }
+
+                            th.valid = true;
+
+                            DBG_LORA_PRINTF("Loaded Threshold: Dev=0x%08X '%s' Key='%s' Val=%.2f %s (is_pct=%d) Op=%s Damp=%u Buzz=%u",
+                                           dev.dev_addr, th.rule_id, th.key, th.threshold_val, th.unit,
+                                           th.is_percent ? 1 : 0, th.op == 0 ? "<" : ">", th.damping, th.buzzer_mode);
+                        }
+                    }
+
+                    /* Load limits from device JSON */
+                    dev.limit_count = 0;
+                    JsonObject limits = doc["limits"];
+                    if (limits) {
+                        size_t lim_idx = 0;
+                        for (JsonPair lim_pair : limits) {
+                            if (lim_idx >= MAX_DEVICE_LIMITS) break;
+                            const char* lim_key = lim_pair.key().c_str();
+                            JsonObject lim_cfg = lim_pair.value().as<JsonObject>();
+                            if (lim_cfg) {
+                                device_limit_t &l = g_device_limits[target_idx][lim_idx];
+                                strncpy(l.key, lim_key, sizeof(l.key) - 1);
+                                l.val_min = lim_cfg["val_min"] | 0.0f;
+                                l.val_max = lim_cfg["val_max"] | 0.0f;
+                                l.cap_min = lim_cfg["cap_min"] | 0;
+                                l.cap_max = lim_cfg["cap_max"] | 0;
+                                l.valid = true;
+
+                                /* Mirror into packed device struct for ESP32 UART streaming (0x3F) */
+                                lora_limit_config_t &dev_lim = dev.limits[dev.limit_count++];
+                                memset(&dev_lim, 0, sizeof(lora_limit_config_t));
+                                strncpy(dev_lim.key, lim_key, sizeof(dev_lim.key) - 1);
+                                dev_lim.val_min = l.val_min;
+                                dev_lim.val_max = l.val_max;
+                                dev_lim.cap_min = l.cap_min;
+                                dev_lim.cap_max = l.cap_max;
+                                dev_lim.valid = true;
+
+                                lim_idx++;
                             }
                         }
                     }
@@ -794,6 +1007,7 @@ bool lorasensors_load_all(SdFat32 &sd) {
                             virtual_decoder_config_t vd;
                             memset(&vd, 0, sizeof(vd));
                             strncpy(vd.output_key, output_key, sizeof(vd.output_key) - 1);
+                            vd.dev_addr = dev.dev_addr; /* Virtual decoders are always scoped to their device */
 
                             const char* calc_type = vd_config["calculation"] | "";
                             const char* vd_type = vd_config["type"] | "";
@@ -887,12 +1101,15 @@ bool lorasensors_load_all(SdFat32 &sd) {
                                     vd.geometry.max_depth_cm = parse_dim("max_depth");
                                     vd.geometry.cone_compensation = geo["cone_compensation"] | 1.0f;
                                 }
+                                /* Parse volume capping mode: 0=Pass-Through, 1=Clamp, 2=Drop */
+                                vd.geometry.cap_max = vd_config["cap_max"] | 0;
                             }
 
                             if (vd.calculation != CALC_NONE && vd.source_key_count > 0) {
                                 virtual_decoder_register(&vd);
-                                DBG_LORA_PRINTF("Registered virtual decoder '%s' (sources: %u, type: %d) for device '%s'",
-                                                vd.output_key, vd.source_key_count, vd.calculation, dev.device_name);
+                                DBG_LORA_PRINTF("Registered virtual decoder '%s' (sources: %u, type: %d) for device '%s' (0x%08lX)",
+                                                vd.output_key, vd.source_key_count, vd.calculation, dev.device_name,
+                                                (unsigned long)dev.dev_addr);
                             }
                         }
                     }
@@ -902,14 +1119,14 @@ bool lorasensors_load_all(SdFat32 &sd) {
                     }
                 }
             } else {
-                Serial.printf("RP2040 Error: Failed to parse /devices/%s (%s)\r\n", filename, err.c_str());
+                LogSerial.printf("RP2040 Error: Failed to parse /devices/%s (%s)\r\n", filename, err.c_str());
             }
         }
         entry.close();
     }
     dev_dir.close();
 
-    Serial.printf("RP2040 Engine: Total active devices loaded: %u | Decoders cached in RAM: %u\r\n",
+    LogSerial.printf("RP2040 Engine: Total active devices loaded: %u | Decoders cached in RAM: %u\r\n",
                   (unsigned)g_device_count, (unsigned)g_decoder_count);
     return sys_glob_ok;
 }
@@ -999,10 +1216,25 @@ static void process_and_dispatch_rule(PacketSerial &ps, const lora_device_config
 
     if (!valid) return;
 
-    // 1. Universal scaling factor
-    double scaled_val = raw_num * rule->scale;
+    // ── STEP 1: Driver Hardware Bounds (Stage 1 Gate) ───────────────────
+    if (rule->has_bounds) {
+        if (raw_num < rule->val_min || raw_num > rule->val_max) {
+            DBG_LORA_PRINTF(" -> [%s] %s: Raw %.2f outside hardware bounds [%.2f..%.2f] - DROPPED",
+                            rule->context, rule->key, raw_num, rule->val_min, rule->val_max);
+            return;
+        }
+    }
 
-    // 2. Generic Offset Conversion: output unit strictly matches input target_unit
+    // ── STEP 2: Convert value to target_unit (rounded to 6 decimal places) ─
+    double converted_val = raw_num;
+    if (strlen(rule->unit) > 0 && strlen(rule->target_unit) > 0 && strcmp(rule->unit, rule->target_unit) != 0) {
+        converted_val = round_6dp(units_convert(static_cast<float>(raw_num), rule->unit, rule->target_unit));
+    }
+
+    // ── STEP 3: Apply corr_factor (scale) ────────────────────────────────
+    double scaled_val = round_6dp(converted_val * rule->scale);
+
+    // ── STEP 4: Generic Offset Addition (in target_unit) ─────────────────
     int dev_idx = dev - g_devices;
     if (dev_idx >= 0 && dev_idx < static_cast<int>(g_device_count)) {
         for (size_t o = 0; o < MAX_DEVICE_OFFSETS; o++) {
@@ -1015,7 +1247,7 @@ static void process_and_dispatch_rule(PacketSerial &ps, const lora_device_config
                     float converted_offset = units_convert(g_device_offsets[dev_idx][o].value, 
                                                            g_device_offsets[dev_idx][o].unit, 
                                                            rule->target_unit);
-                    scaled_val += converted_offset;
+                    scaled_val = round_6dp(scaled_val + converted_offset);
                     DBG_LORA_PRINTF(" -> [%s] %s: Raw=%.2f, Offset=%.2f %s (from %.2f %s), Scaled=%.2f %s",
                                     rule->context, rule->key, raw_num, 
                                     converted_offset, rule->target_unit,
@@ -1023,6 +1255,43 @@ static void process_and_dispatch_rule(PacketSerial &ps, const lora_device_config
                                     scaled_val, rule->target_unit);
                     break;
                 }
+            }
+        }
+    }
+
+    // ── STEP 5: Device Limits & Capping (Stage 2 Gate) ───────────────────
+    if (dev_idx >= 0 && dev_idx < static_cast<int>(g_device_count)) {
+        for (size_t l = 0; l < MAX_DEVICE_LIMITS; l++) {
+            const device_limit_t &lim = g_device_limits[dev_idx][l];
+            if (lim.valid && strcmp(lim.key, rule->key) == 0) {
+                // Minimum bound check
+                if (scaled_val < lim.val_min) {
+                    if (lim.cap_min == 0) { // Drop
+                        DBG_LORA_PRINTF(" -> [%s] %s: Value %.2f < val_min %.2f (cap_min=0) - DROPPED",
+                                        rule->context, rule->key, scaled_val, lim.val_min);
+                        return;
+                    } else if (lim.cap_min == 1) { // Clamp
+                        DBG_LORA_PRINTF(" -> [%s] %s: Value %.2f clamped to val_min %.2f",
+                                        rule->context, rule->key, scaled_val, lim.val_min);
+                        scaled_val = lim.val_min;
+                    }
+                    // cap_min == 2: Pass-Through (no action)
+                }
+
+                // Maximum bound check
+                if (scaled_val > lim.val_max) {
+                    if (lim.cap_max == 0) { // Drop
+                        DBG_LORA_PRINTF(" -> [%s] %s: Value %.2f > val_max %.2f (cap_max=0) - DROPPED",
+                                        rule->context, rule->key, scaled_val, lim.val_max);
+                        return;
+                    } else if (lim.cap_max == 1) { // Clamp
+                        DBG_LORA_PRINTF(" -> [%s] %s: Value %.2f clamped to val_max %.2f",
+                                        rule->context, rule->key, scaled_val, lim.val_max);
+                        scaled_val = lim.val_max;
+                    }
+                    // cap_max == 2: Pass-Through (no action)
+                }
+                break;
             }
         }
     }
@@ -1065,14 +1334,19 @@ static void process_and_dispatch_rule(PacketSerial &ps, const lora_device_config
                                     rule->key, rule->target_unit, &i_val, sizeof(int32_t));
     }
 
-    // 4. In the measurement trigger block, pass rule->target_unit to virtual decoders:
-    if (strcmp(rule->context, "measurement") == 0) {
+    // 4. Archive numeric measurement and diagnostic keys (e.g. battery_soc).
+    //    data_storage only keeps keys listed in the device's "archive" block.
+    bool is_measurement = (strcmp(rule->context, "measurement") == 0);
+    if (is_measurement || strcmp(rule->context, "diagnostic") == 0) {
         char dev_addr_str[16];
         snprintf(dev_addr_str, sizeof(dev_addr_str), "%08X", dev->dev_addr);
 
-        data_storage_add_point(dev_addr_str, dev->decoder, rule->key, 
+        data_storage_add_point(dev_addr_str, dev->decoder, rule->key,
                                (uint32_t)time(NULL), numeric_for_storage, rule->target_unit);
+    }
 
+    // 5. In the measurement trigger block, pass rule->target_unit to virtual decoders:
+    if (is_measurement) {
         virtual_decoder_process_and_send(ps, dev->device_name, dev->dev_addr, fcnt,
                                          rule->key, numeric_for_storage, (uint32_t)time(NULL), rule->target_unit);
     }
@@ -1184,4 +1458,263 @@ void lorasensors_process_raw_frame(PacketSerial &ps, const uint8_t *buffer, size
             break;
         }
     }
+}
+
+bool lorasensors_save_offset_to_sd(SdFat32 &sd, uint32_t dev_addr, const char *key,
+                                   float value, const char *unit) {
+    if (!key || strlen(key) == 0) return false;
+
+    /* 1. Locate and parse target device JSON file directly */
+    File32 dev_dir = sd.open("/devices/");
+    if (!dev_dir || !dev_dir.isDir()) {
+        LogSerial.println("RP2040 Error: /devices/ directory missing on SD!");
+        return false;
+    }
+
+    char target_path[128] = {0};
+    DynamicJsonDocument doc(4096);
+    bool found_and_parsed = false;
+
+    File32 entry;
+    while (entry.openNext(&dev_dir, O_READ)) {
+        char filename[64];
+        entry.getName(filename, sizeof(filename));
+
+        if (!entry.isDir() && strstr(filename, ".json") != NULL) {
+            doc.clear();
+            DeserializationError err = deserializeJson(doc, entry);
+            if (!err) {
+                uint32_t file_dev_addr = parse_hex_u32(doc["dev_addr"] | "");
+                if (file_dev_addr == dev_addr) {
+                    snprintf(target_path, sizeof(target_path), "/devices/%s", filename);
+                    found_and_parsed = true;
+                    entry.close();
+                    break;
+                }
+            }
+        }
+        entry.close();
+    }
+    dev_dir.close();
+
+    if (!found_and_parsed) {
+        LogSerial.printf("RP2040 Error: No JSON config found for DevAddr 0x%08lX\r\n", (unsigned long)dev_addr);
+        return false;
+    }
+
+    /* 2. Locate or create target offset entry in offsets object */
+    JsonObject offsets = doc["offsets"];
+    if (!offsets) {
+        offsets = doc.createNestedObject("offsets");
+    }
+
+    JsonObject target_off = offsets[key];
+    if (!target_off) {
+        target_off = offsets.createNestedObject(key);
+    }
+
+    target_off["value"] = value;
+    if (unit && unit[0] != '\0') {
+        target_off["unit"] = unit;
+    }
+
+    /* 3. Atomically write back updated JSON to SD card */
+    File32 file = sd.open(target_path, O_WRITE | O_CREAT | O_TRUNC);
+    if (!file) {
+        LogSerial.printf("RP2040 Error: Cannot open %s for writing\r\n", target_path);
+        return false;
+    }
+
+    serializeJsonPretty(doc, file);
+    file.close();
+    LogSerial.printf("RP2040: Successfully patched offset '%s' = %.2f %s in %s\r\n",
+                  key, value, unit ? unit : "", target_path);
+
+    /* 4. Synchronize in-memory RAM structures immediately */
+    for (size_t d = 0; d < g_device_count; d++) {
+        if (g_devices[d].dev_addr == dev_addr) {
+            /* Update local processing offset table */
+            bool updated_local = false;
+            for (size_t o = 0; o < MAX_DEVICE_OFFSETS; o++) {
+                if (g_device_offsets[d][o].valid && strcmp(g_device_offsets[d][o].key, key) == 0) {
+                    g_device_offsets[d][o].value = value;
+                    if (unit && unit[0] != '\0') {
+                        strncpy(g_device_offsets[d][o].unit, unit, sizeof(g_device_offsets[d][o].unit) - 1);
+                    }
+                    updated_local = true;
+                    break;
+                }
+            }
+            if (!updated_local) {
+                for (size_t o = 0; o < MAX_DEVICE_OFFSETS; o++) {
+                    if (!g_device_offsets[d][o].valid) {
+                        strncpy(g_device_offsets[d][o].key, key, sizeof(g_device_offsets[d][o].key) - 1);
+                        g_device_offsets[d][o].value = value;
+                        strncpy(g_device_offsets[d][o].unit, unit ? unit : "", sizeof(g_device_offsets[d][o].unit) - 1);
+                        g_device_offsets[d][o].valid = true;
+                        break;
+                    }
+                }
+            }
+
+            /* Update streamed device struct */
+            for (uint8_t o = 0; o < g_devices[d].offset_count; o++) {
+                if (strcmp(g_devices[d].offsets[o].key, key) == 0) {
+                    g_devices[d].offsets[o].value = value;
+                    if (unit && unit[0] != '\0') {
+                        strncpy(g_devices[d].offsets[o].unit, unit, sizeof(g_devices[d].offsets[o].unit) - 1);
+                    }
+                    break;
+                }
+            }
+
+            if (strcmp(key, "depth") == 0) {
+                const char *u = (unit && unit[0] != '\0') ? unit : "mm";
+                g_devices[d].raw_offset_mm = static_cast<int32_t>(units_convert(value, u, "mm"));
+            }
+            break;
+        }
+    }
+
+    return true;
+}
+
+bool lorasensors_save_threshold_to_sd(SdFat32 &sd, uint32_t dev_addr, const char *rule_id,
+                                      bool is_percent, float threshold_val, float hysteresis_val,
+                                      uint8_t damping, uint8_t severity, uint8_t buzzer_mode) {
+    if (!rule_id || strlen(rule_id) == 0) return false;
+
+    /* 1. Locate and parse target device JSON file directly */
+    File32 dev_dir = sd.open("/devices/");
+    if (!dev_dir || !dev_dir.isDir()) {
+        LogSerial.println("RP2040 Error: /devices/ directory missing on SD!");
+        return false;
+    }
+
+    char target_path[128] = {0};
+    DynamicJsonDocument doc(4096);
+    bool found_and_parsed = false;
+
+    File32 entry;
+    while (entry.openNext(&dev_dir, O_READ)) {
+        char filename[64];
+        entry.getName(filename, sizeof(filename));
+
+        if (!entry.isDir() && strstr(filename, ".json") != NULL) {
+            doc.clear();
+            DeserializationError err = deserializeJson(doc, entry);
+            if (!err) {
+                uint32_t file_dev_addr = parse_hex_u32(doc["dev_addr"] | "");
+                if (file_dev_addr == dev_addr) {
+                    snprintf(target_path, sizeof(target_path), "/devices/%s", filename);
+                    found_and_parsed = true;
+                    entry.close();
+                    break;
+                }
+            } else {
+                LogSerial.printf("RP2040 Warning: Skipping /devices/%s: JSON parse failed (%s)\r\n", 
+                              filename, err.c_str());
+            }
+        }
+        entry.close();
+    }
+    dev_dir.close();
+
+    if (!found_and_parsed) {
+        LogSerial.printf("RP2040 Error: No JSON config found for DevAddr 0x%08lX\r\n", (unsigned long)dev_addr);
+        return false;
+    }
+
+    /* 2. Locate and update target threshold entry in thresholds array */
+    JsonArray thresholds = doc["thresholds"];
+    if (!thresholds) {
+        LogSerial.printf("RP2040 Error: %s has no 'thresholds' array\r\n", target_path);
+        return false;
+    }
+
+    bool rule_found = false;
+    for (JsonObject t_obj : thresholds) {
+        const char *id_str = t_obj["id"] | "";
+        if (strcmp(id_str, rule_id) == 0) {
+            rule_found = true;
+
+            /* Map severity enum */
+            if (severity == 1) t_obj["severity"] = "warning";
+            else if (severity == 2) t_obj["severity"] = "info";
+            else t_obj["severity"] = "danger";
+
+            /* Map buzzer mode enum */
+            if (buzzer_mode == 1) t_obj["buzzer_mode"] = "continuous";
+            else if (buzzer_mode == 2) t_obj["buzzer_mode"] = "off";
+            else t_obj["buzzer_mode"] = "intermittent";
+
+            t_obj["damping"] = damping;
+
+            /* Retain exact JSON field format without loss */
+            if (is_percent) {
+                t_obj["value_percent"] = threshold_val;
+                t_obj["hysteresis_percent"] = hysteresis_val;
+                t_obj.remove("value_threshold");
+                t_obj.remove("value");
+                t_obj.remove("hysteresis");
+            } else {
+                /* Preserve original naming: 'value' if used previously, else 'value_threshold' */
+                if (t_obj.containsKey("value")) {
+                    t_obj["value"] = threshold_val;
+                } else {
+                    t_obj["value_threshold"] = threshold_val;
+                }
+                t_obj["hysteresis"] = hysteresis_val;
+                t_obj.remove("value_percent");
+                t_obj.remove("hysteresis_percent");
+            }
+            break;
+        }
+    }
+
+    if (!rule_found) {
+        LogSerial.printf("RP2040 Error: Rule '%s' not found in %s\r\n", rule_id, target_path);
+        return false;
+    }
+
+    /* 3. Atomically write back updated JSON to SD card */
+    File32 file = sd.open(target_path, O_WRITE | O_CREAT | O_TRUNC);
+    if (!file) {
+        LogSerial.printf("RP2040 Error: Cannot open %s for writing\r\n", target_path);
+        return false;
+    }
+
+    serializeJsonPretty(doc, file);
+    file.close();
+    LogSerial.printf("RP2040: Successfully patched threshold '%s' in %s\r\n", rule_id, target_path);
+
+    /* 4. Synchronize in-memory RAM structure immediately */
+    for (size_t d = 0; d < g_device_count; d++) {
+        if (g_devices[d].dev_addr == dev_addr) {
+            for (uint8_t t = 0; t < g_devices[d].threshold_count; t++) {
+                lora_threshold_config_t &th = g_devices[d].thresholds[t];
+                if (strcmp(th.rule_id, rule_id) == 0) {
+                    th.is_percent = is_percent;
+                    th.threshold_val = threshold_val;
+                    th.hysteresis_val = hysteresis_val;
+                    th.damping = damping;
+                    th.severity = severity;
+                    th.buzzer_mode = buzzer_mode;
+
+                    if (is_percent) {
+                        strncpy(th.unit, "%", sizeof(th.unit) - 1);
+                    }
+                    if (strstr(th.rule_id, "low") || strstr(th.rule_id, "min") || th.threshold_val < 0.0f) {
+                        th.op = 0; /* THRESHOLD_OP_LESS_THAN */
+                    } else {
+                        th.op = 1; /* THRESHOLD_OP_GREATER_THAN */
+                    }
+                    break;
+                }
+            }
+            break;
+        }
+    }
+
+    return true;
 }

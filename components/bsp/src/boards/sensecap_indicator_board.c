@@ -106,6 +106,7 @@ static const board_res_desc_t g_board_lcd_evb_res = {
     .LCD_DISP_IC_STR =          "null",
 #endif
     .LCD_FREQ =                 (CONFIG_LCD_EVB_SCREEN_FREQ * 1000 * 1000),
+    //.LCD_FREQ = (12 * 1000 * 1000), /* 12 MHz */
 
     .LCD_WIDTH =       (CONFIG_LCD_EVB_SCREEN_WIDTH),
     .LCD_HEIGHT =      (CONFIG_LCD_EVB_SCREEN_HEIGHT),
@@ -139,12 +140,13 @@ static const board_res_desc_t g_board_lcd_evb_res = {
 
 #ifdef CONFIG_SENSECAP_INDICATOR_SCREEN_GX
     .HSYNC_BACK_PORCH = 50,
+    //.HSYNC_BACK_PORCH = 62,
     .HSYNC_FRONT_PORCH = 10,
     .HSYNC_PULSE_WIDTH = 8,
     .VSYNC_BACK_PORCH = 20,
     .VSYNC_FRONT_PORCH = 10,
     .VSYNC_PULSE_WIDTH = 8,
-    .PCLK_ACTIVE_NEG = 0,
+    .PCLK_ACTIVE_NEG = 1,
 #elif defined CONFIG_SENSECAP_INDICATOR_SCREEN_DX
     .HSYNC_BACK_PORCH = 50,
     .HSYNC_FRONT_PORCH = 10,
@@ -152,7 +154,7 @@ static const board_res_desc_t g_board_lcd_evb_res = {
     .VSYNC_BACK_PORCH = 20,
     .VSYNC_FRONT_PORCH = 10,
     .VSYNC_PULSE_WIDTH = 8,
-    .PCLK_ACTIVE_NEG = 0,
+    .PCLK_ACTIVE_NEG = 1,
 #elif defined CONFIG_LCD_EV_SUB_BOARD2
     .HSYNC_BACK_PORCH = 20,
     .HSYNC_FRONT_PORCH = 40,

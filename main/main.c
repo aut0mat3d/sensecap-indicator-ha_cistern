@@ -44,6 +44,17 @@ extern void indicator_model_init(void);
 
 static const char* TAG = "app_main";
 
+static void _heap_monitor_task(void *arg) {
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(10000)); /* alle 10 Sekunden loggen */
+        ESP_LOGW("HEAP_MON", "Free Heap: %lu B (Min ever: %lu B) | Internal DRAM: %u B",
+                 (unsigned long)esp_get_free_heap_size(),
+                 (unsigned long)esp_get_minimum_free_heap_size(),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    }
+}
+
+
 void app_main(void) {
 	ESP_LOGI("TAG", "system start");
 
@@ -71,22 +82,23 @@ void app_main(void) {
 	// 				  portMAX_DELAY); /*send to wifi view*/
 
 #if LOG_MEM_INFO
-	// static char buffer[128];    /* Make sure buffer is enough for `sprintf`
+	 static char buffer[128];    /* Make sure buffer is enough for `sprintf`
 	// */
 	while(1)
 	{
-		// sprintf(buffer, "   Biggest /     Free /    Total\n"
-		//         "\t  DRAM : [%8d / %8d / %8d]\n"
-		//         "\t PSRAM : [%8d / %8d / %8d]",
-		//         heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-		//         heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-		//         heap_caps_get_total_size(MALLOC_CAP_INTERNAL),
-		//         heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
-		//         heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-		//         heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
-		// ESP_LOGI("MEM", "%s", buffer);
+		 sprintf(buffer, "   Biggest /     Free /    Total\n"
+		         "\t  DRAM : [%8d / %8d / %8d]\n"
+		         "\t PSRAM : [%8d / %8d / %8d]",
+		         heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+		         heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+		         heap_caps_get_total_size(MALLOC_CAP_INTERNAL),
+		         heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
+		         heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+		         heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
+		 ESP_LOGI("MEM", "%s", buffer);
 
 		vTaskDelay(pdMS_TO_TICKS(10000));
 	}
 #endif
+	//xTaskCreate(_heap_monitor_task, "heap_mon", 2048, NULL, 1, NULL);
 }

@@ -30,4 +30,6 @@
 
 #include "cistern_view.h"
 
+#include "alarm_view.h"
+
 #endif /*INDICATOR_INCLUDES_H*/

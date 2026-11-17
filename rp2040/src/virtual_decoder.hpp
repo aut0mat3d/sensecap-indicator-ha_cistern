@@ -22,7 +22,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include <PacketSerial.h>
+#include "indicator_rp2040.hpp"
 
 // ============================================================================
 // Calculation Types
@@ -68,15 +68,16 @@ typedef struct {
 
 typedef struct {
     geo_type_t type;
-    float max_depth_cm;
-    float width_cm;
-    float length_cm;
-    float diameter_cm;
-    float dish_height_cm;
-    float bottom_diameter_cm;
-    float top_diameter_cm;
-    float height_cm;
-    float cone_compensation;
+    float   max_depth_cm;
+    float   width_cm;
+    float   length_cm;
+    float   diameter_cm;
+    float   dish_height_cm;
+    float   bottom_diameter_cm;
+    float   top_diameter_cm;
+    float   height_cm;
+    float   cone_compensation;
+    uint8_t cap_max; /* 0 = Pass-Through, 1 = Clamp, 2 = Drop */
 } geometry_config_t;
 
 // ============================================================================
@@ -90,6 +91,7 @@ typedef struct {
 // ============================================================================
 
 typedef struct {
+    uint32_t dev_addr;                     /// Owning device: sources and outputs are resolved within this device only
     char source_keys[MAX_SOURCE_KEYS][32]; /// Keys of the source values (e.g., ["temp", "humidity"])
     uint8_t source_key_count;             /// Number of source keys used
     calc_type_t calculation;               /// Type of calculation
@@ -142,33 +144,57 @@ void virtual_decoder_clear_outputs(void);
 bool virtual_decoder_register(const virtual_decoder_config_t* config);
 
 /**
- * @brief Process a new raw value through all virtual decoders
+ * @brief Process a measurement through virtual decoders and compute outputs.
+ * @param device_name Name of the device (for LoRa telemetry) or NULL for built-in sensors
+ * @param dev_addr Device address (for LoRa telemetry) or 0 for built-in sensors
+ * @param fcnt Frame counter (for LoRa telemetry) or 0 for built-in sensors
+ * @param key The key of the raw value (e.g., "depth")
+ * @param value Input measurement value
+ * @param timestamp Measurement timestamp
+ * @param source_unit Unit of input value
+ * @return true if any virtual values were successfully computed.
+ */
+bool virtual_decoder_process(uint32_t dev_addr, uint32_t fcnt, const char* key,
+                            float value, uint32_t timestamp, const char* source_unit = nullptr);
+
+inline bool virtual_decoder_process(const char* device_name, uint32_t dev_addr, uint32_t fcnt, const char* key,
+                                   float value, uint32_t timestamp, const char* source_unit = nullptr) {
+    (void)device_name;
+    return virtual_decoder_process(dev_addr, fcnt, key, value, timestamp, source_unit);
+}
+
+/**
+ * @brief Process a new raw value through all virtual decoders (legacy overload)
  * @param key The key of the raw value (e.g., "depth")
  * @param value The raw value
  * @param timestamp Unix timestamp of the measurement
  * @return true if any virtual decoder produced output
  */
-bool virtual_decoder_process(const char* key, float value, uint32_t timestamp);
+inline bool virtual_decoder_process(const char* key, float value, uint32_t timestamp) {
+    return virtual_decoder_process(0, 0, key, value, timestamp, nullptr);
+}
 
 /**
- * @brief Get computed value for a virtual decoder output key
+ * @brief Get computed value for a virtual decoder output key of one device
+ * @param dev_addr Owning device address
  * @param output_key The output key (e.g., "volume", "flowrate")
  * @param value Output: computed value
  * @param unit Output: unit string (max 16 chars)
  * @return true if virtual decoder exists and has computed a value
  */
-bool virtual_decoder_get_output(const char* output_key, float* value, char* unit);
+bool virtual_decoder_get_output(uint32_t dev_addr, const char* output_key, float* value, char* unit);
 
 /**
  * @brief Process a new raw value through all virtual decoders and send outputs to ESP32
- * @param ps PacketSerial instance for sending to ESP32
+ * @param ps PacketSerial instance for sending to ESP32 (unused, outputs are enqueued)
  * @param device_name Name of the device (for LoRa telemetry) or NULL for built-in sensors
  * @param dev_addr Device address (for LoRa telemetry) or 0 for built-in sensors
  * @param fcnt Frame counter (for LoRa telemetry) or 0 for built-in sensors
  * @param key The key of the raw value (e.g., "depth")
  * @param value The raw value
  * @param timestamp Unix timestamp of the measurement
- * @return true if any virtual decoder produced output
+ * @param source_unit Unit of input value
+ * @return true if any virtual values were successfully computed
  */
 bool virtual_decoder_process_and_send(PacketSerial* ps, const char* device_name, uint32_t dev_addr, uint32_t fcnt, 
                                        const char* key, float value, uint32_t timestamp, const char* source_unit = nullptr);

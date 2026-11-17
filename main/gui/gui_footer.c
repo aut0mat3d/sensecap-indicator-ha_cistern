@@ -34,7 +34,12 @@ void gui_footer_init(lv_obj_t *parent) {
     lv_obj_set_style_radius(s_footer_cont, 0, LV_PART_MAIN);
     lv_obj_set_style_bg_color(s_footer_cont, FOOTER_BG_COLOR, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(s_footer_cont, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_width(s_footer_cont, 0, LV_PART_MAIN);
+    
+    /* Top border line for seamless visual separation */
+    lv_obj_set_style_border_side(s_footer_cont, LV_BORDER_SIDE_TOP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(s_footer_cont, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(s_footer_cont, lv_color_hex(0x000000), LV_PART_MAIN);
+    
     lv_obj_set_style_pad_all(s_footer_cont, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_left(s_footer_cont, 10, LV_PART_MAIN);
     lv_obj_set_style_pad_right(s_footer_cont, 10, LV_PART_MAIN);

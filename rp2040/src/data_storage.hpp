@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <SdFat.h>
+#include "archive_store.hpp"
 
 class SdFat32;
 
@@ -22,8 +23,8 @@ class SdFat32;
 
 typedef enum {
     GRAN_ROUNDTRIP = 0,  /// Raw/Bucket-averaged data (configurable interval)
-    GRAN_HOURLY    = 1,  /// Hourly aggregated values (max 48 entries)
-    GRAN_DAILY     = 2   /// Daily aggregated values (max 32 entries)
+    GRAN_HOURLY    = 1,  /// Hourly aggregated values (retention "hours")
+    GRAN_DAILY     = 2   /// Daily aggregated values (retention "days")
 } granularity_t;
 
 // ============================================================================
@@ -36,6 +37,8 @@ typedef struct {
     float value;          /// Sensor value
     char unit[8];        /// Unit string (e.g. "cm", "%", "m³")
     bool is_estimated;    /// True if this is an estimated/replacement value
+    uint32_t count;       /// Covered samples behind an aggregated point (hourly/daily), 0 for raw points
+    bool is_gap;          /// True if no value exists for this slot (DATA_FLAG_NO_DATA)
 } data_point_t;
 
 /** Aggregated data point for hourly/daily storage */
@@ -45,8 +48,8 @@ typedef struct {
     float    avg_value;        ///< Average value in interval
     float    min_value;        ///< Minimum value in interval
     float    max_value;        ///< Maximum value in interval
-    uint32_t count;            ///< Number of raw values in interval
-    bool     has_estimated;    ///< True if any estimated values in interval
+    uint32_t count;            ///< Covered samples in interval (real + valid hold, see quality model)
+    bool     has_estimated;    ///< True if coverage is below solid_pct (degraded period)
 } data_aggregated_t;
 
 // ============================================================================
@@ -54,18 +57,47 @@ typedef struct {
 // ============================================================================
 
 /**
- * @brief Per-channel storage configuration
+ * @brief Retention levels of the archive pyramid (index into data_channel_config_t::retention).
+ *        Configured per key in the device JSON: "archive": { "<key>": { "retention": { ... } } }
+ */
+typedef enum {
+    RET_SINGLE = 0,  /// raw/ segments (bucket grid, min(interval, 300 s))
+    RET_HOURS  = 1,  /// hour/ segments (full UTC hour)
+    RET_DAYS   = 2,  /// day/ segments (local midnight)
+    RET_WEEKS  = 3,  /// parsed, aggregation not implemented yet
+    RET_MONTHS = 4,  /// parsed, aggregation not implemented yet
+    RET_YEARS  = 5,  /// parsed, aggregation not implemented yet
+    RET_LEVEL_COUNT
+} retention_level_t;
+
+/** Flag of a grid record (arc_raw_record_t::flag) */
+#define RT_FLAG_REAL       0  ///< Bucket contains at least one received sample
+#define RT_FLAG_ESTIMATED  1  ///< Substitute value after a missed packet (deadline exceeded)
+#define RT_FLAG_HOLD       2  ///< No new sample in this bucket, but the next packet is not overdue yet
+
+/** Defaults of the aggregation quality model ("quality" block of an archive key) */
+#define QUALITY_DEFAULT_SOLID_PCT      66
+#define QUALITY_DEFAULT_MIN_PCT        10
+#define QUALITY_DEFAULT_USE_ESTIMATED  false
+
+/**
+ * @brief Per-channel storage configuration (source: "archive" block of /devices/<name>.json)
  */
 typedef struct {
     char channel_key[64];        /// Unique key: "[dev_addr].[decoder].[key]"
-    char dev_addr[17];          /// Device address (e.g. "05975DC9")
+    char dev_addr[17];          /// Device address, normalized to 8 hex digits (e.g. "05975DC9", "00000045")
     char decoder[32];           /// Decoder name (e.g. "EM500-SWL")
-    char key[32];               /// Channel key (e.g. "depth")
-    bool store_longterm;         /// Enable long-term storage (hourly/daily)
-    bool store_roundtrip;        /// Enable roundtrip storage
-    uint32_t roundtrip_interval;    /// Wall-clock aligned interval in seconds
+    char key[32];               /// Channel key (e.g. "depth"), decoder key or virtual key
+    uint16_t retention[RET_LEVEL_COUNT]; /// Configured entries per level (0 = level disabled)
+    uint16_t keep_entries[RET_LEVEL_COUNT]; /// Effective retention incl. staging levels (0 = level not written)
+    uint16_t max_estimated_count; /// Max consecutive substitute values after a missed packet (0 = never)
+    uint8_t  solid_pct;          /// Coverage >= solid_pct: aggregated value is regular
+    uint8_t  min_pct;            /// Coverage >= min_pct: aggregated value flagged ESTIMATED; below: gap
+    bool     use_estimated;      /// Substitute values enter aggregated averages (coverage never counts them)
+    uint32_t roundtrip_interval;    /// Expected update interval of this key (expected_interval_sec, default: device report_interval_sec)
+    uint32_t storage_interval;      /// Wall-clock storage grid in seconds (capped at 300s)
     uint32_t tolerance_sec;      /// Per-channel jitter tolerance from JSON
-    char unit[8];               /// Unit string from mapping
+    char unit[8];               /// Unit string from decoder mapping or virtual decoder
 } data_channel_config_t;
 
 /**
@@ -75,9 +107,11 @@ typedef struct {
     uint32_t current_bucket;    /// Start timestamp of current wall-clock window
     double   accumulator;       /// High-precision IEEE-754 sum of samples in window
     uint16_t sample_count;      /// Number of sensor samples received in window (cnt)
+    uint32_t last_rx_time;      /// Unix timestamp of the last real sensor packet received
     uint32_t last_stored_time;  /// Timestamp of last written record on LittleFS
-    float    last_value;        /// Last known value (used for missing estimation)
+    float    last_value;        /// Last known value (used for hold / missing estimation)
     bool     has_last_value;    /// True if last_value is valid
+    uint16_t consecutive_estimated; /// Substitute values written since the last real packet
 } data_channel_state_t;
 
 /**
@@ -86,6 +120,8 @@ typedef struct {
 typedef struct {
     data_channel_config_t config;
     data_channel_state_t state;
+    arc_channel_t arc;          /// Segment archive of this channel (/data/<dev_addr>/<key>/...)
+    uint32_t key_hash;          /// Hash of config.channel_key (references queued records)
 } data_channel_t;
 
 // ============================================================================
@@ -107,8 +143,12 @@ uint32_t data_storage_get_saved_time(void);
 // ============================================================================
 
 void data_storage_init(SdFat32* sd);
+
+/**
+ * @brief Scan all device JSON files in /devices/ and register one archive channel per entry of the
+ *        optional "archive" object. Keys without an "archive" entry are not stored.
+ */
 bool data_storage_load_devices(SdFat32* sd);
-void data_storage_load_decoder(SdFat32* sd, const char* dev_addr, const char* decoder);
 bool data_storage_register_channel(const data_channel_config_t* config);
 
 /**
@@ -132,6 +172,14 @@ void data_storage_process_buckets(void);
 void data_storage_aggregate_hourly(void);
 void data_storage_aggregate_daily(void);
 
+/**
+ * @brief Write records queued in RAM while LittleFS was unavailable (card removed, USB-MSC).
+ *        Called periodically from process_buckets() with a small bound per tick.
+ * @param max_records Upper bound per call (0 = all; blocks the caller accordingly).
+ * @return Number of records written.
+ */
+size_t data_storage_flush_pending(size_t max_records);
+
 data_point_t* data_storage_query(
     const char* channel_key,
     uint32_t start_timestamp,
@@ -145,10 +193,6 @@ data_point_t* data_storage_query(
 const data_channel_config_t* data_storage_get_config(const char* channel_key);
 data_channel_state_t* data_storage_get_state(const char* channel_key);
 
-void data_storage_build_roundtrip_path(const char* channel_key, char* path, size_t path_size);
-void data_storage_build_hourly_path(const char* channel_key, char* path, size_t path_size);
-void data_storage_build_daily_path(const char* channel_key, char* path, size_t path_size);
-bool data_storage_trim_file(const char* path, uint32_t max_entries);
 
 // ============================================================================
 // Chart Data Export Types
