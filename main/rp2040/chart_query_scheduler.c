@@ -47,6 +47,7 @@ static uint8_t              s_q_count = 0;
 
 static sched_state_t        s_state = SCHED_STATE_IDLE;
 static uint32_t             s_request_sent_ms = 0;
+static uint32_t             s_last_done_ms = 0;
 static uint8_t              s_next_req_id = 1;
 
 static SemaphoreHandle_t    s_sched_mutex = NULL;
@@ -314,6 +315,7 @@ void chart_query_scheduler_on_response(uint8_t req_id, uint8_t status, uint32_t 
             s_q_head = (s_q_head + 1) % CHART_SCHEDULER_QUEUE_SIZE;
             s_q_count--;
             s_state = SCHED_STATE_IDLE;
+            s_last_done_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 
             xSemaphoreGive(s_sched_mutex);
             return;
@@ -380,11 +382,13 @@ void chart_query_scheduler_update(void) {
             s_q_head = (s_q_head + 1) % CHART_SCHEDULER_QUEUE_SIZE;
             s_q_count--;
             s_state = SCHED_STATE_IDLE;
+            s_last_done_ms = now_ms;
         }
     }
 
-    /* 3. Dispatch next pending request from FIFO */
-    if (s_state == SCHED_STATE_IDLE && s_q_count > 0) {
+    /* 3. Dispatch next pending request from FIFO (after the breathing gap) */
+    if (s_state == SCHED_STATE_IDLE && s_q_count > 0 &&
+        (now_ms - s_last_done_ms) >= CHART_QUERY_GAP_MS) {
         query_queue_item_t *next = &s_queue[s_q_head];
 
         ESP_LOGI(TAG, "Dispatching query: req_id=%u, sub_id=%d, key='%s', step=%lu s",

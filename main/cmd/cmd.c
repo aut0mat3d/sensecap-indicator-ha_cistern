@@ -13,6 +13,10 @@
 #include "chart_query_scheduler.h"
 #include "alarm_model.h"
 #include "alarm_view.h"
+#include "bsp_lcd.h"
+#include "esp_lcd_panel_rgb.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lvgl_port.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -295,6 +299,64 @@ static void register_alarm_ack(void) {
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
 }
 
+/* ── Display diagnostics: lcd_restart / lcd_rgb_reinit ────────────────── */
+/*
+ * Used while the ~15 px horizontal display shift is visible, to locate where it lives:
+ *  - lcd_restart: resynchronizes only the ESP32 side (GDMA + LCD FIFO restart at the next VSYNC),
+ *                 the panel is not touched. Fixes the image -> shift is in the ESP32 data stream.
+ *  - (panel reset + re-init was tested on 2026-11-17 and did NOT fix the shift; it is not offered
+ *    as a command because the panel's 3-wire SPI shares GPIO41/48 with the SX1262 SPI bus and
+ *    re-running lcd_panel_st7701s_init() at runtime takes these pins away from the radio)
+ *  - lcd_rgb_reinit: full stop/reset/start of the ESP32 LCD engine. Fixes the image while
+ *                 lcd_restart does not -> the engine/FIFO lost alignment in the driver's
+ *                 restart path (ESP32-S3 restart workaround) or during an underrun.
+ */
+static int cmd_lcd_restart(int argc, char **argv) {
+    esp_lcd_panel_handle_t panel = bsp_lcd_get_panel_handle();
+    if (!panel) {
+        printf("No LCD panel handle\n");
+        return 1;
+    }
+    esp_err_t err = esp_lcd_rgb_panel_restart(panel);
+    printf("RGB stream restart requested (applied at next VSYNC): %s\n", esp_err_to_name(err));
+    return err == ESP_OK ? 0 : 1;
+}
+
+static int cmd_lcd_rgb_reinit(int argc, char **argv) {
+    esp_lcd_panel_handle_t panel = bsp_lcd_get_panel_handle();
+    if (!panel) {
+        printf("No LCD panel handle\n");
+        return 1;
+    }
+    /* Full restart of the ESP32 LCD engine (stop, reset, FIFO reset, bounce prefill, DMA start,
+     * engine start) - unlike lcd_restart, which only restarts GDMA/FIFO while the engine keeps
+     * running. Rendering is paused meanwhile so LVGL does not swap frame buffers in between. */
+    lvgl_port_lock(0);
+    esp_err_t err = esp_lcd_panel_init(panel);
+    lvgl_port_unlock();
+    printf("RGB engine fully restarted: %s\n", esp_err_to_name(err));
+    return err == ESP_OK ? 0 : 1;
+}
+
+static void register_lcd_diag(void) {
+    const esp_console_cmd_t rgb_reinit_cmd = {
+        .command = "lcd_rgb_reinit",
+        .help    = "Diagnostics: full restart of the ESP32 RGB LCD engine (stop/reset/start), panel untouched",
+        .hint    = NULL,
+        .func    = &cmd_lcd_rgb_reinit,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&rgb_reinit_cmd));
+
+    const esp_console_cmd_t restart_cmd = {
+        .command = "lcd_restart",
+        .help    = "Diagnostics: restart the ESP32 RGB stream (GDMA/FIFO) at the next VSYNC, panel untouched",
+        .hint    = NULL,
+        .func    = &cmd_lcd_restart,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&restart_cmd));
+
+}
+
 /* ── Command: lora_inject ──────────────────────────────────────────────── */
 
 static int cmd_lora_inject(int argc, char **argv) {
@@ -417,6 +479,7 @@ int indicator_cmd_init(void) {
     register_chart_poll();
     register_alarm_mute();
     register_alarm_ack();
+    register_lcd_diag();
 
     /* 4. Start UART REPL Driver */
     esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();

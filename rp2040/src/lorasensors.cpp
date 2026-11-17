@@ -6,6 +6,7 @@
 
 #include "lorasensors.hpp"
 #include "debug_log.hpp"
+#include "uart_link.hpp"
 #include "data_storage.hpp"
 #include "virtual_decoder.hpp"
 #include <math.h>
@@ -448,7 +449,7 @@ void lorasensors_dispatch_local(PacketSerial &ps, uint32_t dev_addr,
     uint8_t checksum = 0;
     for (size_t i = 0; i < idx; i++) checksum ^= tx_buf[i];
     tx_buf[idx++] = checksum;
-    ps.send(tx_buf, idx);
+    uart_link_send(tx_buf, idx);
 
     // 3. Store into LittleFS using device address and decoder name
     char dev_addr_str[16];
@@ -494,13 +495,13 @@ void lora_telemetry_send_dynamic(PacketSerial& ps, uint32_t dev_addr, uint32_t f
     }
     tx_buf[idx++] = checksum;
 
-    ps.send(tx_buf, idx);
+    uart_link_send(tx_buf, idx);
 }
 
 void lorasensors_push_globals(PacketSerial &ps, bool valid_cfg) {
     if (!valid_cfg) {
         uint8_t no_cfg_buf[2] = { PKT_TYPE_PUSH_LORA_CFG, 0 };
-        ps.send(no_cfg_buf, sizeof(no_cfg_buf));
+        uart_link_send(no_cfg_buf, sizeof(no_cfg_buf));
         LogSerial.printf("RP2040: Pushed NO_CONFIG status to ESP32-S3\r\n");
         return;
     }
@@ -511,7 +512,7 @@ void lorasensors_push_globals(PacketSerial &ps, bool valid_cfg) {
     glob_buf[1] = 1;
     memcpy(&glob_buf[2], &g_global_cfg, sizeof(lora_global_config_t));
     glob_buf[2 + sizeof(lora_global_config_t)] = static_cast<uint8_t>(g_device_count);
-    ps.send(glob_buf, sizeof(glob_buf));
+    uart_link_send(glob_buf, sizeof(glob_buf));
 
     LogSerial.printf("RP2040: Pushed Globals (0x35) with %u devices announced\r\n", (unsigned)g_device_count);
 }
@@ -521,13 +522,15 @@ bool lorasensors_stream_single_device(PacketSerial &ps, size_t dev_idx) {
         return false; /* All devices sent */
     }
 
-    /* Packet 0x3F: Stream single device chunk (~772 bytes) */
+    /* Packet 0x3F: Stream single device chunk */
+    static_assert(3 + sizeof(lora_device_config_t) <= UART_LINK_MAX_PACKET,
+                  "lora_device_config_t no longer fits into one UART link packet");
     uint8_t dev_buf[3 + sizeof(lora_device_config_t)];
     dev_buf[0] = PKT_TYPE_PUSH_LORA_DEV;
     dev_buf[1] = static_cast<uint8_t>(dev_idx);
     dev_buf[2] = static_cast<uint8_t>(g_device_count);
     memcpy(&dev_buf[3], &g_devices[dev_idx], sizeof(lora_device_config_t));
-    ps.send(dev_buf, sizeof(dev_buf));
+    uart_link_send(dev_buf, sizeof(dev_buf));
 
     LogSerial.printf("RP2040: Streamed Device [%u/%u]: '%s' (0x%08lX)\r\n",
                   (unsigned)(dev_idx + 1), (unsigned)g_device_count,
@@ -900,6 +903,21 @@ bool lorasensors_load_all(SdFat32 &sd) {
                     if (thresholds) {
                         for (JsonObject t_item : thresholds) {
                             if (dev.threshold_count >= MAX_THRESHOLDS_PER_DEVICE) break;
+
+                            /* Direction is mandatory ("falling" = below threshold, "rising" = above);
+                             * it is never derived from the rule id */
+                            const char* dir = t_item["direction"] | "";
+                            uint8_t op;
+                            if (strcasecmp(dir, "falling") == 0) {
+                                op = 0; /* THRESHOLD_OP_LESS_THAN (<) */
+                            } else if (strcasecmp(dir, "rising") == 0) {
+                                op = 1; /* THRESHOLD_OP_GREATER_THAN (>) */
+                            } else {
+                                LogSerial.printf("[LORA] Dev 0x%08lX: threshold '%s' skipped, \"direction\" must be \"falling\" or \"rising\" (got \"%s\")\r\n",
+                                                 (unsigned long)dev.dev_addr, (const char*)(t_item["id"] | "?"), dir);
+                                continue;
+                            }
+
                             lora_threshold_config_t &th = dev.thresholds[dev.threshold_count++];
                             memset(&th, 0, sizeof(lora_threshold_config_t));
 
@@ -938,22 +956,7 @@ bool lorasensors_load_all(SdFat32 &sd) {
                             /* Dynamically resolve engineering unit from virtual decoder or decoder mappings */
                             _resolve_threshold_unit(doc, dec_idx, th.key, th.is_percent, th.unit, sizeof(th.unit));
 
-                            /* Parse threshold direction explicitly ("falling" / "rising") */
-                            if (t_item.containsKey("direction")) {
-                                const char* dir = t_item["direction"] | "falling";
-                                if (strcasecmp(dir, "falling") == 0) {
-                                    th.op = 0; /* THRESHOLD_OP_LESS_THAN (<) */
-                                } else {
-                                    th.op = 1; /* THRESHOLD_OP_GREATER_THAN (>) */
-                                }
-                            } else {
-                                /* Legacy fallback heuristic if no direction is specified */
-                                if (strstr(th.rule_id, "low") || strstr(th.rule_id, "min") || th.threshold_val < 0.0f) {
-                                    th.op = 0; /* THRESHOLD_OP_LESS_THAN */
-                                } else {
-                                    th.op = 1; /* THRESHOLD_OP_GREATER_THAN */
-                                }
-                            }
+                            th.op = op;
 
                             th.valid = true;
 
@@ -1704,11 +1707,7 @@ bool lorasensors_save_threshold_to_sd(SdFat32 &sd, uint32_t dev_addr, const char
                     if (is_percent) {
                         strncpy(th.unit, "%", sizeof(th.unit) - 1);
                     }
-                    if (strstr(th.rule_id, "low") || strstr(th.rule_id, "min") || th.threshold_val < 0.0f) {
-                        th.op = 0; /* THRESHOLD_OP_LESS_THAN */
-                    } else {
-                        th.op = 1; /* THRESHOLD_OP_GREATER_THAN */
-                    }
+                    /* th.op stays as loaded from "direction" (not editable in the GUI, never derived from the id) */
                     break;
                 }
             }

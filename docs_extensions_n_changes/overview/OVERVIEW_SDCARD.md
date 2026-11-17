@@ -23,7 +23,7 @@ Application-specific settings therefore never belong in a decoder file.
 | `config/units.json` | RP2040 `units_init` (ESP32 has a builtin copy in `units.c`) | quantity types, units, factors/offsets |
 | `config/lang/<lang>/units.json` | RP2040 units | localized unit names (override only `name`) |
 | `decoder/<name>.json` | RP2040 `lorasensors_get_or_load_decoder` (RAM cache), `data_storage_load_decoder` | `format` (`IPSO_TLV`, `PACKED_BINARY`), `fport_config` (encryption), `commands` (downlinks), `reactions`, `mappings[]` (channel/type → `key`, `unit`, `datatype`, `context`: `measurement` / `diagnostic` / `history`) |
-| `devices/<name>.json` | RP2040 `lorasensors_load_all` (devices, thresholds, virtual decoders, streamed to ESP32 via `0x3F`), `data_storage_load_devices` (archive channels), ESP32 `alarm_evaluator_load_device_json` | see schema below |
+| `devices/<name>.json` | RP2040 `lorasensors_load_all` (devices, thresholds, virtual decoders, streamed to ESP32 via `0x3F`), `data_storage_load_devices` (archive channels) | see schema below |
 | `gui/media_standards.json` | ESP32 `media_standards_load_from_sd()` (after config push, together with the language files); `cistern_view` applies `media_get_color(device.medium)` as main color of its graphs | `media_types.<id>`: name EN/DE, `color_hex` (user-defined main color), `unit_default` |
 | `gui/lang/<lang>/common.json` | ESP32 `gui_i18n_reload_from_sd` via `0x38` | GUI string overrides |
 | `gui/lang/<lang>/alarm_config.json` | ESP32 `gui_i18n` / `alarm_model` | alarm colors, texts, HW button behavior |
@@ -58,6 +58,8 @@ Application-specific settings therefore never belong in a decoder file.
   }
 }
 ```
+
+Thresholds: `direction` is mandatory (`"falling"` = alarm below the value, `"rising"` = alarm above); a threshold without a valid direction is skipped with a log message, the direction is never derived from the `id`. Percent values (`value_percent`, `hysteresis_percent`) refer to `limits[key]` (`val_min..val_max`), else to the tank depth. GUI edits rewrite exactly this entry in the device file (value, hysteresis, damping, severity, buzzer mode); `id`, `key` and `direction` are not editable.
 
 Archive keys may be decoder keys (`depth`, `battery_soc`) or virtual keys (`volume`, `flowrate`).
 Retention: number of entries kept per level; `0` disables the level. `weeks`, `months` and `years` are parsed but not aggregated yet (planned NTTW phase).

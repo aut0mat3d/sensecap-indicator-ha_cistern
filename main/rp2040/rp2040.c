@@ -25,6 +25,9 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
 
 static const char* TAG = "esp32_rp2040";
 
@@ -56,6 +59,109 @@ static bool s_thresh_req_success = false;
 static SemaphoreHandle_t s_offset_req_sem = NULL;
 static bool s_offset_req_success = false;
 
+/* UART driver event queue: used to detect RX overflows (FIFO / ring buffer full) */
+#define RP2040_UART_EVT_QUEUE_LEN        16
+/* RX FIFO interrupt threshold in bytes (hardware FIFO: 128 bytes) */
+#define RP2040_UART_RX_FULL_THRESHOLD    64
+static QueueHandle_t s_uart_evt_queue = NULL;
+
+/* The UART task never blocks indefinitely on the event loop: telemetry is dropped (and
+ * counted) when the loop is congested for longer than this, other events wait longer */
+#define RP2040_EVT_POST_TIMEOUT_TELEM_MS  50
+#define RP2040_EVT_POST_TIMEOUT_CTRL_MS   500
+
+/* Alarm journal upload: entries per chunk, ack timeout, attempts before giving up */
+#define RP2040_ALARM_SAVE_ENTRIES_PER_CHUNK  4
+#define RP2040_ALARM_SAVE_ACK_TIMEOUT_MS     1500
+#define RP2040_ALARM_SAVE_MAX_ATTEMPTS       3
+_Static_assert(4 + RP2040_ALARM_SAVE_ENTRIES_PER_CHUNK * sizeof(alarm_entry_t) <= 800,
+               "alarm save chunk exceeds the 800 B packet buffer of _alarm_send_save_chunk");
+
+typedef struct {
+    bool                          active;
+    alarm_entry_t                *entries;       /* owned snapshot, oldest first */
+    uint16_t                      count;
+    uint8_t                       total_chunks;
+    uint8_t                       next_chunk;    /* next chunk to send */
+    bool                          awaiting_ack;  /* ack outstanding for chunk next_chunk - 1 */
+    uint32_t                      sent_ms;
+    uint8_t                       attempt;
+    rp2040_alarm_upload_done_cb_t done_cb;
+} alarm_upload_t;
+
+static alarm_upload_t    s_upl = {0};
+static SemaphoreHandle_t s_upl_mutex = NULL;
+/* Last ack received (written and read by the UART task only) */
+static bool    s_upl_ack_pending = false;
+static uint8_t s_upl_ack_chunk = 0;
+static bool    s_upl_ack_ok = false;
+
+static int _alarm_send_save_chunk(uint8_t chunk_idx, uint8_t total_chunks, uint8_t count, const void *entries);
+static void _alarm_upload_update(void);
+
+#if RP2040_LINK_DIAG
+typedef struct {
+    uint32_t rx_bytes;
+    uint32_t rx_packets;
+    uint32_t rx_decode_errors;   /* COBS decode failures */
+    uint32_t rx_oversized;       /* fragments larger than the frame buffer */
+    uint32_t rx_overflows;       /* UART FIFO / ring buffer overflows */
+    uint32_t rx_line_errors;     /* frame / parity errors */
+    uint32_t evt_drops;          /* events not posted (event loop congested) */
+    uint32_t max_evt_wait_us;
+    uint32_t max_handle_us;
+    uint8_t  max_handle_type;
+    uint32_t tx_packets;
+    uint32_t tx_bytes;
+    uint32_t max_tx_us;          /* longest blocking uart write incl. mutex wait */
+} link_diag_t;
+
+static link_diag_t s_diag = {0};
+static int64_t     s_diag_last_us = 0;
+
+static void _link_diag_periodic(void) {
+    int64_t now = esp_timer_get_time();
+    if (s_diag_last_us == 0) s_diag_last_us = now;
+    if (now - s_diag_last_us < (int64_t)RP2040_LINK_DIAG_PERIOD_MS * 1000) return;
+    s_diag_last_us = now;
+
+    link_diag_t d = s_diag;
+    memset(&s_diag, 0, sizeof(s_diag));
+    if (d.rx_packets == 0 && d.tx_packets == 0 && d.rx_overflows == 0 && d.rx_decode_errors == 0) return;
+
+    ESP_LOGI(TAG, "[LINK] %us: RX %lu pkt / %lu B, decode err %lu, oversized %lu, overflow %lu, line err %lu | "
+                  "slowest handler 0x%02X %lu us | evt drops %lu, max post wait %lu us | "
+                  "TX %lu pkt / %lu B, max write %lu us",
+             (unsigned)(RP2040_LINK_DIAG_PERIOD_MS / 1000),
+             (unsigned long)d.rx_packets, (unsigned long)d.rx_bytes, (unsigned long)d.rx_decode_errors,
+             (unsigned long)d.rx_oversized, (unsigned long)d.rx_overflows, (unsigned long)d.rx_line_errors,
+             d.max_handle_type, (unsigned long)d.max_handle_us,
+             (unsigned long)d.evt_drops, (unsigned long)d.max_evt_wait_us,
+             (unsigned long)d.tx_packets, (unsigned long)d.tx_bytes, (unsigned long)d.max_tx_us);
+}
+#define LINK_DIAG(stmt) do { stmt; } while (0)
+#else
+#define LINK_DIAG(stmt) do { } while (0)
+#endif
+
+/**
+ * @brief Post a view event from the UART task without blocking it indefinitely.
+ * @return true if posted, false if the event loop stayed congested (event dropped).
+ */
+static bool _post_event(int32_t id, const void *data, size_t size, uint32_t timeout_ms) {
+#if RP2040_LINK_DIAG
+    int64_t t0 = esp_timer_get_time();
+#endif
+    esp_err_t err = esp_event_post_to(view_event_handle, VIEW_EVENT_BASE, id, data, size,
+                                      pdMS_TO_TICKS(timeout_ms));
+#if RP2040_LINK_DIAG
+    uint32_t waited = (uint32_t)(esp_timer_get_time() - t0);
+    if (waited > s_diag.max_evt_wait_us) s_diag.max_evt_wait_us = waited;
+    if (err != ESP_OK) s_diag.evt_drops++;
+#endif
+    return err == ESP_OK;
+}
+
 
 /**
  * @brief Thread-safe drop-in replacement for uart_write_bytes.
@@ -66,8 +172,17 @@ static int _uart_write_safe(uart_port_t uart_num, const void *src, size_t size) 
         return uart_write_bytes(uart_num, src, size);
     }
 
+#if RP2040_LINK_DIAG
+    int64_t t0 = esp_timer_get_time();
+#endif
     xSemaphoreTake(s_uart_tx_mutex, portMAX_DELAY);
     int written = uart_write_bytes(uart_num, src, size);
+#if RP2040_LINK_DIAG
+    uint32_t took = (uint32_t)(esp_timer_get_time() - t0);
+    s_diag.tx_packets++;
+    s_diag.tx_bytes += (written > 0) ? (uint32_t)written : 0;
+    if (took > s_diag.max_tx_us) s_diag.max_tx_us = took;
+#endif
     xSemaphoreGive(s_uart_tx_mutex);
 
     return written;
@@ -274,9 +389,8 @@ static bool _packet_handle(uint8_t* p_data, size_t len) {
                     strlcpy(telem_evt.val.str_val, (const char *)&p_data[idx], sizeof(telem_evt.val.str_val));
                 }
 
-                esp_event_post_to(view_event_handle, VIEW_EVENT_BASE,
-                                  VIEW_EVENT_LORA_TELEMETRY, &telem_evt,
-                                  sizeof(telem_evt), portMAX_DELAY);
+                _post_event(VIEW_EVENT_LORA_TELEMETRY, &telem_evt, sizeof(telem_evt),
+                            RP2040_EVT_POST_TIMEOUT_TELEM_MS);
                 return true;
             }
             return true;
@@ -339,9 +453,7 @@ static bool _packet_handle(uint8_t* p_data, size_t len) {
 				snprintf(info.expected_label, sizeof(info.expected_label), 
 						 "SCAP_%02X%02X%02X", mac[3], mac[4], mac[5]);
 
-				esp_event_post_to(view_event_handle, VIEW_EVENT_BASE,
-								  VIEW_EVENT_SD_INFO_RET, &info,
-								  sizeof(info), portMAX_DELAY);
+				_post_event(VIEW_EVENT_SD_INFO_RET, &info, sizeof(info), RP2040_EVT_POST_TIMEOUT_CTRL_MS);
 				return true;
 			}
 			break;
@@ -415,9 +527,7 @@ static bool _packet_handle(uint8_t* p_data, size_t len) {
 		case PKT_TYPE_RES_SD_FORMAT: {
 			if(len >= 2) {
 				bool success = (p_data[1] != 0);
-				esp_event_post_to(view_event_handle, VIEW_EVENT_BASE,
-								  VIEW_EVENT_SD_FORMAT_RET, &success,
-								  sizeof(success), portMAX_DELAY);
+				_post_event(VIEW_EVENT_SD_FORMAT_RET, &success, sizeof(success), RP2040_EVT_POST_TIMEOUT_CTRL_MS);
 				return true;
 			}
 			break;
@@ -430,6 +540,16 @@ static bool _packet_handle(uint8_t* p_data, size_t len) {
 			}
 			break;
 		}
+        case PKT_TYPE_RES_ALARM_SAVE: {
+            if (len >= 3) {
+                /* [1]=chunk_idx, [2]=status; consumed by _alarm_upload_update() in this task */
+                s_upl_ack_chunk = p_data[1];
+                s_upl_ack_ok = (p_data[2] != 0);
+                s_upl_ack_pending = true;
+                return true;
+            }
+            break;
+        }
         case PKT_TYPE_RES_SET_THRESHOLD: {
             if (len >= 2) {
                 s_thresh_req_success = (p_data[1] != 0);
@@ -463,6 +583,33 @@ static bool _packet_handle(uint8_t* p_data, size_t len) {
 	return false;
 }
 
+/**
+ * @brief Drain UART driver events; on an RX overflow flush the input and resync the COBS framer.
+ */
+static void _uart_check_events(size_t *frag_len) {
+    if (!s_uart_evt_queue) return;
+    uart_event_t evt;
+    while (xQueueReceive(s_uart_evt_queue, &evt, 0) == pdTRUE) {
+        switch (evt.type) {
+            case UART_FIFO_OVF:
+            case UART_BUFFER_FULL:
+                LINK_DIAG(s_diag.rx_overflows++);
+                ESP_LOGW(TAG, "UART RX %s: input flushed, packets lost",
+                         evt.type == UART_FIFO_OVF ? "FIFO overflow" : "ring buffer full");
+                uart_flush_input(ESP32_COMM_PORT_NUM);
+                xQueueReset(s_uart_evt_queue);
+                *frag_len = 0;
+                return;
+            case UART_FRAME_ERR:
+            case UART_PARITY_ERR:
+                LINK_DIAG(s_diag.rx_line_errors++);
+                break;
+            default:
+                break;
+        }
+    }
+}
+
 static void esp32_rp2040_comm_task(void* arg) {
     uart_config_t uart_config = {
         .baud_rate = ESP32_COMM_BAUD_RATE,
@@ -474,9 +621,13 @@ static void esp32_rp2040_comm_task(void* arg) {
     };
     int intr_alloc_flags = 0;
 
-    ESP_ERROR_CHECK(
-        uart_driver_install(ESP32_COMM_PORT_NUM, BUF_SIZE * 2, 0, 0, NULL, intr_alloc_flags));
+    /* Installed from this task: the UART ISR runs on the same core (core 1, see esp32_rp2040_init) */
+    ESP_ERROR_CHECK(uart_driver_install(ESP32_COMM_PORT_NUM, BUF_SIZE * 2, 0,
+                                        RP2040_UART_EVT_QUEUE_LEN, &s_uart_evt_queue, intr_alloc_flags));
     ESP_ERROR_CHECK(uart_param_config(ESP32_COMM_PORT_NUM, &uart_config));
+    /* Default RX interrupt at 120 of 128 FIFO bytes leaves only ~87 us at 921600 Bd before the
+     * hardware FIFO overflows; 64 bytes leave ~700 us for interrupt latency */
+    ESP_ERROR_CHECK(uart_set_rx_full_threshold(ESP32_COMM_PORT_NUM, RP2040_UART_RX_FULL_THRESHOLD));
     ESP_ERROR_CHECK(uart_set_pin(ESP32_COMM_PORT_NUM, ESP32_RP2040_TXD, ESP32_RP2040_RXD,
                                  ESP32_RP2040_RTS, ESP32_RP2040_CTS));
 
@@ -486,19 +637,27 @@ static void esp32_rp2040_comm_task(void* arg) {
     rp2040_send_esp_mac();
 
     cobs_decode_result ret;
-    static uint8_t frag[BUF_SIZE] = {0}; /* STATIC: Nimmt 4096 Bytes vom Stack weg! */
+    static uint8_t frag[BUF_SIZE] = {0}; /* STATIC: keeps 2 KB off the task stack */
     size_t frag_len = 0;
 
     while(1)
 	{
+        _uart_check_events(&frag_len);
+
 		int len = uart_read_bytes(ESP32_COMM_PORT_NUM, buf, (BUF_SIZE - 1), pdMS_TO_TICKS(20));
 #if SENSOR_COMM_DEBUG
 		ESP_LOGI(TAG, "len:%d", len);
 #endif
         /* Drive serialized chart query FIFO queue and bucket triggers */
         chart_query_scheduler_update();
+        /* Drive the acknowledged alarm journal upload (one chunk in flight at a time) */
+        _alarm_upload_update();
+#if RP2040_LINK_DIAG
+        _link_diag_periodic();
+#endif
 		if(len > 0)
 		{
+            LINK_DIAG(s_diag.rx_bytes += (uint32_t)len);
 #if SENSOR_COMM_DEBUG
 			printf("recv:  ");
 			for(int i = 0; i < len; i++)
@@ -528,6 +687,7 @@ static void esp32_rp2040_comm_task(void* arg) {
 					{
 						ESP_LOGW(TAG, "drop oversized COBS fragment len=%u",
 								 (unsigned)(frag_len + chunk_len));
+                        LINK_DIAG(s_diag.rx_oversized++);
 						frag_len = 0;
 					}
 					if(frag_len + chunk_len <= sizeof(frag))
@@ -556,8 +716,23 @@ static void esp32_rp2040_comm_task(void* arg) {
 #endif
 						if(ret.status == COBS_DECODE_OK)
 						{
+#if RP2040_LINK_DIAG
+                            int64_t t0 = esp_timer_get_time();
+#endif
 							_packet_handle((uint8_t*)data, ret.out_len);
+#if RP2040_LINK_DIAG
+                            uint32_t took = (uint32_t)(esp_timer_get_time() - t0);
+                            s_diag.rx_packets++;
+                            if (took > s_diag.max_handle_us) {
+                                s_diag.max_handle_us = took;
+                                s_diag.max_handle_type = data[0];
+                            }
+#endif
 						}
+                        else
+                        {
+                            LINK_DIAG(s_diag.rx_decode_errors++);
+                        }
 					}
 					frag_len = 0;
 				}
@@ -593,9 +768,17 @@ void esp32_rp2040_init(void) {
     if (!s_uart_tx_mutex) {
         s_uart_tx_mutex = xSemaphoreCreateMutex();
     }
+    if (!s_upl_mutex) {
+        s_upl_mutex = xSemaphoreCreateMutex();
+    }
     chart_query_scheduler_init();
-    xTaskCreate(esp32_rp2040_comm_task, "esp32_rp2040_comm_task", ESP32_RP2040_COMM_TASK_STACK_SIZE,
-                NULL, 5, NULL);
+    /* Core 1, priority above LVGL (6): the RGB panel's bounce-buffer ISR runs on core 0 and copies
+     * 28.8 KB from PSRAM per interrupt; under render load it delayed the UART ISR long enough to
+     * overflow the 128-byte hardware FIFO. The UART ISR is allocated on the installing task's core.
+     * The task itself only decodes and dispatches (slow work such as the SX1262 init is deferred),
+     * so running above LVGL costs the renderer very little and reception never waits for a frame. */
+    xTaskCreatePinnedToCore(esp32_rp2040_comm_task, "esp32_rp2040_comm_task", ESP32_RP2040_COMM_TASK_STACK_SIZE,
+                            NULL, 7, NULL, 1);
     ESP_ERROR_CHECK(esp_event_handler_instance_register_with(view_event_handle, VIEW_EVENT_BASE,
                                                              VIEW_EVENT_SHUTDOWN,
                                                              _commu_event_handler, NULL, NULL));
@@ -753,7 +936,7 @@ int rp2040_alarm_rearm(void) {
     return -1;
 }
 
-int rp2040_alarm_send_save_chunk(uint8_t chunk_idx, uint8_t total_chunks, uint8_t count, const void *entries) {
+static int _alarm_send_save_chunk(uint8_t chunk_idx, uint8_t total_chunks, uint8_t count, const void *entries) {
     if (!entries && count > 0) return -1;
 
     size_t payload_len = 4 + (count * sizeof(alarm_entry_t));
@@ -778,6 +961,121 @@ int rp2040_alarm_send_save_chunk(uint8_t chunk_idx, uint8_t total_chunks, uint8_
 
     ESP_LOGE(TAG, "COBS encode failed for alarm save chunk %u/%u", chunk_idx + 1, total_chunks);
     return -1;
+}
+
+/* ── Acknowledged alarm journal upload ─────────────────────────────────── */
+
+int rp2040_alarm_upload_start(void *entries, uint16_t count, rp2040_alarm_upload_done_cb_t done_cb) {
+    if (!s_upl_mutex || (count > 0 && !entries)) return -1;
+
+    xSemaphoreTake(s_upl_mutex, portMAX_DELAY);
+    if (s_upl.active) {
+        xSemaphoreGive(s_upl_mutex);
+        return -1;
+    }
+    uint16_t chunks = (count + RP2040_ALARM_SAVE_ENTRIES_PER_CHUNK - 1) / RP2040_ALARM_SAVE_ENTRIES_PER_CHUNK;
+    s_upl.active = true;
+    s_upl.entries = (alarm_entry_t *)entries;
+    s_upl.count = count;
+    s_upl.total_chunks = (chunks == 0) ? 1 : (uint8_t)chunks; /* empty journal: one chunk with 0 entries */
+    s_upl.next_chunk = 0;
+    s_upl.awaiting_ack = false;
+    s_upl.sent_ms = 0;
+    s_upl.attempt = 1;
+    s_upl.done_cb = done_cb;
+    xSemaphoreGive(s_upl_mutex);
+
+    ESP_LOGI(TAG, "Alarm journal upload started: %u entries in %u chunks", count, s_upl.total_chunks);
+    return 0;
+}
+
+bool rp2040_alarm_upload_busy(void) {
+    return s_upl.active;
+}
+
+/**
+ * @brief Advance the upload by at most one chunk. Runs in the UART task (acks arrive there too).
+ */
+static void _alarm_upload_update(void) {
+    if (!s_upl_mutex) return;
+
+    xSemaphoreTake(s_upl_mutex, portMAX_DELAY);
+    if (!s_upl.active) {
+        xSemaphoreGive(s_upl_mutex);
+        return;
+    }
+
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    bool finished = false;
+    bool attempt_failed = false;
+
+    if (s_upl.awaiting_ack) {
+        uint8_t expected = (uint8_t)(s_upl.next_chunk - 1);
+        if (s_upl_ack_pending) {
+            s_upl_ack_pending = false;
+            if (s_upl_ack_chunk == expected) {
+                if (s_upl_ack_ok) {
+                    s_upl.awaiting_ack = false;
+                    finished = (s_upl.next_chunk >= s_upl.total_chunks);
+                } else {
+                    ESP_LOGW(TAG, "Alarm journal chunk %u rejected by RP2040", expected);
+                    attempt_failed = true;
+                }
+            }
+            /* Ack for another chunk: stale answer of an aborted attempt, ignore */
+        } else if (now_ms - s_upl.sent_ms >= RP2040_ALARM_SAVE_ACK_TIMEOUT_MS) {
+            ESP_LOGW(TAG, "Alarm journal chunk %u not acknowledged within %u ms",
+                     expected, (unsigned)RP2040_ALARM_SAVE_ACK_TIMEOUT_MS);
+            attempt_failed = true;
+        }
+    }
+
+    bool failed = false;
+    if (attempt_failed) {
+        if (s_upl.attempt < RP2040_ALARM_SAVE_MAX_ATTEMPTS) {
+            s_upl.attempt++;
+            s_upl.next_chunk = 0;      /* RP2040 restarts the staged file on chunk 0 */
+            s_upl.awaiting_ack = false;
+            ESP_LOGW(TAG, "Restarting alarm journal upload (attempt %u of %u)",
+                     s_upl.attempt, (unsigned)RP2040_ALARM_SAVE_MAX_ATTEMPTS);
+        } else {
+            failed = true;
+        }
+    }
+
+    if (!finished && !failed && !s_upl.awaiting_ack) {
+        uint16_t first = (uint16_t)s_upl.next_chunk * RP2040_ALARM_SAVE_ENTRIES_PER_CHUNK;
+        uint16_t remaining = (s_upl.count > first) ? (uint16_t)(s_upl.count - first) : 0;
+        uint8_t n = (remaining < RP2040_ALARM_SAVE_ENTRIES_PER_CHUNK) ? (uint8_t)remaining
+                                                                      : RP2040_ALARM_SAVE_ENTRIES_PER_CHUNK;
+        if (s_upl.next_chunk == 0) s_upl_ack_pending = false;
+
+        if (_alarm_send_save_chunk(s_upl.next_chunk, s_upl.total_chunks, n,
+                                   n ? (const void *)&s_upl.entries[first] : NULL) > 0) {
+            s_upl.next_chunk++;
+            s_upl.awaiting_ack = true;
+            s_upl.sent_ms = now_ms;
+        } else {
+            ESP_LOGE(TAG, "Alarm journal chunk %u could not be sent", s_upl.next_chunk);
+            failed = true;
+        }
+    }
+
+    rp2040_alarm_upload_done_cb_t cb = NULL;
+    if (finished || failed) {
+        free(s_upl.entries);
+        s_upl.entries = NULL;
+        s_upl.active = false;
+        cb = s_upl.done_cb;
+        if (finished) {
+            ESP_LOGI(TAG, "Alarm journal upload complete (%u entries)", s_upl.count);
+        } else {
+            ESP_LOGE(TAG, "Alarm journal upload failed after %u attempts", s_upl.attempt);
+        }
+    }
+    xSemaphoreGive(s_upl_mutex);
+
+    if (cb) cb(finished);
 }
 
 int rp2040_alarm_request_load(void) {

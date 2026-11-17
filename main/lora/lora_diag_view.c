@@ -272,6 +272,7 @@ static void lora_diag_create_modal(void) {
 
     lv_obj_set_style_bg_color(s_diag_modal, lv_color_hex(0x101418), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_bg_opa(s_diag_modal, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(s_diag_modal, 0, LV_PART_MAIN); /* full screen: square corners, lets lv_port skip the page underneath */
     lv_obj_set_style_border_width(s_diag_modal, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_pad_all(s_diag_modal, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_add_flag(s_diag_modal, LV_OBJ_FLAG_HIDDEN);

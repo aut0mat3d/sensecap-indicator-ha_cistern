@@ -7,7 +7,7 @@
 ```
 RP2040 Core 1: SD_CHECK ─► LOAD_CFG: lorasensors_load_all() + data_storage_load_devices()
    ├─ 0x35 PUSH_LORA_CFG  (globals, RF, mesh, device count)   ─► ESP32 lora_model_on_rp2040_cfg_received()
-   └─ 0x3F PUSH_LORA_DEV  (one device per packet, 15 ms pacing) ─► ESP32 lora_model_on_rp2040_device_received()
+   └─ 0x3F PUSH_LORA_DEV  (one device per packet, ≥ 15 ms apart, only when the link queue has room) ─► ESP32 lora_model_on_rp2040_device_received()
 ESP32 → 0x3D GET_TIME → RP2040 → 0x3E RES_TIME (last saved UTC, offline clock recovery)
 ESP32 → 0x37 SET_TIME_CFG (POSIX TZ) / 0x3A SYNC_TIME (after NTP or P2P time)
 ```
@@ -45,6 +45,31 @@ scheduler (bucket boundary crossed) ─► 0x3B GET_CHART_DATA ─► RP2040 dat
 RP2040 ─► 0x3C RES_CHART_DATA (req_id, status, step, count, chart_data_point_t[]) ─► chart callback ─► widget
 ```
 `cistern_view.c` subscribes 3 zones for `depth`: 7 × 86400 s, 12 × 7200 s, 11 × 300 s (zone 3 = live value).
+Only one query is in flight at a time; after each answer the scheduler waits `CHART_QUERY_GAP_MS` (100 ms) before the next one, so pages with many charts fill gradually instead of in one burst.
+
+## 5a. Link flow control (both directions)
+
+Rule: a page may take longer to fill, but neither MCU may stall. No side sends large blobs at once, no side blocks while holding a shared lock.
+
+**RP2040 → ESP32** (`rp2040/src/uart_link.cpp`)
+* Every packet goes through `uart_link_send()` into a 6 KB ring buffer (both cores). Only core 1 transmits, in `uart_link_process()`.
+* Pacing: after a packet of *n* bytes the next one waits `max(2 ms, n / 32 B/ms)` (≈ 32 KB/s, about a third of the line rate). A 40 B telemetry packet is followed by 2 ms of silence, a 1 KB file packet by 32 ms.
+* Large or many packets are produced incrementally: the alarm history stream sends one entry per loop pass when `uart_link_can_send()` allows it (no `delay()`), device configs (`0x3F`) are streamed only when the whole chunk fits.
+* Maximum packet size `UART_LINK_MAX_PACKET` = 1536 B (below the 2048 B receive buffers on both sides; checked at compile time for `0x3F`).
+
+**ESP32 → RP2040**
+* The alarm journal is uploaded by the UART task as acknowledged chunks of 4 entries: chunk *k+1* is sent only after `0xAC RES_ALARM_SAVE` for chunk *k* (the RP2040 writes each chunk to SD first). Missing or negative acks restart the upload from chunk 0 (3 attempts), then the journal stays dirty and is retried later.
+* Chart queries: one in flight (see above). Threshold / offset writes: one request, waiting for its response.
+
+**ESP32 receive path** (`main/rp2040/rp2040.c`)
+* The UART task (and with it the UART ISR) is pinned to core 1 at priority 7, above LVGL (6): the RGB bounce-buffer ISR on core 0 copies 28.8 KB from PSRAM per interrupt and starved the UART ISR under render load. The RX FIFO interrupt fires at 64 of 128 bytes (default 120 left only ~87 µs). Slow work is deferred out of the task (the SX1262 init for `0x35` runs in the LoRa task). The task never takes the LVGL lock: views pick up model changes with LVGL timers (`alarm_view_notify_change()`, `gui_header_set_alarm_state()` only set flags).
+* Events are posted with a timeout (telemetry 50 ms, control events 500 ms) instead of `portMAX_DELAY`; when the event loop (queue 32) stays congested, telemetry is dropped and counted rather than stalling reception.
+* UART driver events are monitored: on a FIFO / ring buffer overflow the input is flushed, the COBS framer resynchronized and a warning logged.
+
+**Diagnostics** (switchable): `UART_LINK_DIAG` (`rp2040/src/uart_link.hpp`), `RP2040_LINK_DIAG` (`main/rp2040/rp2040.h`), `LV_PORT_RENDER_DIAG` (`main/lv_port.h`). Every 30 s, only when there was traffic:
+* RP2040 `[LINK]`: TX packets/bytes, drops, queue high-water mark, RX packets/bytes, overflows, slowest packet handler.
+* ESP32 `[LINK]`: RX packets/bytes, decode errors, oversized fragments, overflows, line errors, slowest handler, event drops and longest post wait, TX packets/bytes, longest blocking write.
+* ESP32 `[RENDER]`: rendered frames, average and maximum render time.
 
 ## 6. UART packet table (complete)
 
@@ -80,9 +105,10 @@ RP2040 ─► 0x3C RES_CHART_DATA (req_id, status, step, count, chart_data_point
 | `0xA6` | CMD_ALARM_SET | E→R | tON_ms(2) + tOFF_ms(2) |
 | `0xA7` | CMD_ALARM_MUTE | E→R | mute_sec(4), 0 = indefinite |
 | `0xA8` | CMD_ALARM_REARM | E→R | – |
-| `0xA9` | CMD_ALARM_SAVE | E→R | chunk_idx, total, count, entries[] |
+| `0xA9` | CMD_ALARM_SAVE | E→R | chunk_idx, total, count (≤ 4), entries[]; next chunk only after `0xAC` |
 | `0xAA` | CMD_ALARM_LOAD | E→R | – |
-| `0xAB` | RES_ALARM_LOAD | R→E | chunk_idx, total, count, entries[] |
+| `0xAB` | RES_ALARM_LOAD | R→E | chunk_idx, total, count, entries[] (one entry per packet, paced) |
+| `0xAC` | RES_ALARM_SAVE | R→E | chunk_idx, status (1 = written to SD); ack per `0xA9` chunk, flow control |
 | `0xBB` | LORA_TELEMETRY | R→E | DevAddr, FCnt, type, context, key, unit, value |
 | `0xBC` | LOCAL_TELEMETRY | R→E | onboard/Grove sensors |
 

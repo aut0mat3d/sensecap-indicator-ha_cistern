@@ -20,6 +20,9 @@ extern "C" {
 #define CHART_SCHEDULER_MAX_SUBSCRIPTIONS  64
 #define CHART_SCHEDULER_QUEUE_SIZE        16
 #define CHART_QUERY_TIMEOUT_MS            2500
+/* Pause after a finished query before the next one is dispatched: the widget can consume and
+ * draw its data before the next response arrives (pages with many charts load gradually) */
+#define CHART_QUERY_GAP_MS                100
 #define CHART_SUB_MAX_POINTS              32
 
 /**

@@ -103,7 +103,8 @@ typedef struct {
     void       *user_data;         ///< Context pointer passed to click callback
 
     /* LVGL internal widget references */
-    lv_obj_t   *row_btn;           ///< Clickable row container
+    lv_obj_t   *row_btn;           ///< Row container (not clickable: dragging on it scrolls the list)
+    lv_obj_t   *edit_btn;          ///< Clickable value + edit icon area on the right
     lv_obj_t   *lbl_label;         ///< Left label object
     lv_obj_t   *lbl_value;         ///< Value text object
     lv_obj_t   *lbl_icon;          ///< Edit symbol object

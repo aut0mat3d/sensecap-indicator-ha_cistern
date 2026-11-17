@@ -149,8 +149,6 @@ static void _threshold_apply_runtime_fn(uint32_t dev_addr, const config_group_da
     lora_device_config_t *dev = lora_model_get_device_by_addr(dev_addr);
     if (!dev) return;
 
-    float max_depth_cm = dev->geometry.max_depth_cm;
-
     for (size_t g = 0; g < count; g++) {
         const config_group_data_t *grp = &groups[g];
 
@@ -182,13 +180,9 @@ static void _threshold_apply_runtime_fn(uint32_t dev_addr, const config_group_da
                 else if (strcasecmp(grp->fields[4].enum_val, "off") == 0) dev->thresholds[t].buzzer_mode = 2;
                 else dev->thresholds[t].buzzer_mode = 0;
 
-                /* Compute physical value for background evaluator */
-                float eval_val = dev->thresholds[t].threshold_val;
-                float eval_hyst = dev->thresholds[t].hysteresis_val;
-                if (dev->thresholds[t].is_percent && max_depth_cm > 0.0f) {
-                    eval_val = (dev->thresholds[t].threshold_val / 100.0f) * max_depth_cm;
-                    eval_hyst = (dev->thresholds[t].hysteresis_val / 100.0f) * max_depth_cm;
-                }
+                /* Compute physical value for background evaluator (same reference range as at boot) */
+                float eval_val, eval_hyst;
+                lora_model_resolve_threshold(dev, &dev->thresholds[t], &eval_val, &eval_hyst);
 
                 /* Register updated rule in live alarm evaluator */
                 alarm_eval_rule_t rule = {

@@ -92,18 +92,13 @@ static bool cistern_resolve_depth_config(float *out_min, float *out_max,
         max_val = dev->geometry.max_depth_cm;
     }
 
-    /* 2. Resolve depth thresholds (low / high) relative to resolved limit range */
-    float span = max_val - min_val;
+    /* 2. Resolve depth thresholds (low / high) exactly like the alarm evaluator does */
     for (uint8_t t = 0; t < dev->threshold_count; t++) {
         const lora_threshold_config_t *th = &dev->thresholds[t];
         if (!th->valid || strcmp(th->key, CISTERN_KEY_DEPTH) != 0) continue;
 
-        float eval_val  = th->threshold_val;
-        float eval_hyst = th->hysteresis_val;
-        if (th->is_percent && span > 0.0f) {
-            eval_val  = min_val + (th->threshold_val / 100.0f) * span;
-            eval_hyst = (th->hysteresis_val / 100.0f) * span;
-        }
+        float eval_val, eval_hyst;
+        lora_model_resolve_threshold(dev, th, &eval_val, &eval_hyst);
 
         if (th->op == 0) { /* THRESHOLD_OP_LESS_THAN (falling / low level) */
             alarm_min = eval_val;

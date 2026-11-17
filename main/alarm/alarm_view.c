@@ -41,6 +41,11 @@ static alarm_sort_mode_t s_current_sort_mode = ALARM_SORT_BY_TIME_DESC;
 static alarm_filter_t    s_current_filter = ALARM_FILTER_ALL;
 static int               s_current_state_filter = 0; /* 0=All, 1=Active, 2=Ack, 3=Going */
 
+/* Deferred list refresh (see alarm_view_notify_change) */
+#define ALARM_VIEW_REFRESH_PERIOD_MS 200
+static bool        s_list_dirty = false;
+static lv_timer_t *s_list_refresh_timer = NULL;
+
 void alarm_view_hide(void);
 
 /* ── Color & Severity Helpers ───────────────────────────────────────────── */
@@ -389,6 +394,7 @@ static void _create_alarm_modal(void) {
 
     lv_obj_set_style_bg_color(s_alarm_modal, lv_color_hex(0x101418), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(s_alarm_modal, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(s_alarm_modal, 0, LV_PART_MAIN); /* full screen: square corners, lets lv_port skip the page underneath */
     lv_obj_set_style_border_width(s_alarm_modal, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(s_alarm_modal, 0, LV_PART_MAIN);
 
@@ -604,18 +610,27 @@ void alarm_view_handle_hw_button(void) {
     lv_port_sem_give();
 }
 
+/* Journal changes are flagged from any task and picked up here (LVGL task, lock held) */
+static void _list_refresh_timer_cb(lv_timer_t *timer) {
+    (void)timer;
+    if (!__atomic_exchange_n(&s_list_dirty, false, __ATOMIC_ACQ_REL)) return;
+    if (s_alarm_modal && !lv_obj_has_flag(s_alarm_modal, LV_OBJ_FLAG_HIDDEN)) {
+        alarm_view_update_list();
+    }
+}
+
 int alarm_view_init(void) {
     lv_port_sem_take();
     _create_alarm_modal();
+    if (!s_list_refresh_timer) {
+        s_list_refresh_timer = lv_timer_create(_list_refresh_timer_cb, ALARM_VIEW_REFRESH_PERIOD_MS, NULL);
+    }
     lv_port_sem_give();
     ESP_LOGI(TAG, "Modal Alarm View initialized on lv_layer_top");
     return 0;
 }
 
 void alarm_view_notify_change(void) {
-    lv_port_sem_take();
-    if (s_alarm_modal && !lv_obj_has_flag(s_alarm_modal, LV_OBJ_FLAG_HIDDEN)) {
-        alarm_view_update_list();
-    }
-    lv_port_sem_give();
+    /* Never takes the LVGL lock: callable from the UART task, event loop and timers */
+    __atomic_store_n(&s_list_dirty, true, __ATOMIC_RELEASE);
 }

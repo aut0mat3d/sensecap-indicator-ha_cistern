@@ -13,6 +13,7 @@
 #include "debug_log.h"
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 #include "rp2040.h"
 #include "mbedtls/aes.h"
 #include "mbedtls/cmac.h"
@@ -27,6 +28,10 @@ static lora_global_config_t g_rf_cfg;
 static lora_device_config_t g_devices[MAX_LORA_DEVICES];
 static uint8_t              g_device_count = 0;
 static bool                 g_radio_active = false;
+/* Radio (re)configuration requested by the UART task (0x35), applied by the LoRa task:
+ * the SX1262 init takes ~250 ms (reset, calibration, TCXO start-up) and must neither block
+ * UART reception nor touch the radio from a second task */
+static volatile bool        s_rf_apply_pending = false;
 
 static lora_dup_entry_t     s_dup_cache[DUP_CACHE_SIZE];
 static uint8_t              s_dup_idx = 0;
@@ -907,7 +912,8 @@ void lora_model_on_rp2040_cfg_received(const uint8_t *buf, size_t len) {
     memset(g_devices, 0, sizeof(g_devices));
     alarm_evaluator_clear_rules();
 
-    lora_model_apply_rf_config();
+    /* Applied by lora_model_update() in the LoRa task */
+    s_rf_apply_pending = true;
 
     /* Apply POSIX Timezone received from SD card globals.json */
     if (strlen(g_rf_cfg.time_cfg.posix_timezone) > 0) {
@@ -965,22 +971,8 @@ void lora_model_on_rp2040_device_received(const uint8_t *buf, size_t len) {
         if (!th->valid) continue;
 
         /* If threshold is percentage-based, calculate physical value for live background evaluation */
-        float eval_val = th->threshold_val;
-        float eval_hyst = th->hysteresis_val;
-        if (th->is_percent) {
-            float ref_min = 0.0f;
-            float ref_max = (dev->geometry.max_depth_cm > 0.0f) ? dev->geometry.max_depth_cm : 100.0f;
-            for (uint8_t l = 0; l < dev->limit_count; l++) {
-                if (dev->limits[l].valid && strcmp(dev->limits[l].key, th->key) == 0) {
-                    ref_min = dev->limits[l].val_min;
-                    ref_max = dev->limits[l].val_max;
-                    break;
-                }
-            }
-            float span = ref_max - ref_min;
-            eval_val = ref_min + (th->threshold_val / 100.0f) * span;
-            eval_hyst = (th->hysteresis_val / 100.0f) * span;
-        }
+        float eval_val, eval_hyst;
+        lora_model_resolve_threshold(dev, th, &eval_val, &eval_hyst);
 
         alarm_eval_rule_t rule = {
             .dev_addr = dev->dev_addr,
@@ -1001,6 +993,11 @@ void lora_model_on_rp2040_device_received(const uint8_t *buf, size_t len) {
 
 void lora_model_update(void) {
     uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+
+    if (s_rf_apply_pending) {
+        s_rf_apply_pending = false;
+        lora_model_apply_rf_config();
+    }
 
     if (g_radio_active) {
         /* Direct SX1262 Hardware IRQ Register Inspection (Raw RF Diagnostic) */
@@ -1198,4 +1195,31 @@ lora_device_config_t* lora_model_get_device_by_addr(uint32_t dev_addr) {
         }
     }
     return NULL;
+}
+
+void lora_model_resolve_threshold(const lora_device_config_t *dev, const lora_threshold_config_t *th,
+                                  float *out_val, float *out_hyst) {
+    if (!dev || !th) return;
+
+    float val = th->threshold_val;
+    float hyst = th->hysteresis_val;
+
+    if (th->is_percent) {
+        /* Reference range: limits[key], else tank depth, else 0..100 */
+        float ref_min = 0.0f;
+        float ref_max = (dev->geometry.max_depth_cm > 0.0f) ? dev->geometry.max_depth_cm : 100.0f;
+        for (uint8_t l = 0; l < dev->limit_count; l++) {
+            if (dev->limits[l].valid && strcmp(dev->limits[l].key, th->key) == 0) {
+                ref_min = dev->limits[l].val_min;
+                ref_max = dev->limits[l].val_max;
+                break;
+            }
+        }
+        float span = ref_max - ref_min;
+        val = ref_min + (th->threshold_val / 100.0f) * span;
+        hyst = (th->hysteresis_val / 100.0f) * span;
+    }
+
+    if (out_val) *out_val = val;
+    if (out_hyst) *out_hyst = fabsf(hyst);
 }

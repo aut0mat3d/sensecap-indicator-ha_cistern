@@ -193,6 +193,21 @@ const lora_device_status_t* lora_model_get_device_status(size_t index);
 lora_device_config_t* lora_model_get_device_by_addr(uint32_t dev_addr);
 
 /**
+ * @brief Resolve a threshold to physical units (single source of truth for percent thresholds).
+ *
+ * Absolute thresholds are returned unchanged. Percent thresholds are resolved against the
+ * reference range of the threshold's key: limits[key] (val_min..val_max), else
+ * 0..geometry.max_depth_cm, else 0..100.
+ *
+ * @param dev      Device owning the threshold.
+ * @param th       Threshold to resolve.
+ * @param out_val  Physical threshold value.
+ * @param out_hyst Physical hysteresis (always >= 0).
+ */
+void lora_model_resolve_threshold(const lora_device_config_t *dev, const lora_threshold_config_t *th,
+                                  float *out_val, float *out_hyst);
+
+/**
  * @brief Get total active P2P mesh peers.
  */
 size_t lora_model_get_peer_count(void);

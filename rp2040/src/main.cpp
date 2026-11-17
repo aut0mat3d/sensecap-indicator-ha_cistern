@@ -23,6 +23,7 @@
  */
 
 #include "indicator_rp2040.hpp"
+#include "uart_link.hpp"
 #include "sdcard.hpp"
 #include "lorasensors.hpp"
 #include "data_storage.hpp"
@@ -107,12 +108,193 @@ static bool is_valid_alarm_entry(const alarm_entry_t *entry) {
     return true;
 }
 
+/* ── Alarm history persistence (SD partition 1) ─────────────────────────── */
+
+/* Staged upload state of /alarm_history.tmp (one upload at a time, chunk by chunk) */
+static bool     s_save_active = false;
+static uint8_t  s_save_expected_chunk = 0;
+static uint8_t  s_save_total_chunks = 0;
+static uint16_t s_staged_entries = 0;
+
+/**
+ * @brief Validate and stage one CMD_ALARM_SAVE chunk; commits the file on the last chunk.
+ * @return true if the chunk was accepted (the ESP32 sends the next chunk only after this ack).
+ */
+static bool alarm_save_chunk(const uint8_t* buffer, size_t size) {
+    if (size < 4) return false;
+
+    uint8_t chunk_idx    = buffer[1];
+    uint8_t total_chunks = buffer[2];
+    uint8_t count        = buffer[3];
+    size_t payload_len   = size - 4;
+
+    /* Check 1: Verify exact byte payload length matches entry size */
+    size_t expected_len = (size_t)count * sizeof(alarm_entry_t);
+    if (payload_len != expected_len) {
+        LogSerial.printf("RP2040: Alarm save chunk %u REJECTED (payload len %u != expected %u)\r\n",
+                      chunk_idx, (unsigned)payload_len, (unsigned)expected_len);
+        if (s_save_active) {
+            sd_card_get_fs().remove("/alarm_history.tmp");
+            s_save_active = false;
+        }
+        return false;
+    }
+
+    /* Check 2: Semantic validation of every entry inside this chunk */
+    const alarm_entry_t* incoming_entries = reinterpret_cast<const alarm_entry_t*>(&buffer[4]);
+    bool chunk_valid = true;
+    for (uint8_t i = 0; i < count; i++) {
+        if (!is_valid_alarm_entry(&incoming_entries[i])) {
+            LogSerial.printf("RP2040: Alarm save chunk %u entry %u REJECTED (corrupt fields)\r\n", chunk_idx, i);
+            chunk_valid = false;
+            break;
+        }
+    }
+    if (!chunk_valid) {
+        if (s_save_active) {
+            sd_card_get_fs().remove("/alarm_history.tmp");
+            s_save_active = false;
+        }
+        return false;
+    }
+
+    /* Check 3: Strictly enforce chunk sequence */
+    if (chunk_idx == 0) {
+        s_save_active = true;
+        s_save_expected_chunk = 1;
+        s_save_total_chunks = total_chunks;
+        s_staged_entries = count;
+
+        File32 f = sd_card_get_fs().open("/alarm_history.tmp", O_WRITE | O_CREAT | O_TRUNC);
+        if (f) {
+            uint16_t entry_sz = sizeof(alarm_entry_t);
+            uint16_t dummy_total = 0;
+            f.write(reinterpret_cast<const uint8_t*>(&entry_sz), 2);
+            f.write(reinterpret_cast<const uint8_t*>(&dummy_total), 2);
+            if (payload_len > 0) {
+                f.write(&buffer[4], payload_len);
+            }
+            f.close();
+        } else {
+            s_save_active = false;
+            LogSerial.printf("RP2040: Failed to create /alarm_history.tmp\r\n");
+            return false;
+        }
+    } else {
+        if (!s_save_active || chunk_idx != s_save_expected_chunk || total_chunks != s_save_total_chunks) {
+            LogSerial.printf("RP2040: Alarm save aborted: sequence mismatch (expected %u of %u, got %u of %u)\r\n",
+                          s_save_expected_chunk, s_save_total_chunks, chunk_idx, total_chunks);
+            if (s_save_active) {
+                sd_card_get_fs().remove("/alarm_history.tmp");
+                s_save_active = false;
+            }
+            return false;
+        }
+
+        File32 f = sd_card_get_fs().open("/alarm_history.tmp", O_WRITE | O_APPEND);
+        if (f) {
+            if (payload_len > 0) {
+                f.write(&buffer[4], payload_len);
+            }
+            f.close();
+            s_staged_entries += count;
+            s_save_expected_chunk++;
+        } else {
+            sd_card_get_fs().remove("/alarm_history.tmp");
+            s_save_active = false;
+            return false;
+        }
+    }
+
+    /* Final chunk: finalize total count and atomically commit file to SD */
+    if (chunk_idx + 1 >= total_chunks && s_save_active) {
+        File32 f = sd_card_get_fs().open("/alarm_history.tmp", O_RDWR);
+        if (f) {
+            f.seek(2);
+            f.write(reinterpret_cast<const uint8_t*>(&s_staged_entries), 2);
+            f.close();
+
+            sd_card_get_fs().remove("/alarm_history.bin");
+            sd_card_get_fs().rename("/alarm_history.tmp", "/alarm_history.bin");
+            LogSerial.printf("RP2040: Atomically saved verified alarm history (%u entries, %u B each)\r\n",
+                          s_staged_entries, (unsigned)sizeof(alarm_entry_t));
+        } else {
+            s_save_active = false;
+            LogSerial.printf("RP2040: Failed to finalize /alarm_history.tmp\r\n");
+            return false;
+        }
+        s_save_active = false;
+    }
+    return true;
+}
+
+/* Non-blocking alarm history streamer for CMD_ALARM_LOAD (driven by loop1) */
+static File32   s_alarm_stream_file;
+static bool     s_alarm_stream_active = false;
+static uint16_t s_alarm_stream_total = 0;
+static uint16_t s_alarm_stream_sent = 0;
+
+static void alarm_stream_stop(void) {
+    if (s_alarm_stream_file) s_alarm_stream_file.close();
+    s_alarm_stream_active = false;
+}
+
+/**
+ * @brief Start streaming the validated entries of /alarm_history.bin (a running stream restarts).
+ */
+static void alarm_stream_start(uint16_t total) {
+    alarm_stream_stop();
+    if (total > 255) total = 255; /* total_chunks is 8 bit (journal holds 50 entries) */
+
+    s_alarm_stream_file = sd_card_get_fs().open("/alarm_history.bin", O_READ);
+    if (!s_alarm_stream_file || !s_alarm_stream_file.seek(4)) {
+        LogSerial.printf("RP2040: Alarm history streaming failed: cannot reopen file\r\n");
+        alarm_stream_stop();
+        return;
+    }
+    s_alarm_stream_total = total;
+    s_alarm_stream_sent = 0;
+    s_alarm_stream_active = true;
+    LogSerial.printf("RP2040: Streaming %u verified alarms to ESP32...\r\n", total);
+}
+
+/**
+ * @brief Send the next history entry if the link queue has room. Call with g_comm_mutex held (SD access).
+ */
+static void alarm_stream_step(void) {
+    if (!s_alarm_stream_active) return;
+
+    const size_t pkt_len = 4 + sizeof(alarm_entry_t);
+    if (!uart_link_can_send(pkt_len)) return;
+
+    alarm_entry_t entry;
+    do {
+        if (s_alarm_stream_file.read(&entry, sizeof(entry)) != (int)sizeof(entry)) {
+            LogSerial.printf("RP2040: Alarm history streaming aborted after %u of %u entries (read error)\r\n",
+                             s_alarm_stream_sent, s_alarm_stream_total);
+            alarm_stream_stop();
+            return;
+        }
+    } while (!is_valid_alarm_entry(&entry));
+
+    uint8_t res_buf[4 + sizeof(alarm_entry_t)];
+    res_buf[0] = static_cast<uint8_t>(PKT_TYPE_RES_ALARM_LOAD);
+    res_buf[1] = static_cast<uint8_t>(s_alarm_stream_sent);
+    res_buf[2] = static_cast<uint8_t>(s_alarm_stream_total);
+    res_buf[3] = 1;
+    memcpy(&res_buf[4], &entry, sizeof(entry));
+    uart_link_send(res_buf, pkt_len);
+
+    if (++s_alarm_stream_sent >= s_alarm_stream_total) {
+        LogSerial.printf("RP2040: Alarm history streaming complete.\r\n");
+        alarm_stream_stop();
+    }
+}
+
 /* ── Core 1 UART Packet Handler ────────────────────────────────────────── */
 
-void onPacketReceived(const uint8_t* buffer, size_t size)
+static void handle_packet(const uint8_t* buffer, size_t size)
 {
-    if (size < 1) return;
-
     /* Lock communication, virtual decoder and shared memory during packet processing */
     mutex_enter_blocking(&g_comm_mutex);
 
@@ -158,7 +340,7 @@ void onPacketReceived(const uint8_t* buffer, size_t size)
             uint8_t res_buf[5];
             res_buf[0] = static_cast<uint8_t>(PKT_TYPE_RES_TIME);
             memcpy(&res_buf[1], &last_ts, sizeof(last_ts));
-            packetSerial.send(res_buf, sizeof(res_buf));
+            uart_link_send(res_buf, sizeof(res_buf));
             LogSerial.printf("RP2040: Sent stored LittleFS time (%lu) to ESP32\r\n", (unsigned long)last_ts);
             break;
         }
@@ -200,117 +382,13 @@ void onPacketReceived(const uint8_t* buffer, size_t size)
             break;
 
         case PKT_TYPE_CMD_ALARM_SAVE: {
-            /* Payload structure from ESP32:
-             * [1]: chunk_idx (uint8_t)
-             * [2]: total_chunks (uint8_t)
-             * [3]: count (uint8_t)
-             * [4..]: raw alarm entries (count * sizeof(alarm_entry_t))
-             */
-            if (size < 4) break;
-
-            uint8_t chunk_idx    = buffer[1];
-            uint8_t total_chunks = buffer[2];
-            uint8_t count        = buffer[3];
-            size_t payload_len   = size - 4;
-
-            static bool     s_save_active = false;
-            static uint8_t  s_save_expected_chunk = 0;
-            static uint8_t  s_save_total_chunks = 0;
-            static uint16_t s_staged_entries = 0;
-
-            /* Check 1: Verify exact byte payload length matches entry size */
-            size_t expected_len = (size_t)count * sizeof(alarm_entry_t);
-            if (payload_len != expected_len) {
-                LogSerial.printf("RP2040: Alarm save chunk %u REJECTED (payload len %u != expected %u)\r\n",
-                              chunk_idx, (unsigned)payload_len, (unsigned)expected_len);
-                if (s_save_active) {
-                    sd_card_get_fs().remove("/alarm_history.tmp");
-                    s_save_active = false;
-                }
-                break;
-            }
-
-            /* Check 2: Semantic validation of every entry inside this chunk */
-            const alarm_entry_t* incoming_entries = reinterpret_cast<const alarm_entry_t*>(&buffer[4]);
-            bool chunk_valid = true;
-            for (uint8_t i = 0; i < count; i++) {
-                if (!is_valid_alarm_entry(&incoming_entries[i])) {
-                    LogSerial.printf("RP2040: Alarm save chunk %u entry %u REJECTED (corrupt fields)\r\n", chunk_idx, i);
-                    chunk_valid = false;
-                    break;
-                }
-            }
-            if (!chunk_valid) {
-                if (s_save_active) {
-                    sd_card_get_fs().remove("/alarm_history.tmp");
-                    s_save_active = false;
-                }
-                break;
-            }
-
-            /* Check 3: Strictly enforce chunk sequence */
-            if (chunk_idx == 0) {
-                s_save_active = true;
-                s_save_expected_chunk = 1;
-                s_save_total_chunks = total_chunks;
-                s_staged_entries = count;
-
-                File32 f = sd_card_get_fs().open("/alarm_history.tmp", O_WRITE | O_CREAT | O_TRUNC);
-                if (f) {
-                    uint16_t entry_sz = sizeof(alarm_entry_t);
-                    uint16_t dummy_total = 0;
-                    f.write(reinterpret_cast<const uint8_t*>(&entry_sz), 2);
-                    f.write(reinterpret_cast<const uint8_t*>(&dummy_total), 2);
-                    if (payload_len > 0) {
-                        f.write(&buffer[4], payload_len);
-                    }
-                    f.close();
-                } else {
-                    s_save_active = false;
-                    LogSerial.printf("RP2040: Failed to create /alarm_history.tmp\r\n");
-                    break;
-                }
-            } else {
-                if (!s_save_active || chunk_idx != s_save_expected_chunk || total_chunks != s_save_total_chunks) {
-                    LogSerial.printf("RP2040: Alarm save aborted: sequence mismatch (expected %u of %u, got %u of %u)\r\n",
-                                  s_save_expected_chunk, s_save_total_chunks, chunk_idx, total_chunks);
-                    if (s_save_active) {
-                        sd_card_get_fs().remove("/alarm_history.tmp");
-                        s_save_active = false;
-                    }
-                    break;
-                }
-
-                File32 f = sd_card_get_fs().open("/alarm_history.tmp", O_WRITE | O_APPEND);
-                if (f) {
-                    if (payload_len > 0) {
-                        f.write(&buffer[4], payload_len);
-                    }
-                    f.close();
-                    s_staged_entries += count;
-                    s_save_expected_chunk++;
-                } else {
-                    sd_card_get_fs().remove("/alarm_history.tmp");
-                    s_save_active = false;
-                    break;
-                }
-            }
-
-            /* Final chunk: finalize total count and atomically commit file to SD */
-            if (chunk_idx + 1 >= total_chunks && s_save_active) {
-                File32 f = sd_card_get_fs().open("/alarm_history.tmp", O_RDWR);
-                if (f) {
-                    f.seek(2);
-                    f.write(reinterpret_cast<const uint8_t*>(&s_staged_entries), 2);
-                    f.close();
-
-                    sd_card_get_fs().remove("/alarm_history.bin");
-                    sd_card_get_fs().rename("/alarm_history.tmp", "/alarm_history.bin");
-                    LogSerial.printf("RP2040: Atomically saved verified alarm history (%u entries, %u B each)\r\n",
-                                  s_staged_entries, (unsigned)sizeof(alarm_entry_t));
-                }
-                s_save_active = false;
-            }
+            /* Payload: [1] chunk_idx, [2] total_chunks, [3] count, [4..] entries.
+             * Every chunk is acknowledged ([0] RES_ALARM_SAVE, [1] chunk_idx, [2] status);
+             * the ESP32 sends the next chunk only after the ack (flow control). */
+            uint8_t chunk_idx = (size >= 2) ? buffer[1] : 0;
+            bool ok = alarm_save_chunk(buffer, size);
+            uint8_t ack[3] = { static_cast<uint8_t>(PKT_TYPE_RES_ALARM_SAVE), chunk_idx, static_cast<uint8_t>(ok ? 1 : 0) };
+            uart_link_send(ack, sizeof(ack));
             break;
         }
 
@@ -319,7 +397,7 @@ void onPacketReceived(const uint8_t* buffer, size_t size)
             if (!f || f.size() < 4) {
                 if (f) f.close();
                 uint8_t res_buf[4] = { static_cast<uint8_t>(PKT_TYPE_RES_ALARM_LOAD), 0, 1, 0 };
-                packetSerial.send(res_buf, sizeof(res_buf));
+                uart_link_send(res_buf, sizeof(res_buf));
                 LogSerial.printf("RP2040: No alarm history on SD, dispatched empty response\r\n");
                 break;
             }
@@ -336,7 +414,7 @@ void onPacketReceived(const uint8_t* buffer, size_t size)
                 LogSerial.printf("RP2040: Purged incompatible alarm history file (entry_size %u != %u)\r\n",
                               file_entry_size, (unsigned)sizeof(alarm_entry_t));
                 uint8_t res_buf[4] = { static_cast<uint8_t>(PKT_TYPE_RES_ALARM_LOAD), 0, 1, 0 };
-                packetSerial.send(res_buf, sizeof(res_buf));
+                uart_link_send(res_buf, sizeof(res_buf));
                 break;
             }
 
@@ -344,7 +422,7 @@ void onPacketReceived(const uint8_t* buffer, size_t size)
             if (file_total_entries == 0) {
                 f.close();
                 uint8_t res_buf[4] = { static_cast<uint8_t>(PKT_TYPE_RES_ALARM_LOAD), 0, 1, 0 };
-                packetSerial.send(res_buf, sizeof(res_buf));
+                uart_link_send(res_buf, sizeof(res_buf));
                 LogSerial.printf("RP2040: Alarm history empty (0 entries), dispatched empty response\r\n");
                 break;
             }
@@ -413,35 +491,14 @@ void onPacketReceived(const uint8_t* buffer, size_t size)
             if (!f || valid_count == 0) {
                 if (f) f.close();
                 uint8_t res_buf[4] = { static_cast<uint8_t>(PKT_TYPE_RES_ALARM_LOAD), 0, 1, 0 };
-                packetSerial.send(res_buf, sizeof(res_buf));
+                uart_link_send(res_buf, sizeof(res_buf));
                 break;
             }
 
-            LogSerial.printf("RP2040: Streaming %u verified alarms to ESP32...\r\n", valid_count);
-
-            const uint8_t entries_per_chunk = 1;
-            uint8_t total_chunks = valid_count;
-            static uint8_t res_buf[256];
-            uint8_t chunk_idx = 0;
-
-            for (uint16_t i = 0; i < valid_count && f.available() >= (int)sizeof(alarm_entry_t); i++) {
-                alarm_entry_t entry;
-                if (f.read(&entry, sizeof(alarm_entry_t)) == sizeof(alarm_entry_t)) {
-                    res_buf[0] = static_cast<uint8_t>(PKT_TYPE_RES_ALARM_LOAD);
-                    res_buf[1] = chunk_idx++;
-                    res_buf[2] = total_chunks;
-                    res_buf[3] = 1;
-                    memcpy(&res_buf[4], &entry, sizeof(alarm_entry_t));
-
-                    packetSerial.send(res_buf, 4 + sizeof(alarm_entry_t));
-
-                    if (chunk_idx < total_chunks) {
-                        delay(15); /* Controlled 15 ms pacing between chunks */
-                    }
-                }
-            }
+            /* Stream asynchronously from loop1 (alarm_stream_step): one entry per pass when the
+             * link queue has room, no delay() while holding the communication mutex */
             f.close();
-            LogSerial.printf("RP2040: Alarm history streaming complete.\r\n");
+            alarm_stream_start(valid_count);
             break;
         }
 
@@ -476,7 +533,7 @@ void onPacketReceived(const uint8_t* buffer, size_t size)
             memcpy(&res_buf[4], &capacity_mb, sizeof(capacity_mb));
             memcpy(&res_buf[8], volume_label, 11);
 
-            packetSerial.send(res_buf, 19);
+            uart_link_send(res_buf, 19);
             break;
         }
 
@@ -500,7 +557,7 @@ void onPacketReceived(const uint8_t* buffer, size_t size)
                 res_buf[1] = 0; // Status: Failed / Not found
                 uint16_t len = 0;
                 memcpy(&res_buf[2], &len, sizeof(len));
-                packetSerial.send(res_buf, 4);
+                uart_link_send(res_buf, 4);
                 break;
             }
 
@@ -510,7 +567,7 @@ void onPacketReceived(const uint8_t* buffer, size_t size)
             res_buf[1] = 1; // Status: Success
             memcpy(&res_buf[2], &bytes_read, sizeof(bytes_read));
 
-            packetSerial.send(res_buf, 4 + bytes_read);
+            uart_link_send(res_buf, 4 + bytes_read);
             LogSerial.printf("RP2040: Sent %u bytes for %s\r\n", bytes_read, file_path);
             break;
         }
@@ -596,7 +653,7 @@ void onPacketReceived(const uint8_t* buffer, size_t size)
                 }
             }
 
-            packetSerial.send(res_buf, payload_size);
+            uart_link_send(res_buf, payload_size);
 /*            LogSerial.printf("[RP2040] Sent RES_CHART_DATA: %u bytes (status: %u)\r\n", 
                           (unsigned)payload_size, res_buf[2]);
 */
@@ -626,7 +683,7 @@ void onPacketReceived(const uint8_t* buffer, size_t size)
             
             // Send response back to ESP32-S3
             uint8_t res_buf[2] = {static_cast<uint8_t>(PKT_TYPE_RES_SD_FORMAT), format_success};
-            packetSerial.send(res_buf, sizeof(res_buf));
+            uart_link_send(res_buf, sizeof(res_buf));
             break;
         }
 
@@ -666,7 +723,7 @@ void onPacketReceived(const uint8_t* buffer, size_t size)
             if (size < 33) {
                 LogSerial.printf("RP2040: CMD_SET_THRESHOLD payload too short (%u bytes)\r\n", (unsigned)size);
                 uint8_t res_buf[2] = { static_cast<uint8_t>(PKT_TYPE_RES_SET_THRESHOLD), 0 };
-                packetSerial.send(res_buf, sizeof(res_buf));
+                uart_link_send(res_buf, sizeof(res_buf));
                 break;
             }
 
@@ -700,7 +757,7 @@ void onPacketReceived(const uint8_t* buffer, size_t size)
 
             /* Respond back to ESP32: [0x41, success] */
             uint8_t res_buf[2] = { static_cast<uint8_t>(PKT_TYPE_RES_SET_THRESHOLD), static_cast<uint8_t>(success ? 1 : 0) };
-            packetSerial.send(res_buf, sizeof(res_buf));
+            uart_link_send(res_buf, sizeof(res_buf));
             break;
         }
 
@@ -714,7 +771,7 @@ void onPacketReceived(const uint8_t* buffer, size_t size)
             if (size < 33) {
                 LogSerial.printf("RP2040: CMD_SET_OFFSET payload too short (%u bytes)\r\n", (unsigned)size);
                 uint8_t res_buf[2] = { static_cast<uint8_t>(PKT_TYPE_RES_SET_OFFSET), 0 };
-                packetSerial.send(res_buf, sizeof(res_buf));
+                uart_link_send(res_buf, sizeof(res_buf));
                 break;
             }
 
@@ -741,7 +798,7 @@ void onPacketReceived(const uint8_t* buffer, size_t size)
 
             /* Respond back to ESP32: [0x43, success] */
             uint8_t res_buf[2] = { static_cast<uint8_t>(PKT_TYPE_RES_SET_OFFSET), static_cast<uint8_t>(success ? 1 : 0) };
-            packetSerial.send(res_buf, sizeof(res_buf));
+            uart_link_send(res_buf, sizeof(res_buf));
             break;
         }
 
@@ -750,6 +807,17 @@ void onPacketReceived(const uint8_t* buffer, size_t size)
     }
 
     mutex_exit(&g_comm_mutex);
+}
+
+/**
+ * @brief PacketSerial callback (core 1): dispatch one packet and record its handling time.
+ */
+void onPacketReceived(const uint8_t* buffer, size_t size)
+{
+    if (size < 1) return;
+    uint32_t t0 = micros();
+    handle_packet(buffer, size);
+    uart_link_diag_rx(buffer[0], size, micros() - t0);
 }
 
 /* ── Core 0 Setup & Loop (Real-time & Alarm Domain) ───────────────────── */
@@ -884,22 +952,32 @@ void setup1()
     // Initialize virtual decoder system & telemetry TX queue
     virtual_decoder_init();
     telemetry_tx_init();
+    uart_link_init();
 }
 
 void loop1()
 {
     /* 1. Universal UART Communication Task */
     packetSerial.update();
-    if (packetSerial.overflow()) {
-        /* Buffer overflow handled cleanly */
+    /* Oversized packet: PacketSerial drops it and keeps the flag set until the next packet
+     * marker, so only the rising edge is counted */
+    static bool s_rx_overflow_seen = false;
+    bool rx_overflow = packetSerial.overflow();
+    if (rx_overflow && !s_rx_overflow_seen) {
+        uart_link_diag_rx_overflow();
     }
+    s_rx_overflow_seen = rx_overflow;
 
-    /* 2. Dispatch queued telemetry with controlled 8 ms pacing */
+    /* 2. Move queued telemetry (8 ms pacing) into the link queue, then transmit at most one
+     *    packet whose pacing slot has come (all ESP32-bound traffic leaves here) */
     telemetry_tx_process_queue(packetSerial);
+    uart_link_process();
 
-    /* 3. MicroSD Driver Worker (Card Detect ISR & Non-blocking Formatter) */
+    /* 3. MicroSD Driver Worker (Card Detect ISR & Non-blocking Formatter) and
+     *    pending alarm history stream (SD reads, one entry per pass) */
     mutex_enter_blocking(&g_comm_mutex);
     sd_card_update(packetSerial);
+    alarm_stream_step();
     mutex_exit(&g_comm_mutex);
 
     /* 4. System State Machine */
@@ -952,7 +1030,8 @@ void loop1()
             static NonBlockingDelay dev_stream_timer(15); /* 15 ms pacing between device chunks */
             static size_t current_stream_idx = 0;
 
-            if (dev_stream_timer.check()) {
+            /* Next device only when the link queue can take the whole chunk */
+            if (dev_stream_timer.check() && uart_link_can_send(3 + sizeof(lora_device_config_t))) {
                 mutex_enter_blocking(&g_comm_mutex);
                 bool has_more = lorasensors_stream_single_device(packetSerial, current_stream_idx);
                 mutex_exit(&g_comm_mutex);

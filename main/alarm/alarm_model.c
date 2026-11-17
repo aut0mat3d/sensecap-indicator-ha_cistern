@@ -25,7 +25,6 @@
 static const char* TAG = "alarm_model";
 
 #define ALARM_PERSIST_SETTLE_MS    5000      /* 5 seconds debounce window for alarm bursts & state settling */
-#define ALARMS_PER_UART_CHUNK      1         /* 1 entry (184 B) + 4 B header = 188 B per UART chunk */
 #define MAX_ACTIVE_CONDITIONS      16        /* Maximum distinct active alarm conditions tracked */
 
 /* Forward declarations */
@@ -191,35 +190,46 @@ bool alarm_history_load(void) {
     return (ret > 0);
 }
 
+/* Upload result (called from the UART task): a failed upload is retried after the debounce */
+static void _alarm_upload_done(bool success) {
+    if (!success) {
+        ESP_LOGW(TAG, "Alarm journal not saved to SD, retrying later");
+        _alarm_mark_dirty();
+    }
+}
+
 bool alarm_history_save(void) {
     if (!s_history_dirty) {
         return true;
     }
+    /* One upload at a time; the journal stays dirty and is saved after the running upload */
+    if (rp2040_alarm_upload_busy()) {
+        return false;
+    }
 
-    if (s_ringbuffer_count == 0) {
-        rp2040_alarm_send_save_chunk(0, 1, 0, NULL);
-    } else {
-        uint8_t total_chunks = (uint8_t)((s_ringbuffer_count + ALARMS_PER_UART_CHUNK - 1) / ALARMS_PER_UART_CHUNK);
-        alarm_entry_t chunk_buf[ALARMS_PER_UART_CHUNK];
-
-        for (uint8_t chunk_idx = 0; chunk_idx < total_chunks; chunk_idx++) {
-            size_t start_idx = chunk_idx * ALARMS_PER_UART_CHUNK;
-            size_t remaining = s_ringbuffer_count - start_idx;
-            uint8_t count_in_chunk = (remaining < ALARMS_PER_UART_CHUNK) ? (uint8_t)remaining : ALARMS_PER_UART_CHUNK;
-
-            for (uint8_t i = 0; i < count_in_chunk; i++) {
-                alarm_entry_t *entry = _ringbuffer_get(s_ringbuffer_count - 1 - (start_idx + i));
-                if (entry) {
-                    memcpy(&chunk_buf[i], entry, sizeof(alarm_entry_t));
-                }
-            }
-
-            rp2040_alarm_send_save_chunk(chunk_idx, total_chunks, count_in_chunk, chunk_buf);
+    /* Snapshot oldest -> newest (the uploader owns and frees it) */
+    size_t count = s_ringbuffer_count;
+    alarm_entry_t *snapshot = NULL;
+    if (count > 0) {
+        snapshot = heap_caps_malloc(count * sizeof(alarm_entry_t), MALLOC_CAP_SPIRAM);
+        if (!snapshot) snapshot = malloc(count * sizeof(alarm_entry_t));
+        if (!snapshot) {
+            ESP_LOGE(TAG, "No memory for alarm journal snapshot (%u entries)", (unsigned)count);
+            return false;
+        }
+        for (size_t i = 0; i < count; i++) {
+            alarm_entry_t *entry = _ringbuffer_get(count - 1 - i);
+            if (entry) memcpy(&snapshot[i], entry, sizeof(alarm_entry_t));
         }
     }
 
+    if (rp2040_alarm_upload_start(snapshot, (uint16_t)count, _alarm_upload_done) != 0) {
+        free(snapshot);
+        return false;
+    }
+
     s_history_dirty = false;
-    ESP_LOGI(TAG, "Dispatched %u alarm journal entries to RP2040 SD card", (unsigned)s_ringbuffer_count);
+    ESP_LOGI(TAG, "Queued %u alarm journal entries for the RP2040 SD card", (unsigned)count);
     return true;
 }
 

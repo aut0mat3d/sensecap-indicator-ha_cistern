@@ -71,7 +71,8 @@ void alarm_view_mute_time(void);
 void alarm_view_handle_hw_button(void);
 
 /**
- * @brief Notify the view of an alarm journal change to trigger a live redraw if open.
+ * @brief Notify the view of an alarm journal change (thread-safe, no LVGL lock).
+ *        An open list is redrawn by the view's LVGL timer within ~200 ms.
  */
 void alarm_view_notify_change(void);
 

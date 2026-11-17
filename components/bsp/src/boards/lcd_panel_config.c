@@ -855,14 +855,22 @@ void lcd_panel_st7701s_init(void)
 {
     init_gpios(&s_io);
 
-    //IO_EXP_MULTI_WRITE_START();
-    //RESET(0);
-    //Delay(10);
-    //RESET(1);
-    //SPI_WriteComm(0x11);
-    //IO_EXP_MULTI_WRITE_END();
-
-    //Delay(120);
+    /* Hardware reset via IO expander IO0_5 (LCD_RESET): without it a warm ESP32 reset keeps the
+     * old panel state while a cold power-up starts from power-on defaults. With the pulse both
+     * cases start from the same defined state. Low pulse >= 10 us, then 120 ms before the
+     * command sequence (ST7701S reset timing). Sleep Out (0x11) follows at the end of the list. */
+    IO_EXP_MULTI_WRITE_START();
+    RESET(1);
+    IO_EXP_MULTI_WRITE_END();
+    Delay(5);
+    IO_EXP_MULTI_WRITE_START();
+    RESET(0);
+    IO_EXP_MULTI_WRITE_END();
+    Delay(10);
+    IO_EXP_MULTI_WRITE_START();
+    RESET(1);
+    IO_EXP_MULTI_WRITE_END();
+    Delay(120);
 
     IO_EXP_MULTI_WRITE_START();
     SPI_WriteComm(0xFF);

@@ -274,15 +274,9 @@ esp_err_t bsp_board_sensecap_indicator_init(void)
 
     indev_init_default();
 
-    ESP_ERROR_CHECK(bsp_lcd_init());
-    //bsp_led_init();
-    //bsp_led_set_rgb(0, 255, 0, 0);
-    //vTaskDelay(pdMS_TO_TICKS(100));
-    //bsp_led_set_rgb(0, 0, 255, 0);
-    //vTaskDelay(pdMS_TO_TICKS(100));
-    //ESP_ERROR_CHECK(bsp_i2s_init(I2S_NUM_0, 16000));
-    //ESP_ERROR_CHECK(bsp_codec_init(AUDIO_HAL_16K_SAMPLES));
-    //bsp_led_set_rgb(0, 0, 0, 255);
+    /* Panel first, pixel data second: reset and fully configure the ST7701S over 3-wire SPI
+     * (incl. Sleep Out / Display On) before bsp_lcd_init() starts the RGB stream and switches
+     * the backlight on. Same order as Espressif's esp_lcd_st7701 and ESPHome's mipi_rgb. */
 #if CONFIG_SENSECAP_INDICATOR_SCREEN_GX
     lcd_panel_st7701s_init();
 #elif CONFIG_SENSECAP_INDICATOR_SCREEN_DX
@@ -293,6 +287,16 @@ esp_err_t bsp_board_sensecap_indicator_init(void)
         g_board_lcd_evb_io_expander_ops.set_direction(EXPANDER_IO_LCD_RESET, 1);
     }
 #endif
+
+    ESP_ERROR_CHECK(bsp_lcd_init());
+    //bsp_led_init();
+    //bsp_led_set_rgb(0, 255, 0, 0);
+    //vTaskDelay(pdMS_TO_TICKS(100));
+    //bsp_led_set_rgb(0, 0, 255, 0);
+    //vTaskDelay(pdMS_TO_TICKS(100));
+    //ESP_ERROR_CHECK(bsp_i2s_init(I2S_NUM_0, 16000));
+    //ESP_ERROR_CHECK(bsp_codec_init(AUDIO_HAL_16K_SAMPLES));
+    //bsp_led_set_rgb(0, 0, 0, 255);
     //bsp_led_set_rgb(0, 0, 0, 0);
 
 #if CONFIG_LCD_BOARD_SENSECAP_INDICATOR_WXM

@@ -86,7 +86,8 @@ enum pkt_type {
     PKT_TYPE_CMD_ALARM_REARM      = 0xA8,  /* Payload: none */
     PKT_TYPE_CMD_ALARM_SAVE       = 0xA9,  /* Payload: chunk_idx(1B) + total_chunks(1B) + count(1B) + entries[] */
     PKT_TYPE_CMD_ALARM_LOAD       = 0xAA,  /* Request: trigger RP2040 to stream saved history */
-    PKT_TYPE_RES_ALARM_LOAD       = 0xAB,   /* Response: chunk_idx(1B) + total_chunks(1B) + count(1B) + entries[] */
+    PKT_TYPE_RES_ALARM_LOAD       = 0xAB,  /* Response: chunk_idx(1B) + total_chunks(1B) + count(1B) + entries[] */
+    PKT_TYPE_RES_ALARM_SAVE       = 0xAC,  /* Ack per save chunk: chunk_idx(1B) + status(1B: 1=OK, 0=ERR) */
 
     /* ── 0xB0..0xBF: Telemetry Data ────────────────────────────────────── */
     PKT_TYPE_LORA_TELEMETRY       = 0xBB,  /* External LoRa / LoRaWAN nodes */

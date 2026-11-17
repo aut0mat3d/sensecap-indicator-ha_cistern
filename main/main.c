@@ -64,7 +64,9 @@ void app_main(void) {
 	lv_port_init();
 
 	esp_event_loop_args_t view_event_task_args = {
-		.queue_size = 10,
+		/* Room for telemetry bursts (one LoRa frame yields several keys) while handlers wait
+		 * for the LVGL lock; the UART task drops telemetry instead of blocking when full */
+		.queue_size = 32,
 		.task_name = "view_event_task",
 		.task_priority = uxTaskPriorityGet(NULL),
 		.task_stack_size = 10240,

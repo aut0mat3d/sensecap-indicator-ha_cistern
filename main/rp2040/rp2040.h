@@ -107,7 +107,8 @@ enum pkt_type_cmd
     PKT_TYPE_CMD_ALARM_REARM      = 0xA8,
     PKT_TYPE_CMD_ALARM_SAVE       = 0xA9,  /* Payload: chunk_idx(1B) + total_chunks(1B) + count(1B) + entries[] */
     PKT_TYPE_CMD_ALARM_LOAD       = 0xAA,  /* Request: trigger RP2040 to stream saved history */
-    PKT_TYPE_RES_ALARM_LOAD       = 0xAB   /* Response: chunk_idx(1B) + total_chunks(1B) + count(1B) + entries[] */
+    PKT_TYPE_RES_ALARM_LOAD       = 0xAB,  /* Response: chunk_idx(1B) + total_chunks(1B) + count(1B) + entries[] */
+    PKT_TYPE_RES_ALARM_SAVE       = 0xAC   /* Ack per save chunk: chunk_idx(1B) + status(1B: 1=OK, 0=ERR) */
 };
 
 enum pkt_type_data
@@ -116,6 +117,12 @@ enum pkt_type_data
     PKT_TYPE_LORA_TELEMETRY  = 0xBB, /* External LoRa / LoRaWAN nodes */
     PKT_TYPE_LOCAL_TELEMETRY = 0xBC  /* Onboard and Grove I2C sensors */
 };
+
+/** UART link diagnostics (counters + periodic summary in the log). 0 = compiled out */
+#ifndef RP2040_LINK_DIAG
+#define RP2040_LINK_DIAG             1
+#endif
+#define RP2040_LINK_DIAG_PERIOD_MS   30000
 
 void esp32_rp2040_init(void);
 
@@ -151,15 +158,29 @@ int rp2040_alarm_rearm(void);
 /* Forward declaration to avoid circular include with alarm_model.h */
 struct alarm_entry_s;
 
+/** Completion callback of an alarm journal upload (called from the UART task) */
+typedef void (*rp2040_alarm_upload_done_cb_t)(bool success);
+
 /**
- * @brief Transmit an alarm history chunk to RP2040 for SD card persistence.
- * @param chunk_idx Zero-based index of this chunk.
- * @param total_chunks Total number of chunks in this burst.
- * @param count Number of alarm entries in this chunk.
- * @param entries Pointer to array of alarm entries.
- * @return Number of UART bytes written, or -1 on error.
+ * @brief Start a non-blocking, acknowledged upload of the alarm journal to the RP2040 SD card.
+ *
+ * The journal is sent in small chunks; the next chunk follows only after the RP2040 has
+ * written the previous one and acknowledged it (RES_ALARM_SAVE). Failed or unacknowledged
+ * uploads restart from the first chunk (limited attempts), then done_cb(false) is called.
+ *
+ * @param entries  Heap buffer with the journal (oldest first), sizeof(alarm_entry_t) each.
+ *                 Ownership passes to the uploader on success (released with free()).
+ *                 May be NULL when count is 0 (clears the journal on SD).
+ * @param count    Number of entries.
+ * @param done_cb  Optional completion callback.
+ * @return 0 if started, -1 if an upload is still running (caller keeps the buffer).
  */
-int rp2040_alarm_send_save_chunk(uint8_t chunk_idx, uint8_t total_chunks, uint8_t count, const void *entries);
+int rp2040_alarm_upload_start(void *entries, uint16_t count, rp2040_alarm_upload_done_cb_t done_cb);
+
+/**
+ * @brief true while an alarm journal upload is in progress.
+ */
+bool rp2040_alarm_upload_busy(void);
 
 /**
  * @brief Request RP2040 to stream saved alarm history from SD card.

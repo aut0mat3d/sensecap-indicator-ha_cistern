@@ -47,15 +47,15 @@ static void _on_header_clicked(lv_event_t *e) {
 
 static void _on_item_clicked(lv_event_t *e) {
     collapsible_list_t *widget = (collapsible_list_t *)lv_event_get_user_data(e);
-    /* Retrieve the row button itself even if an inner label was touched */
-    lv_obj_t *row_btn = lv_event_get_current_target(e);
-    if (!widget || !row_btn || !widget->item_click_cb) return;
+    /* Retrieve the edit area itself even if an inner label was touched */
+    lv_obj_t *edit_btn = lv_event_get_current_target(e);
+    if (!widget || !edit_btn || !widget->item_click_cb) return;
 
     /* Locate the group and item index */
     for (uint8_t g = 0; g < widget->group_count; g++) {
         collapsible_list_group_t *grp = &widget->groups[g];
         for (uint8_t i = 0; i < grp->item_count; i++) {
-            if (grp->items[i].row_btn == row_btn) {
+            if (grp->items[i].edit_btn == edit_btn) {
                 widget->item_click_cb(widget, g, i, grp->items[i].user_data);
                 return;
             }
@@ -142,7 +142,9 @@ static void _build_item_row_ui(collapsible_list_t *widget, uint8_t group_idx, ui
     lv_obj_set_flex_flow(itm->row_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(itm->row_btn, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    lv_obj_add_event_cb(itm->row_btn, _on_item_clicked, LV_EVENT_CLICKED, widget);
+    /* Only the value + edit icon area on the right reacts to clicks; touching the rest of the
+     * row and dragging scrolls the list without opening the editor by accident */
+    lv_obj_remove_flag(itm->row_btn, LV_OBJ_FLAG_CLICKABLE);
 
     /* Left side: Property Label */
     itm->lbl_label = lv_label_create(itm->row_btn);
@@ -151,15 +153,22 @@ static void _build_item_row_ui(collapsible_list_t *widget, uint8_t group_idx, ui
     lv_obj_set_style_text_font(itm->lbl_label, widget->font, LV_PART_MAIN);
     lv_obj_remove_flag(itm->lbl_label, LV_OBJ_FLAG_CLICKABLE);
 
-    /* Right side container: Value + Edit Icon */
+    /* Right side: Value + Edit Icon, the clickable edit area of the row */
     lv_obj_t *val_box = lv_obj_create(itm->row_btn);
+    itm->edit_btn = val_box;
     lv_obj_set_size(val_box, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_remove_flag(val_box, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(val_box, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(val_box, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(val_box, 8);
+    lv_obj_set_style_radius(val_box, 4, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(val_box, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(val_box, lv_color_hex(0x3A4048), LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(val_box, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_PRESSED);
     lv_obj_set_style_border_width(val_box, 0, LV_PART_MAIN);
     lv_obj_set_style_outline_width(val_box, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(val_box, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_hor(val_box, 6, LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(val_box, 2, LV_PART_MAIN);
+    lv_obj_add_event_cb(val_box, _on_item_clicked, LV_EVENT_CLICKED, widget);
     lv_obj_set_flex_flow(val_box, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(val_box, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(val_box, 8, LV_PART_MAIN);

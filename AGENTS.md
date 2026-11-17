@@ -51,6 +51,9 @@ Keep these documents in sync when changing architecture, protocol or JSON schema
 │   ├── lora/              SX1262 model, LoRaWAN crypto, P2P mesh, LoRa diagnostics page
 │   ├── rp2040/            UART link + chart_query_scheduler
 │   └── ...                btn, cmd, ha, mqtt, nav, sdcard, sensor, settings, storage, util, wifi
+├── components/
+│   ├── bsp/               board support (Seeed/Espressif BSP): ST7701S panel init, RGB timings, IO expander
+│   └── esp_lcd/           patched copy of ESP-IDF v5.4 esp_lcd (RGB restart fix), see esp_lcd/CISTERN_PATCH.md
 ├── rp2040/                RP2040 firmware (PlatformIO): code in rp2040/src and rp2040/include
 ├── sdcontent/             reference content of SD partition 1 (tracked in git, dummy keys only)
 ├── docs_extensions_n_changes/   architecture docs (overview/ is current; old/ is archived)

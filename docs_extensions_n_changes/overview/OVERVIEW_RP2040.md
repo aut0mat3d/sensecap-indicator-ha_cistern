@@ -9,9 +9,9 @@
 | Core | Entry | Work |
 |---|---|---|
 | Core 0 | `setup()` / `loop()` | SD + LittleFS buffer init, UART pins, I2C sensor power and detection, buzzer state machine (`buzzer_update`), sampling SCD41 / SGP40 / SHT41 (AHT20) / light → `lorasensors_dispatch_local()` |
-| Core 1 | `setup1()` / `loop1()` | `packetSerial.update()` (UART RX → `onPacketReceived`), paced telemetry TX queue, `sd_card_update()`, system state machine: `BOOT → SD_CHECK → LOAD_CFG → STREAM_DEV_CFG → RUNNING (↔ RELOAD_CFG)`. RUNNING runs `data_storage_process_buckets()` every 1 s, hourly aggregation on UTC hour change, daily aggregation at local midnight. |
+| Core 1 | `setup1()` / `loop1()` | `packetSerial.update()` (UART RX → `onPacketReceived`), telemetry queue → `uart_link_process()` (the only place that writes to the ESP32, paced), `sd_card_update()`, alarm history stream step, system state machine: `BOOT → SD_CHECK → LOAD_CFG → STREAM_DEV_CFG → RUNNING (↔ RELOAD_CFG)`. RUNNING runs `data_storage_process_buckets()` every 1 s, hourly aggregation on UTC hour change, daily aggregation at local midnight. |
 
-Both cores share `g_comm_mutex` around UART TX and SD access.
+Both cores share `g_comm_mutex` around SD access, decoders and the archive. UART TX is decoupled: both cores only queue packets (`uart_link_send`), core 1 transmits them.
 
 ## Files
 
@@ -29,7 +29,8 @@ Both cores share `g_comm_mutex` around UART TX and SD access.
 | `src/sensors.cpp` | Sensor drivers (AHT20, SHT41, SGP40, SCD4x, light) | `sensor_*_init/get` |
 | `src/utility.cpp` | Buzzer / beep helpers, alarm pattern state machine | `alarm_set`, `alarm_mute`, `alarm_rearm`, `buzzer_update` |
 | `src/units.cpp`, `include/units.h` | Unit conversion from `/config/units.json` | `units_convert`, `units_resolve_target` |
-| `src/telemetry_queue.hpp` | Thread-safe paced FIFO for `0xBB` telemetry (8 ms pacing) | `telemetry_tx_enqueue`, `telemetry_tx_process_queue` |
+| `src/telemetry_queue.hpp` | Thread-safe FIFO for virtual decoder telemetry (8 ms spacing, feeds the link queue) | `telemetry_tx_enqueue`, `telemetry_tx_process_queue` |
+| `src/uart_link.cpp/.hpp` | Central paced TX queue to the ESP32 (6 KB ring, pacing by packet size) + link diagnostics (`UART_LINK_DIAG`) | `uart_link_send`, `uart_link_can_send`, `uart_link_process` |
 | `src/debug_log.hpp/.cpp` | Non-blocking console `LogSerial` (drops output instead of stalling when the USB terminal stops reading) and domain debug macros (`DBG_LORA_PRINTF`, …) | `LogSerial` |
 
 ## Data path inside the RP2040

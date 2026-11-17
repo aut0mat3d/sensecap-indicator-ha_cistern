@@ -32,6 +32,10 @@ typedef enum {
     LORA_STATUS_TIMEOUT = 3
 } lora_header_status_t;
 
+/**
+ * @brief Request the alarm indicator state (blinking header, warning icon).
+ *        Thread-safe without the LVGL lock: applied by an LVGL timer within ~100 ms.
+ */
 void gui_header_set_alarm_state(bool has_active_alarms);
 
 /**

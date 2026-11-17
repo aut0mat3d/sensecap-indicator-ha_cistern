@@ -40,11 +40,14 @@ class LcdRgbConfigTests(unittest.TestCase):
         assert match is not None
         self.assertGreaterEqual(int(match.group(1)), 8192)
 
-    def test_avoid_tear_uses_full_refresh_not_direct_mode(self) -> None:
+    def test_avoid_tear_uses_direct_mode_not_full_refresh(self) -> None:
+        """Direct mode redraws only invalidated areas. Full refresh re-rendered the whole
+        480x480 frame for every change and provoked bounce buffer underruns (display shift,
+        see components/esp_lcd/CISTERN_PATCH.md)."""
         text = SDKCONFIG_DEFAULTS.read_text()
 
-        self.assertIn("CONFIG_LCD_LVGL_FULL_REFRESH=y", text)
-        self.assertNotIn("CONFIG_LCD_LVGL_DIRECT_MODE=y", text)
+        self.assertIn("CONFIG_LCD_LVGL_DIRECT_MODE=y", text)
+        self.assertNotIn("CONFIG_LCD_LVGL_FULL_REFRESH=y", text)
 
     def test_lvgl_refresh_period_is_fast_enough_for_swipe_motion(self) -> None:
         text = SDKCONFIG_DEFAULTS.read_text()
@@ -54,7 +57,9 @@ class LcdRgbConfigTests(unittest.TestCase):
     def test_rgb_panel_uses_bounce_buffer_for_psram_scanout(self) -> None:
         text = BSP_LCD.read_text()
 
-        self.assertIn(".bounce_buffer_size_px = brd->LCD_WIDTH * 10", text)
+        # 30 lines (~1.4 ms at 12 MHz pclk) give the bounce ISR more slack than 10 lines (~0.46 ms);
+        # a late ISR causes an underrun and a DMA restart (see components/esp_lcd/CISTERN_PATCH.md)
+        self.assertIn(".bounce_buffer_size_px = brd->LCD_WIDTH * 30", text)
 
     def test_lvgl_port_uses_bounce_buffer_completion_callback(self) -> None:
         text = LV_PORT.read_text()

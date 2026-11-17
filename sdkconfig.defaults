@@ -8,7 +8,10 @@ CONFIG_IDF_TARGET="esp32s3"
 CONFIG_IDF_EXPERIMENTAL_FEATURES=y
 
 CONFIG_SPIRAM=y
-CONFIG_SPIRAM_SPEED_120M=y
+# Octal PSRAM at 120 MHz is experimental (timing point chosen at power-on, accesses can fail after
+# a ~20 degC temperature change); the devices sit on a window sill. 80 MHz is the stable setting
+# Espressif uses for its 480x480 RGB boards. Flash shares the MSPI core clock, so it follows.
+CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y
 CONFIG_SPIRAM_RODATA=y
@@ -27,7 +30,7 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 # CONFIG_ESP_PHY_REDUCE_TX_POWER=y
 
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
-CONFIG_ESPTOOLPY_FLASHFREQ_120M=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 
 CONFIG_PARTITION_TABLE_CUSTOM=y
@@ -41,7 +44,10 @@ CONFIG_FREERTOS_HZ=1000
 
 
 CONFIG_LCD_AVOID_TEAR=y
-CONFIG_LCD_LVGL_FULL_REFRESH=y
+# Direct mode: LVGL redraws only invalidated areas (LVGL 9 syncs them into the second frame buffer).
+# Full refresh redrew all 480x480 pixels for every change (e.g. the clock each second, 60-140 ms of
+# PSRAM traffic per frame), which made scrolling sluggish and provoked bounce buffer underruns.
+CONFIG_LCD_LVGL_DIRECT_MODE=y
 CONFIG_LCD_TASK_REFRESH_TIME=10
 CONFIG_LCD_EVB_SCREEN_FREQ=12
 CONFIG_LV_DEF_REFR_PERIOD=10

@@ -14,7 +14,6 @@
 #include "esp_event.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
-#include "cJSON.h"
 #include "view_data.h"
 #include "gui/i18n/gui_i18n.h"
 
@@ -83,125 +82,6 @@ uint8_t alarm_evaluator_get_rule_buzzer_mode(const char *source_name, const char
     }
     if (s_eval_mutex) xSemaphoreGive(s_eval_mutex);
     return mode;
-}
-
-/* ── JSON Parser (Dynamic SD-Card configuration) ───────────────────────── */
-
-int alarm_evaluator_load_device_json(const char *json_str) {
-    if (!json_str) return -1;
-
-    cJSON *root = cJSON_Parse(json_str);
-    if (!root) {
-        ESP_LOGE(TAG, "Failed to parse device JSON");
-        return -1;
-    }
-
-    /* 1. Extract Device Address and Display Name */
-    cJSON *dev_addr_obj = cJSON_GetObjectItem(root, "dev_addr");
-    cJSON *name_obj = cJSON_GetObjectItem(root, "device_name");
-    if (!dev_addr_obj || !cJSON_IsString(dev_addr_obj)) {
-        cJSON_Delete(root);
-        return -1;
-    }
-
-    uint32_t dev_addr = (uint32_t)strtoul(dev_addr_obj->valuestring, NULL, 16);
-    const char *dev_name = (name_obj && cJSON_IsString(name_obj)) ? name_obj->valuestring : "Unknown";
-
-    /* 2. Extract Tank Geometry for Percent Resolution */
-    float max_depth_cm = 100.0f; /* Fallback scale */
-    cJSON *v_dec = cJSON_GetObjectItem(root, "virtual_decoder");
-    if (v_dec) {
-        cJSON *vol = cJSON_GetObjectItem(v_dec, "volume");
-        if (vol) {
-            cJSON *md = cJSON_GetObjectItem(vol, "max_depth");
-            if (md) {
-                cJSON *v = cJSON_GetObjectItem(md, "value");
-                if (v && cJSON_IsNumber(v)) max_depth_cm = (float)v->valuedouble;
-            }
-        }
-    }
-
-    /* 3. Parse Threshold Array */
-    cJSON *thresholds = cJSON_GetObjectItem(root, "thresholds");
-    if (!thresholds || !cJSON_IsArray(thresholds)) {
-        cJSON_Delete(root);
-        return 0;
-    }
-
-    int registered = 0;
-    cJSON *t_item = NULL;
-    cJSON_ArrayForEach(t_item, thresholds) {
-        cJSON *id_obj   = cJSON_GetObjectItem(t_item, "id");
-        cJSON *key_obj  = cJSON_GetObjectItem(t_item, "key");
-        cJSON *sev_obj  = cJSON_GetObjectItem(t_item, "severity");
-        cJSON *damp_obj = cJSON_GetObjectItem(t_item, "damping");
-
-        if (!id_obj || !key_obj) continue;
-
-        alarm_eval_rule_t rule = {0};
-        rule.dev_addr = dev_addr;
-        strlcpy(rule.source_name, dev_name, sizeof(rule.source_name));
-        strlcpy(rule.rule_id, id_obj->valuestring, sizeof(rule.rule_id));
-        strlcpy(rule.key, key_obj->valuestring, sizeof(rule.key));
-
-        /* Severity */
-        rule.severity = ALARM_SEVERITY_DANGER;
-        if (sev_obj && cJSON_IsString(sev_obj)) {
-            if (strcasecmp(sev_obj->valuestring, "warning") == 0) rule.severity = ALARM_SEVERITY_WARNING;
-            else if (strcasecmp(sev_obj->valuestring, "info") == 0) rule.severity = ALARM_SEVERITY_INFO;
-        }
-
-        /* Damping */
-        rule.damping = (damp_obj && cJSON_IsNumber(damp_obj)) ? (uint8_t)damp_obj->valueint : 0;
-
-        /* Buzzer mode (0=intermittent, 1=continuous, 2=off) */
-        cJSON *buzz_obj = cJSON_GetObjectItem(t_item, "buzzer_mode");
-        rule.buzzer_mode = 0;
-        if (buzz_obj && cJSON_IsString(buzz_obj)) {
-            if (strcasecmp(buzz_obj->valuestring, "continuous") == 0) rule.buzzer_mode = 1;
-            else if (strcasecmp(buzz_obj->valuestring, "off") == 0) rule.buzzer_mode = 2;
-        }
-
-        /* Value & Hysteresis Calculation (Percent vs Absolute) */
-        cJSON *v_pct = cJSON_GetObjectItem(t_item, "value_percent");
-        cJSON *v_abs = cJSON_GetObjectItem(t_item, "value_threshold");
-        cJSON *h_pct = cJSON_GetObjectItem(t_item, "hysteresis_percent");
-        cJSON *h_abs = cJSON_GetObjectItem(t_item, "hysteresis");
-
-        if (v_pct && cJSON_IsNumber(v_pct)) {
-            rule.threshold_val = ((float)v_pct->valuedouble / 100.0f) * max_depth_cm;
-            rule.hysteresis_val = (h_pct && cJSON_IsNumber(h_pct))
-                                  ? (((float)h_pct->valuedouble / 100.0f) * max_depth_cm)
-                                  : 2.0f;
-        } else if (v_abs && cJSON_IsNumber(v_abs)) {
-            rule.threshold_val = (float)v_abs->valuedouble;
-            rule.hysteresis_val = (h_abs && cJSON_IsNumber(h_abs)) ? fabsf((float)h_abs->valuedouble) : 0.5f;
-        }
-
-        /* Determine Evaluation Direction ("falling" / "rising") */
-        cJSON *dir_obj = cJSON_GetObjectItem(t_item, "direction");
-        if (dir_obj && cJSON_IsString(dir_obj)) {
-            if (strcasecmp(dir_obj->valuestring, "falling") == 0) {
-                rule.op = THRESHOLD_OP_LESS_THAN;
-            } else {
-                rule.op = THRESHOLD_OP_GREATER_THAN;
-            }
-        } else {
-            /* Legacy fallback heuristic if no direction is specified */
-            if (strstr(rule.rule_id, "low") || strstr(rule.rule_id, "min") || rule.threshold_val < 0.0f) {
-                rule.op = THRESHOLD_OP_LESS_THAN;
-            } else {
-                rule.op = THRESHOLD_OP_GREATER_THAN;
-            }
-        }
-
-        if (alarm_evaluator_register_rule(&rule) == 0) {
-            registered++;
-        }
-    }
-
-    cJSON_Delete(root);
-    return registered;
 }
 
 /* ── Mathematical Evaluation & Alarm Dispatch ──────────────────────────── */

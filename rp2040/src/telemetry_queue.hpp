@@ -12,6 +12,7 @@
 #include <string.h>
 #include "pico/mutex.h"
 #include "indicator_rp2040.hpp"
+#include "uart_link.hpp"
 
 #define TELEMETRY_QUEUE_CAPACITY 32
 
@@ -122,7 +123,7 @@ public:
         for (size_t j = 0; j < idx; j++) checksum ^= tx_buf[j];
         tx_buf[idx++] = checksum;
 
-        ps.send(tx_buf, idx);
+        uart_link_send(tx_buf, idx);
         last_tx_ms = millis();
     }
 

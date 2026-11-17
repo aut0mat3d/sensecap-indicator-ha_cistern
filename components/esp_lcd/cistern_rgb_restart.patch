@@ -1,0 +1,118 @@
+--- a/rgb/esp_lcd_panel_rgb.c	2026-09-28 08:55:28.757761639 +0200
++++ b/rgb/esp_lcd_panel_rgb.c	2026-11-17 16:29:12.384834008 +0100
+@@ -1,4 +1,8 @@
+ /*
++ * [CISTERN PATCH] Local copy of ESP-IDF v5.4 (67c1de1) components/esp_lcd, see components/esp_lcd/CISTERN_PATCH.md.
++ * Changes in this file are marked with "[CISTERN PATCH]".
++ */
++/*
+  * SPDX-FileCopyrightText: 2021-2024 Espressif Systems (Shanghai) CO LTD
+  *
+  * SPDX-License-Identifier: Apache-2.0
+@@ -125,6 +129,7 @@
+     int bounce_pos_px;              // Position in whatever source material is used for the bounce buffer, in pixels
+     size_t bb_eof_count;            // record the number we received the DMA EOF event, compare with `expect_eof_count` in the VSYNC_END ISR
+     size_t expect_eof_count;        // record the number of DMA EOF event we expected to receive
++    uint32_t restart_count;         // [CISTERN PATCH] number of DMA restarts after a detected desync
+     esp_lcd_rgb_panel_draw_buf_complete_cb_t on_color_trans_done; // draw buffer completes
+     esp_lcd_rgb_panel_frame_buf_complete_cb_t on_frame_buf_complete; // callback used to notify when the bounce buffer finish copying the entire frame
+     esp_lcd_rgb_panel_vsync_cb_t on_vsync; // VSYNC event callback
+@@ -442,6 +447,16 @@
+     return ESP_OK;
+ }
+ 
++/* [CISTERN PATCH] diagnostics: number of DMA restarts after a detected desync */
++uint32_t esp_lcd_rgb_panel_get_restart_count(esp_lcd_panel_handle_t panel)
++{
++    if (!panel) {
++        return 0;
++    }
++    esp_rgb_panel_t *rgb_panel = __containerof(panel, esp_rgb_panel_t, base);
++    return rgb_panel->restart_count;
++}
++
+ esp_err_t esp_lcd_rgb_panel_get_frame_buffer(esp_lcd_panel_handle_t panel, uint32_t fb_num, void **fb0, ...)
+ {
+     ESP_RETURN_ON_FALSE(panel, ESP_ERR_INVALID_ARG, TAG, "invalid argument");
+@@ -1026,24 +1041,41 @@
+ {
+     int bb_size_px = panel->bb_size / (panel->fb_bits_per_pixel / 8);
+     bool do_restart = false;
++    /* [CISTERN PATCH] backport of upstream c0fb05b (bb_eof_count reset also with RESTART_IN_VSYNC)
++     * and 201ad05 (restart on missing AND excess EOF counts) */
++    portENTER_CRITICAL_ISR(&panel->spinlock);
+ #if CONFIG_LCD_RGB_RESTART_IN_VSYNC
+     do_restart = true;
+ #else
+-    portENTER_CRITICAL_ISR(&panel->spinlock);
+     if (panel->flags.need_restart) {
+         panel->flags.need_restart = false;
+         do_restart = true;
+     }
+-    if (panel->bb_eof_count < panel->expect_eof_count) {
++    if (panel->bb_eof_count != panel->expect_eof_count) {
+         do_restart = true;
+     }
++#endif // CONFIG_LCD_RGB_RESTART_IN_VSYNC
++    // DMA restart always relaunches from bounce buffer 0. Keep the software index in sync
+     panel->bb_eof_count = 0;
+     portEXIT_CRITICAL_ISR(&panel->spinlock);
+-#endif // CONFIG_LCD_RGB_RESTART_IN_VSYNC
+ 
+     if (!do_restart) {
+         return;
+     }
++    panel->restart_count++;
++
++#if RGB_LCD_NEEDS_SEPARATE_RESTART_LINK && !CONFIG_LCD_RGB_RESTART_IN_VSYNC
++    /* [CISTERN PATCH] Full restart instead of the ESP32-S3 restart link in bounce buffer mode.
++     * The restart link skips the first LCD_FIFO_PRESERVE_SIZE_PX (17) pixels, assuming the LCD
++     * FIFO still holds them. After an underrun (late bounce ISR, e.g. under PSRAM load) the FIFO
++     * is empty, the 17 pixels are lost and the whole picture stays shifted left by ~16 px
++     * (wrapping around) until the next full start. Stopping and resetting the LCD engine as in
++     * the initial start costs at most one disturbed frame but always realigns the stream. */
++    if (panel->bb_size) {
++        lcd_rgb_panel_start_transmission(panel);
++        return;
++    }
++#endif
+ 
+     if (panel->bb_size) {
+         // Catch de-synced frame buffer and reset if needed.
+@@ -1078,7 +1110,8 @@
+ 
+ }
+ 
+-static void lcd_rgb_panel_start_transmission(esp_rgb_panel_t *rgb_panel)
++/* [CISTERN PATCH] IRAM_ATTR: also called from the VSYNC ISR as full recovery (see try_restart) */
++static IRAM_ATTR void lcd_rgb_panel_start_transmission(esp_rgb_panel_t *rgb_panel)
+ {
+     // reset FIFO of DMA and LCD, in case there remains old frame data
+     gdma_reset(rgb_panel->dma_chan);
+@@ -1089,6 +1122,7 @@
+     // pre-fill bounce buffers if needed
+     if (rgb_panel->bb_size) {
+         rgb_panel->bounce_pos_px = 0;
++        rgb_panel->bb_eof_count = 0; // [CISTERN PATCH] backport of upstream c0fb05b
+         lcd_rgb_panel_fill_bounce_buffer(rgb_panel, rgb_panel->bounce_buffer[0]);
+         lcd_rgb_panel_fill_bounce_buffer(rgb_panel, rgb_panel->bounce_buffer[1]);
+     }
+--- a/rgb/include/esp_lcd_panel_rgb.h	2026-09-28 08:55:28.758030510 +0200
++++ b/rgb/include/esp_lcd_panel_rgb.h	2026-11-17 16:29:12.384979489 +0100
+@@ -236,6 +236,16 @@
+ esp_err_t esp_lcd_rgb_panel_restart(esp_lcd_panel_handle_t panel);
+ 
+ /**
++ * @brief [CISTERN PATCH] Number of DMA restarts the driver performed after a detected bounce buffer
++ *        desync (missing or excess EOF events per frame) or an explicit esp_lcd_rgb_panel_restart().
++ *        Diagnostic only; see components/esp_lcd/CISTERN_PATCH.md.
++ *
++ * @param[in] panel LCD panel handle, returned from `esp_lcd_new_rgb_panel()`
++ * @return Restart count since panel creation
++ */
++uint32_t esp_lcd_rgb_panel_get_restart_count(esp_lcd_panel_handle_t panel);
++
++/**
+  * @brief Get the address of the frame buffer(s) that allocated by the driver
+  *
+  * @param[in] panel LCD panel handle, returned from `esp_lcd_new_rgb_panel`

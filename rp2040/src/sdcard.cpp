@@ -5,6 +5,7 @@
 
 #include "sdcard.hpp"
 #include "debug_log.hpp"
+#include "uart_link.hpp"
 #include "littlefs_driver.hpp"
 #include <ArduinoJson.h>
 
@@ -308,7 +309,7 @@ void sd_card_trigger_status_push(void) {
     memcpy(&res_buf[4], &capacity_mb, sizeof(capacity_mb));
     memcpy(&res_buf[8], volume_label, 11);
 
-    packetSerial.send(res_buf, 19);
+    uart_link_send(res_buf, 19);
 
     /* Push LoRa config automatically to ESP32 on status query if SD card is valid */
     if (state == SD_STATE_VALID_FAT32_LFS || state == SD_STATE_VALID_FAT32) {
@@ -538,7 +539,7 @@ void sd_card_update(PacketSerial &packetSerial) {
                 memcpy(&res_buf[4], &capacity_mb, sizeof(capacity_mb));
                 memcpy(&res_buf[8], volume_label, 11);
 
-                packetSerial.send(res_buf, 19);
+                uart_link_send(res_buf, 19);
                 LogSerial.printf("SD Card Event Pushed! State: %d, Label: %s\r\n", state, volume_label);
 
                 /* Signal main loop to reload LoRa config files from SD */
@@ -722,7 +723,7 @@ void sd_card_update(PacketSerial &packetSerial) {
 
         case FMT_SUCCESS: {
             uint8_t res_buf[2] = { static_cast<uint8_t>(PKT_TYPE_RES_SD_FORMAT), 1 };
-            packetSerial.send(res_buf, sizeof(res_buf));
+            uart_link_send(res_buf, sizeof(res_buf));
             g_sd_card_event_triggered = true;
             LogSerial.println("Non-Blocking Dual-Partition Format completed successfully!\r\n");
             g_fmt_state = FMT_IDLE;
@@ -732,7 +733,7 @@ void sd_card_update(PacketSerial &packetSerial) {
         case FMT_ERROR: {
             g_sd_initialized = false;
             uint8_t res_buf[2] = { static_cast<uint8_t>(PKT_TYPE_RES_SD_FORMAT), 0 };
-            packetSerial.send(res_buf, sizeof(res_buf));
+            uart_link_send(res_buf, sizeof(res_buf));
             g_sd_card_event_triggered = true;
             LogSerial.println("Non-Blocking Dual-Partition Format failed.\r\n");
             g_fmt_state = FMT_IDLE;

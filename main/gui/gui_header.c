@@ -47,6 +47,11 @@ static header_slot_ui_t s_slots[4];
 static bool s_alarm_active = false;
 static lv_timer_t *s_alarm_timer = NULL;
 static bool s_alarm_blink_state = false;
+/* Requested alarm indicator state, written from any task and applied by an LVGL timer
+ * (-1 = nothing pending). Callers never have to take the LVGL lock. */
+#define ALARM_STATE_APPLY_PERIOD_MS 100
+static int8_t s_alarm_state_request = -1;
+static lv_timer_t *s_alarm_apply_timer = NULL;
 
 
 /* Cached network state */
@@ -193,12 +198,13 @@ static void alarm_blink_timer_cb(lv_timer_t *timer) {
     }
 }
 
-void gui_header_set_alarm_state(bool has_active_alarms) {
+/**
+ * @brief Apply the alarm indicator state. Runs in the LVGL task (timer context, lock held).
+ */
+static void apply_alarm_state(bool has_active_alarms) {
     if (s_alarm_active == has_active_alarms) return; /* No change */
-    
-    s_alarm_active = has_active_alarms;
 
-    lv_port_sem_take();
+    s_alarm_active = has_active_alarms;
 
     if (has_active_alarms) {
         /* 1. Start blinking timer (600ms toggle rate) */
@@ -234,16 +240,28 @@ void gui_header_set_alarm_state(bool has_active_alarms) {
             lv_obj_set_style_text_color(s_lbl_title, lv_color_white(), LV_PART_MAIN);
         }
 
-        /* 2. Restore Slot 1 to default WiFi behavior */
+        /* 2. Restore Slot 1 to default WiFi behavior (icon and click callback) */
         lv_obj_add_flag(s_slots[HEADER_SLOT_RIGHT_1].lbl, LV_OBJ_FLAG_HIDDEN);
         lv_obj_remove_event_cb(s_slots[HEADER_SLOT_RIGHT_1].btn, alarm_click_interceptor_cb);
-        
-        lv_port_sem_give();
-        apply_wifi_status_ui();
-        return;
-    }
+        lv_obj_remove_event_cb(s_slots[HEADER_SLOT_RIGHT_1].btn, default_wifi_click_cb);
+        lv_obj_add_event_cb(s_slots[HEADER_SLOT_RIGHT_1].btn, default_wifi_click_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_port_sem_give();
+        apply_wifi_status_ui();
+    }
+}
+
+static void alarm_state_apply_timer_cb(lv_timer_t *timer) {
+    (void)timer;
+    /* Take the latest request atomically; a request set meanwhile is applied on the next tick */
+    int8_t req = __atomic_exchange_n(&s_alarm_state_request, (int8_t)-1, __ATOMIC_ACQ_REL);
+    if (req < 0) return;
+    apply_alarm_state(req == 1);
+}
+
+void gui_header_set_alarm_state(bool has_active_alarms) {
+    /* Callable from any task without the LVGL lock (alarm model, UART task, event loop):
+     * the header applies it within ALARM_STATE_APPLY_PERIOD_MS */
+    __atomic_store_n(&s_alarm_state_request, (int8_t)(has_active_alarms ? 1 : 0), __ATOMIC_RELEASE);
 }
 
 static void gui_header_event_handler(void *handler_args, esp_event_base_t base, int32_t id, void *event_data) {
@@ -324,6 +342,11 @@ void gui_header_init(lv_obj_t *parent) {
     /* Right 3 (Action button / Mute) */
     lv_obj_set_size(s_slots[HEADER_SLOT_RIGHT_3].btn, 80, SLOT_HEIGHT);
     lv_obj_set_pos(s_slots[HEADER_SLOT_RIGHT_3].btn, 480 - 10 - SLOT_W_EDGE - 6 - SLOT_W_INNER - 6 - 80, SLOT_Y_OFFSET);
+
+    /* Applies alarm state requests made from other tasks */
+    if (!s_alarm_apply_timer) {
+        s_alarm_apply_timer = lv_timer_create(alarm_state_apply_timer_cb, ALARM_STATE_APPLY_PERIOD_MS, NULL);
+    }
 
     lv_port_sem_give();
 

@@ -73,14 +73,6 @@ int alarm_evaluator_register_rule(const alarm_eval_rule_t *rule);
 uint8_t alarm_evaluator_get_rule_buzzer_mode(const char *source_name, const char *rule_id);
 
 /**
- * @brief Parse device JSON string and extract all defined thresholds.
- *        Automatically resolves percent-based thresholds against tank geometry.
- * @param json_str Null-terminated device JSON string.
- * @return Number of registered rules, or negative error code on failure.
- */
-int alarm_evaluator_load_device_json(const char *json_str);
-
-/**
  * @brief Autonomous evaluation entrypoint called on incoming telemetry.
  * @param dev_addr Source device address.
  * @param key Telemetry key.
