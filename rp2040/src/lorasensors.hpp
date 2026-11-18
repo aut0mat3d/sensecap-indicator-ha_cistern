@@ -22,6 +22,28 @@
 #define MAX_THRESHOLDS_PER_DEVICE       8
 #define MAX_DEVICE_OFFSETS              4
 #define MAX_DEVICE_LIMITS               8
+#define MAX_MQTT_KEYS                   10    /* keys per device in the "mqtt" block */
+
+/* MQTT key selection flags (device JSON "mqtt" block, packet 0x46) */
+#define MQTT_KEY_FLAG_VALUE             0x01  /* publish the value */
+#define MQTT_KEY_FLAG_ALARM             0x02  /* publish the alarm state of the key */
+
+/* Packet 0x46: [0] type, [1..4] dev_addr, [5] count, count x entry
+ * entry: key[16], flags(1), expire_after_sec(uint32 LE) */
+#define MQTT_PKT_ENTRY_SIZE             21
+#define MQTT_PKT_MAX_SIZE               (6 + MAX_MQTT_KEYS * MQTT_PKT_ENTRY_SIZE)
+
+/** MQTT selection of one key (RAM only, parsed from the device JSON "mqtt" block) */
+typedef struct __attribute__((packed)) {
+    char     key[16];
+    uint8_t  flags;               /* MQTT_KEY_FLAG_* */
+    uint32_t expire_after_sec;    /* explicit "expire_after_sec" (0 = derived from the expected interval) */
+} lora_mqtt_key_t;
+
+typedef struct {
+    uint8_t         count;
+    lora_mqtt_key_t keys[MAX_MQTT_KEYS];
+} lora_mqtt_cfg_t;
 
 typedef enum {
     TANK_TYPE_NONE = 0,
@@ -225,7 +247,13 @@ void lora_telemetry_send_dynamic(PacketSerial& ps, uint32_t dev_addr, uint32_t f
                                  const void* val_data, size_t val_len);
 
 void lorasensors_push_globals(PacketSerial &ps, bool valid_cfg);
+/**
+ * @brief Stream one device to the ESP32: configuration (0x3F) followed by its MQTT key selection (0x46).
+ *        The caller checks uart_link_can_send(LORASENSORS_STREAM_CHUNK_SIZE) first.
+ * @return true if more devices follow.
+ */
 bool lorasensors_stream_single_device(PacketSerial &ps, size_t dev_idx);
+#define LORASENSORS_STREAM_CHUNK_SIZE   (3 + sizeof(lora_device_config_t) + MQTT_PKT_MAX_SIZE)
 bool lorasensors_load_all(SdFat32 &sd);
 const lora_global_config_t& lorasensors_get_globals(void);
 const lora_device_config_t* lorasensors_find_device(uint32_t dev_addr);

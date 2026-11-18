@@ -8,10 +8,17 @@
 RP2040 Core 1: SD_CHECK ─► LOAD_CFG: lorasensors_load_all() + data_storage_load_devices()
    ├─ 0x35 PUSH_LORA_CFG  (globals, RF, mesh, device count)   ─► ESP32 lora_model_on_rp2040_cfg_received()
    └─ 0x3F PUSH_LORA_DEV  (one device per packet, ≥ 15 ms apart, only when the link queue has room) ─► ESP32 lora_model_on_rp2040_device_received()
+      └─ 0x46 PUSH_MQTT_DEV  (MQTT key selection of the same device, always sent) ─► ESP32 mqtt_bridge_on_rp2040_mqtt_cfg()
 ESP32 → 0x3D GET_TIME → RP2040 → 0x3E RES_TIME (last saved UTC, offline clock recovery)
 ESP32 → 0x37 SET_TIME_CFG (POSIX TZ) / 0x3A SYNC_TIME (after NTP or P2P time)
 ```
 On SD insert or after USB-MSC, `sd_card_needs_config_reload()` triggers the same sequence again (RELOAD_CFG).
+Reload requests (MSC end, card state change, ESP32 boot announce `0x22`) are merged: the reload starts
+800 ms after the last request, so close triggers load the configuration once. A `0x22` label resync
+(byte 18 = 1, sent by the SD view when the RP2040 reports a mismatch with the right label) pushes only the
+SD status, the configuration only if the label changed. On the ESP32 the GUI file reload (language files,
+media colors, theme) after `0x35` is merged the same way (1 s quiet time); `/config/mqtt.json` follows 2.5 s
+after the last `0x35` / `0x46`.
 
 ## 2. LoRa uplink (master node with keys)
 
@@ -99,7 +106,7 @@ Rule: a page may take longer to fill, but neither MCU may stall. No side sends l
 |---|---|---|---|
 | `0x20` | CMD_GET_SYS_INFO | E→R | defined, not handled on RP2040 |
 | `0x21` | RES_SYS_INFO | R→E | defined, unused |
-| `0x22` | CMD_SET_ESP_MAC | E→R | 6 B MAC + 11 B expected SD label |
+| `0x22` | CMD_SET_ESP_MAC | E→R | 6 B MAC + 11 B expected SD label + 1 B mode (0 = boot announce: config push, 1 = label resync: config push only if the label changed) |
 | `0x30` | CMD_SD_GET_INFO | E→R | – |
 | `0x31` | RES_SD_INFO | R→E | present, usb_mounted, state, total_mb, label |
 | `0x32` | CMD_SD_FORMAT | E→R | format_type (0 = LittleFS, 1 = full SD) + label[12] |
@@ -122,6 +129,7 @@ Rule: a page may take longer to fill, but neither MCU may stall. No side sends l
 | `0x43` | RES_SET_OFFSET | R→E | 1 = OK, 0 = ERR |
 | `0x44` | CMD_GET_LAST_VALUE | E→R | dev_addr(4) + key[16]: newest archived value of a key |
 | `0x45` | RES_LAST_VALUE | R→E | dev_addr, key[16], status (1 = value), value (float), timestamp, expected interval (s), unit[8]; posted on the ESP32 as `VIEW_EVENT_ARCHIVE_LAST_VALUE` |
+| `0x46` | PUSH_MQTT_DEV | R→E | dev_addr, count, count × {key[16], flags (bit 0 value, bit 1 alarm), expire_after_sec (uint32)}; sent right after the device's `0x3F` (§7) |
 | `0xA0` | CMD_COLLECT_INTERVAL | E→R | defined, not handled |
 | `0xA1/0xA2` | CMD_BEEP_ON/OFF | E→R | legacy click |
 | `0xA3/0xA4` | CMD_SHUTDOWN / POWER_ON | E→R | sensor power |
@@ -136,9 +144,49 @@ Rule: a page may take longer to fill, but neither MCU may stall. No side sends l
 | `0xBB` | LORA_TELEMETRY | R→E | DevAddr, FCnt, type, context, key, unit, value |
 | `0xBC` | LOCAL_TELEMETRY | R→E | onboard/Grove sensors |
 
-Free IDs for planned extensions: `0x46`–`0x47` (CLEAR_CHANNEL_HISTORY per NTTW roadmap).
+Free IDs for planned extensions: `0x47`–`0x48` (CLEAR_CHANNEL_HISTORY per NTTW roadmap).
 
-## 7. Differences found vs. AGENTS.md
+## 7. MQTT / Home Assistant
+
+```
+device JSON "mqtt" block ─► RP2040 lorasensors_load_all() ─► 0x46 per device ─► ESP32 mqtt_bridge (selection)
+/config/mqtt.json ─► ESP32 rp2040_read_file_from_sd() (2.5 s after the last 0x35/0x46) ─► broker settings
+VIEW_EVENT_LORA_TELEMETRY ─► mqtt_bridge queue ─► bridge task ─► esp-mqtt outbox ─► broker
+alarm_evaluator (1 s poll per selected key) ─► alarm state topic
+```
+
+* Only keys listed in the `mqtt` block of a device JSON are published (per SenseCAP: each SD card selects
+  its own keys). No file `/config/mqtt.json` or `"enabled": false` → no connection at all.
+* Node id: `sensecap_<last 3 MAC bytes>` (matches the SD label `SCAP_XXXXXX`).
+* Device identity in HA: LoRa sensors `lora_<dev_eui>` (`lora_<dev_addr>` without `dev_eui`), shared by all
+  SenseCAPs that forward the sensor, with `via_device` = node. Onboard / Grove sensors (dev_addr ≤ 0x7F),
+  `rssi` and `snr` belong to the SenseCAP device (reception quality differs per receiver).
+* If two SenseCAPs select the same key of the same sensor, HA receives the same `unique_id` twice and
+  keeps the first one; select every sensor key on one SenseCAP only.
+
+| Topic | Payload | Retain |
+|---|---|---|
+| `<base>/<node>/status` | `online` / `offline` (last will) | yes |
+| `<base>/<node>/<obj>/<key>` | value (`1.25`, `42`, string) — `<obj>` = `lora_<id>` or `i2c_<addr>` | `retain_states` |
+| `<base>/<node>/<obj>/<key>/alarm` | `ok` / `info` / `warning` / `danger` (most severe tripped threshold, hysteresis and damping applied) | yes |
+| `<base>/<node>/<obj>/rssi`, `.../snr` | reception of the device's last frame at this SenseCAP (P2P listener: the relaying hop) | `retain_states` |
+| `<prefix>/sensor/<node>/<obj>_<key>[_alarm]/config` | HA discovery (`unique_id`, `state_topic`, `availability_topic`, `device_class` / `state_class` / unit from the unit, `expire_after`, `device`, `origin`) | yes |
+
+* Discovery of a value entity is published with its first value (type and unit come from the telemetry,
+  so discovery and values always agree); alarm, RSSI and SNR entities are known in advance.
+* `expire_after` (LoRa values, RSSI, SNR): `expire_after_sec` of the key, else 2 × expected interval + 60 s
+  (archive `expected_interval_sec`, else `report_interval_sec`), the staleness rule of the GUI. Onboard
+  sensors rely on the node availability; they are published at most every `local_interval_sec`.
+* Sync after every connect and config reload: the bridge subscribes to `<prefix>/+/<node>/+/config` for 3 s,
+  publishes an empty retained config for every collected topic that no selected entity produces any more
+  (HA removes the entity), then publishes all known configs. HA birth (`<prefix>/status` = `online`)
+  republishes the configs.
+* Changing `base_topic` or `discovery_prefix` leaves the retained messages under the old names on the broker.
+* Threading: the UART task and the event loops only copy into a staging table (spinlock) or the bridge
+  queue (no wait); publishing uses `esp_mqtt_client_enqueue` (outbox limit 32 KB), so a slow broker never
+  blocks the link. Entity table, collected topics, staging tables and queue live in PSRAM.
+
+## 8. Differences found vs. AGENTS.md
 
 * AGENTS.md §6 lists only 15 packets; the table above is complete (0x20–0x22, 0x32–0x34, 0x38/0x39, 0x3F–0x43, 0xA9–0xAB are missing there).
 * P2P type `0x01` (CLAIM) is not mentioned in AGENTS.md.

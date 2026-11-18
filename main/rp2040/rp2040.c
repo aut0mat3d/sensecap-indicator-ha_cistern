@@ -20,6 +20,7 @@
 #include "gui/i18n/gui_i18n.h"
 #include "media_standards.h"
 #include "gui_theme.h"
+#include "mqtt_bridge.h"
 #include "chart_query_scheduler.h"
 #include <time.h>
 #include <stdlib.h>
@@ -344,25 +345,59 @@ static bool _dynamic_sensor_packet_is_valid(const uint8_t* p_data, size_t len) {
     }
 }
 
-/* Helper task to reload GUI files from SD (language files, media colors)
- * without blocking the UART receiver task */
+/* Reload of the GUI files from SD (language files, media colors, theme) in a helper task, so the
+ * UART receiver never blocks. Requests are merged: the files are read once the requests have
+ * been quiet for GUI_RELOAD_SETTLE_MS; a request during the reload starts one more pass. */
+#define GUI_RELOAD_SETTLE_MS 1000
+static portMUX_TYPE      s_gui_reload_mux = portMUX_INITIALIZER_UNLOCKED;
+static char              s_gui_reload_lang[16];
+static volatile uint32_t s_gui_reload_req_ms;
+static volatile bool     s_gui_reload_pending;
+static volatile bool     s_gui_reload_running;
+
 static void i18n_reload_task(void *arg) {
-    char *lang = (char *)arg;
-    if (lang) {
+    (void)arg;
+    for (;;) {
+        uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        uint32_t quiet = now - s_gui_reload_req_ms;
+        if (quiet < GUI_RELOAD_SETTLE_MS) {
+            vTaskDelay(pdMS_TO_TICKS(GUI_RELOAD_SETTLE_MS - quiet));
+            continue;
+        }
+
+        char lang[sizeof(s_gui_reload_lang)];
+        portENTER_CRITICAL(&s_gui_reload_mux);
+        bool pending = s_gui_reload_pending;
+        s_gui_reload_pending = false;
+        if (!pending) s_gui_reload_running = false;
+        memcpy(lang, s_gui_reload_lang, sizeof(lang));
+        portEXIT_CRITICAL(&s_gui_reload_mux);
+        if (!pending) break;
+
         gui_i18n_reload_from_sd(lang);
-        free(lang);
+        media_standards_load_from_sd();
+        gui_theme_load_from_sd();
+        gui_theme_check_media_contrast();
     }
-    media_standards_load_from_sd();
-    gui_theme_load_from_sd();
-    gui_theme_check_media_contrast();
     vTaskDelete(NULL);
 }
 
 static void trigger_async_i18n_reload(const char *lang) {
     if (!lang || strlen(lang) == 0) return;
-    char *lang_copy = strdup(lang);
-    if (lang_copy) {
-        xTaskCreate(i18n_reload_task, "i18n_load", 4096, lang_copy, 3, NULL);
+    bool start_task;
+    portENTER_CRITICAL(&s_gui_reload_mux);
+    strlcpy(s_gui_reload_lang, lang, sizeof(s_gui_reload_lang));
+    s_gui_reload_req_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    s_gui_reload_pending = true;
+    start_task = !s_gui_reload_running;
+    if (start_task) s_gui_reload_running = true;
+    portEXIT_CRITICAL(&s_gui_reload_mux);
+
+    if (start_task && xTaskCreate(i18n_reload_task, "i18n_load", 4096, NULL, 3, NULL) != pdPASS) {
+        portENTER_CRITICAL(&s_gui_reload_mux);
+        s_gui_reload_running = false;
+        portEXIT_CRITICAL(&s_gui_reload_mux);
+        ESP_LOGE(TAG, "GUI file reload task not created");
     }
 }
 
@@ -454,12 +489,18 @@ static bool _packet_handle(uint8_t* p_data, size_t len) {
 			/* Forward to LoRa RF Subsystem only if LoRa extension is enabled */
 			lora_model_on_rp2040_cfg_received(p_data, len);
 		#endif
+			/* New configuration cycle: MQTT selection follows per device (0x46), mqtt.json is re-read */
+			mqtt_bridge_on_rp2040_cfg_reload();
 			return true;
 		}
         case PKT_TYPE_PUSH_LORA_DEV: {
         #if CONFIG_LORA_ENABLE
             lora_model_on_rp2040_device_received(p_data, len);
         #endif
+            return true;
+        }
+        case PKT_TYPE_PUSH_MQTT_DEV: {
+            mqtt_bridge_on_rp2040_mqtt_cfg(p_data, len);
             return true;
         }
 		case PKT_TYPE_RES_SD_INFO: {
@@ -687,7 +728,7 @@ static void esp32_rp2040_comm_task(void* arg) {
     _cmd_send(PKT_TYPE_CMD_POWER_ON, NULL, 0);
 	/* Announce ESP32 to RP2040 immediately: triggers SD check & config push */
     vTaskDelay(pdMS_TO_TICKS(100));
-    rp2040_send_esp_mac();
+    rp2040_send_esp_mac(false);
 
     cobs_decode_result ret;
     static uint8_t frag[BUF_SIZE] = {0}; /* STATIC: keeps 2 KB off the task stack */
@@ -843,7 +884,7 @@ void esp32_rp2040_init(void) {
                                                              _commu_event_handler, NULL, NULL));
 }
 
-int rp2040_send_esp_mac(void) {
+int rp2040_send_esp_mac(bool resync_only) {
     uint8_t mac[6] = {0};
     esp_efuse_mac_get_default(mac);
 
@@ -853,6 +894,9 @@ int rp2040_send_esp_mac(void) {
     uint8_t payload[18] = {0};
     memcpy(&payload[0], mac, 6);
     memcpy(&payload[6], expected_label, 11);
+    /* [17] = 1: label resync only, the RP2040 pushes the configuration only if the label changed;
+     * 0 = boot announce (config push requested) */
+    payload[17] = resync_only ? 1 : 0;
 
     ESP_LOGI(TAG, "Syncing ESP32 MAC (%02X:%02X:%02X:%02X:%02X:%02X) and Label (%s) to RP2040",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], expected_label);

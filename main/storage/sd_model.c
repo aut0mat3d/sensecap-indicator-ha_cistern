@@ -94,8 +94,7 @@ static void sd_model_event_handler(void *handler_args, esp_event_base_t base,
 }
 
 int sd_model_init(void) {
-    /* Send ESP32 MAC & Expected Label right after UART boot */
-    rp2040_send_esp_mac();
+    /* The ESP32 MAC & expected label are announced once by esp32_rp2040_init() */
 
     /* Register Event Handlers */
     ESP_ERROR_CHECK(esp_event_handler_instance_register_with(

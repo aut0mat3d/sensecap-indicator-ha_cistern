@@ -17,7 +17,7 @@ function(collect_sources source_var)
 endfunction()
 
 # Define a list of directories to include
-set(DIRECTORIES_TO_INCLUDE "util" "alarm" "ha" "wifi" "sensor" "display" "settings" "rp2040" "btn" "mqtt" "storage" "cmd" "nav" "assets" "cistern" "gui" "gui_ext" "lora" "sdcard")
+set(DIRECTORIES_TO_INCLUDE "util" "alarm" "wifi" "sensor" "display" "settings" "rp2040" "btn" "mqtt" "storage" "cmd" "nav" "assets" "cistern" "gui" "gui_ext" "lora" "sdcard")
 
 # Call the custom function to collect the source files
 collect_sources(COLLECTED_SOURCES ${DIRECTORIES_TO_INCLUDE})
@@ -29,6 +29,8 @@ idf_component_register(
   REQUIRES
     lora
     mqtt
+    mbedtls
+    esp_app_format
     json
     console
     nvs_flash

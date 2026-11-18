@@ -34,9 +34,10 @@ LV_IMAGE_DECLARE(ui_img_ic_lora_png);
 #define SLOT_W_INNER    56
 
 typedef struct {
-    lv_obj_t *btn;
-    lv_obj_t *lbl;
-    lv_obj_t *img;
+    lv_obj_t     *btn;
+    lv_obj_t     *lbl;
+    lv_obj_t     *img;
+    lv_event_cb_t page_cb;   /* callback set by the current page (removed by gui_header_clear) */
 } header_slot_ui_t;
 
 static lv_obj_t *s_header_cont = NULL;
@@ -83,6 +84,28 @@ static void default_lora_click_cb(lv_event_t *e) {
         lora_diag_view_show();
 #endif
     }
+}
+
+static bool is_default_cb(lv_event_cb_t cb) {
+    return cb == default_settings_click_cb || cb == default_wifi_click_cb || cb == default_lora_click_cb;
+}
+
+/* Attach exactly one instance of a click callback (LVGL lock held) */
+static void attach_click_cb(lv_obj_t *btn, lv_event_cb_t cb, void *user_data) {
+    lv_obj_remove_event_cb(btn, cb);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, user_data);
+}
+
+/* Replace the page callback of a slot (LVGL lock held); default callbacks are not tracked */
+static void set_slot_cb(header_slot_t slot, lv_event_cb_t cb, void *user_data) {
+    if (!cb) return;
+    if (!is_default_cb(cb)) {
+        if (s_slots[slot].page_cb && s_slots[slot].page_cb != cb) {
+            lv_obj_remove_event_cb(s_slots[slot].btn, s_slots[slot].page_cb);
+        }
+        s_slots[slot].page_cb = cb;
+    }
+    attach_click_cb(s_slots[slot].btn, cb, user_data);
 }
 
 
@@ -359,12 +382,7 @@ void gui_header_init(lv_obj_t *parent) {
         view_event_handle, VIEW_EVENT_BASE, VIEW_EVENT_WIFI_ST,
         gui_header_event_handler, NULL, NULL);
 
-    /* Register default static click callbacks once */
-    lv_obj_add_event_cb(s_slots[HEADER_SLOT_LEFT].btn, default_settings_click_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(s_slots[HEADER_SLOT_RIGHT_1].btn, default_wifi_click_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(s_slots[HEADER_SLOT_RIGHT_2].btn, default_lora_click_cb, LV_EVENT_CLICKED, NULL);
-
-    /* Apply initial default icons */
+    /* Default icons and click callbacks (settings, Wi-Fi / alarm, LoRa) */
     gui_header_clear();
 }
 
@@ -382,11 +400,15 @@ void gui_header_clear(void) {
         if (s_slots[i].lbl) lv_obj_add_flag(s_slots[i].lbl, LV_OBJ_FLAG_HIDDEN);
         if (s_slots[i].img) lv_obj_add_flag(s_slots[i].img, LV_OBJ_FLAG_HIDDEN);
 
-        /* Remove only known standard callbacks to prevent memory list corruptions */
+        /* Remove the standard callbacks and the one set by the previous page */
         lv_obj_remove_event_cb(s_slots[i].btn, default_settings_click_cb);
         lv_obj_remove_event_cb(s_slots[i].btn, default_wifi_click_cb);
         lv_obj_remove_event_cb(s_slots[i].btn, default_lora_click_cb);
         lv_obj_remove_event_cb(s_slots[i].btn, alarm_click_interceptor_cb);
+        if (s_slots[i].page_cb) {
+            lv_obj_remove_event_cb(s_slots[i].btn, s_slots[i].page_cb);
+            s_slots[i].page_cb = NULL;
+        }
     }
     lv_port_sem_give();
 
@@ -403,13 +425,20 @@ void gui_header_clear(void) {
         lv_label_set_text(s_slots[HEADER_SLOT_RIGHT_1].lbl, LV_SYMBOL_WARNING);
         lv_obj_set_style_text_color(s_slots[HEADER_SLOT_RIGHT_1].lbl, warn_color, LV_PART_MAIN);
         lv_obj_remove_flag(s_slots[HEADER_SLOT_RIGHT_1].lbl, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_event_cb(s_slots[HEADER_SLOT_RIGHT_1].btn, alarm_click_interceptor_cb, LV_EVENT_CLICKED, NULL);
+        attach_click_cb(s_slots[HEADER_SLOT_RIGHT_1].btn, alarm_click_interceptor_cb, NULL);
         lv_obj_remove_flag(s_slots[HEADER_SLOT_RIGHT_1].btn, LV_OBJ_FLAG_HIDDEN);
         lv_port_sem_give();
     } else {
+        lv_port_sem_take();
+        attach_click_cb(s_slots[HEADER_SLOT_RIGHT_1].btn, default_wifi_click_cb, NULL);
+        lv_port_sem_give();
         apply_wifi_status_ui();
     }
 
+    /* LoRa status slot: diagnostics page */
+    lv_port_sem_take();
+    attach_click_cb(s_slots[HEADER_SLOT_RIGHT_2].btn, default_lora_click_cb, NULL);
+    lv_port_sem_give();
     apply_lora_status_ui();
 }
 
@@ -429,10 +458,7 @@ void gui_header_set_slot(header_slot_t slot, const char *text, lv_event_cb_t cb,
     lv_label_set_text(s_slots[slot].lbl, text ? text : "");
     lv_obj_remove_flag(s_slots[slot].lbl, LV_OBJ_FLAG_HIDDEN);
 
-    if (cb != NULL) {
-        lv_obj_remove_event_cb(s_slots[slot].btn, cb);
-        lv_obj_add_event_cb(s_slots[slot].btn, cb, LV_EVENT_CLICKED, user_data);
-    }
+    set_slot_cb(slot, cb, user_data);
     lv_obj_remove_flag(s_slots[slot].btn, LV_OBJ_FLAG_HIDDEN);
     lv_port_sem_give();
 }
@@ -446,10 +472,7 @@ void gui_header_set_slot_image(header_slot_t slot, const lv_image_dsc_t *img_src
     lv_image_set_src(s_slots[slot].img, img_src);
     lv_obj_remove_flag(s_slots[slot].img, LV_OBJ_FLAG_HIDDEN);
 
-    if (cb != NULL) {
-        lv_obj_remove_event_cb(s_slots[slot].btn, cb);
-        lv_obj_add_event_cb(s_slots[slot].btn, cb, LV_EVENT_CLICKED, user_data);
-    }
+    set_slot_cb(slot, cb, user_data);
     lv_obj_remove_flag(s_slots[slot].btn, LV_OBJ_FLAG_HIDDEN);
     lv_port_sem_give();
 }

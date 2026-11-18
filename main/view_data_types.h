@@ -179,18 +179,6 @@ struct view_data_lora_diag {
 };
 #endif
 
-/* ── Home Assistant ───────────────────────────────────────────────────────── */
-
-struct view_data_ha_sensor_data {
-    uint8_t index;
-    char    value[32];
-};
-
-struct view_data_ha_switch_data {
-    uint8_t index;
-    int     value;
-};
-
 typedef enum {
     SD_STATE_UNCHECKED       = -1, /* Still unchecked / initialization pending */
     SD_STATE_MISMATCH        =  0, /* Validation failed: Wrong volume label or wrong device */
@@ -237,7 +225,7 @@ enum {
     /* P/C: TODO  Payload: char city[32] */
     VIEW_EVENT_CITY,
 
-    /* P: rp2040/rp2040.c  C: sensor/sensor_view.c, ha/ha_sensor.c */
+    /* P: sensor/sensor_model.c  C: sensor/sensor_view.c */
     VIEW_EVENT_SENSOR_DATA,         /* struct view_data_sensor_data */
 
     /* Trigger-only events (NULL payload) */
@@ -284,21 +272,6 @@ enum {
     /* P: btn/btn.c, display/display_model.c  Payload: bool (0=off, 1=on) */
     VIEW_EVENT_SCREEN_CTRL,
 
-    /* P: ha/ha_config.c  C: ha/ha_config.c  Payload: NULL (reads textarea directly) */
-    VIEW_EVENT_MQTT_ADDR_CHANGED,
-
-    /* P: ha/ha_mqtt.c  C: ha/ha_config.c  Payload: NULL */
-    VIEW_EVENT_HA_ADDR_DISPLAY,
-
-    /* P: ha/ha_sensor.c  C: *** NO CONSUMER — not yet wired up ***
-     * Payload: struct view_data_ha_sensor_data */
-    VIEW_EVENT_HA_SENSOR,
-
-    /* P: ha/ha_switch_screen.c  C: ha/ha_switch.c  Payload: struct view_data_ha_switch_data */
-    VIEW_EVENT_HA_SWITCH_ST,
-
-    /* P: ha/ha_switch.c  C: ha/ha_switch.c (internal loop)  Payload: struct view_data_ha_switch_data */
-    VIEW_EVENT_HA_SWITCH_SET,
 #if CONFIG_GUI_CONFIG_EXTERN
     /* P: settings_view.c  C: storage/sd_model.c  Payload: uint8_t (0=LittleFS only, 1=Full SD) */
     VIEW_EVENT_SD_FORMAT_REQ,

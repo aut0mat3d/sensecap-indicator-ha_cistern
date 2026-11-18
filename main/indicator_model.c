@@ -37,11 +37,8 @@ int indicator_model_init(void) {
 
 #ifdef WIFI_H
 	indicator_wifi_model_init();
-	#ifdef MQTT_H
-	indicator_mqtt_init();
-		#ifdef HA_H
-	indicator_ha_model_init();
-		#endif
+	#ifdef MQTT_BRIDGE_H
+	mqtt_bridge_init();
 	#endif
 
 #endif

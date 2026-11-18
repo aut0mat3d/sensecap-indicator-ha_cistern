@@ -111,6 +111,14 @@
       "retention": { "single": 0, "hours": 24, "days": 31, "weeks": 0, "months": 36, "years": 10 }
     }
   },
+  "mqtt": {
+    "depth":       { "alarm": true },
+    "volume":      {},
+    "flowrate":    { "alarm": true },
+    "battery_soc": { "alarm": true },
+    "rssi":        {},
+    "snr":         {}
+  },
   "display_config": {
     "unit_system": "metric",
     "volume_unit": "m3"

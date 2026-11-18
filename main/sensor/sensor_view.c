@@ -5,7 +5,6 @@
 #include "sensor_model.h"
 #include "sensor_view.h"
 
-#include "home_assistant_config.h"
 #include "lv_port.h"
 #include "view_data.h"
 
@@ -46,7 +45,7 @@ static SensorCardSpec sensor_card_specs[] = {
         .type = SHT41_SENSOR_TEMP,
         .icon = &ui_img_ic_temp_png,
         .name = "Temp",
-        .unit = CONFIG_SENSOR1_UI_UNIT,
+        .unit = "°C",
         .accent_color = 0xECBF41,
         .x = 22,
         .y = 72,

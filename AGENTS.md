@@ -50,7 +50,7 @@ Keep these documents in sync when changing architecture, protocol or JSON schema
 │   ├── gui/               reusable LVGL 9 widgets, header/footer, i18n (builtin EN + DE)
 │   ├── lora/              SX1262 model, LoRaWAN crypto, P2P mesh, LoRa diagnostics page
 │   ├── rp2040/            UART link + chart_query_scheduler
-│   └── ...                btn, cmd, ha, mqtt, nav, sdcard, sensor, settings, storage, util, wifi
+│   └── ...                btn, cmd, mqtt (MQTT + HA discovery), nav, sdcard, sensor, settings, storage, util, wifi
 ├── components/
 │   ├── bsp/               board support (Seeed/Espressif BSP): ST7701S panel init, RGB timings, IO expander
 │   └── esp_lcd/           patched copy of ESP-IDF v5.4 esp_lcd (RGB restart fix), see esp_lcd/CISTERN_PATCH.md

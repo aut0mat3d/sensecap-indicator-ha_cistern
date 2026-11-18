@@ -29,7 +29,11 @@ bool sd_card_needs_config_reload(void);
 
 void sd_card_clear_config_reload(void);
 
-void sd_card_trigger_status_push(void);
+/**
+ * @brief Push the SD status (0x31) to the ESP32.
+ * @param request_reload true: also push the configuration again (merged with other requests)
+ */
+void sd_card_trigger_status_push(bool request_reload);
 
 /**
  * @brief Provides reference to the initialized SdFat32 filesystem instance.
@@ -59,8 +63,9 @@ void sd_card_msc_toggle(bool enable);
 
 /**
  * @brief Sets the expected target Volume Label received from ESP32 eFuse MAC.
+ * @return true if the label differs from the stored one
  */
-void sd_card_set_expected_label(const char* label);
+bool sd_card_set_expected_label(const char* label);
 
 /**
  * @brief Returns true if USB MSC mode is currently active.

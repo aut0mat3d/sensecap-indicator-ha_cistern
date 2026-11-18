@@ -109,6 +109,7 @@ enum pkt_type_cmd
     PKT_TYPE_RES_SET_OFFSET       = 0x43,  /* RP2040 -> ESP32: Status (uint8_t: 1=OK, 0=ERR) */
     PKT_TYPE_CMD_GET_LAST_VALUE   = 0x44,  /* ESP32 -> RP2040: dev_addr(4) + key[16]: newest archived value */
     PKT_TYPE_RES_LAST_VALUE       = 0x45,  /* RP2040 -> ESP32: dev_addr, key[16], status, value, ts, expected interval, unit[8] */
+    PKT_TYPE_PUSH_MQTT_DEV        = 0x46,  /* RP2040 -> ESP32: MQTT key selection of one device (after its 0x3F) */
 
 
     /* ── 0xA0..0xAF: Power, Hardware & Buzzer Control ─────────────────── */
@@ -142,7 +143,12 @@ enum pkt_type_data
 
 void esp32_rp2040_init(void);
 
-int rp2040_send_esp_mac(void);
+/**
+ * @brief Send the ESP32 MAC and the expected SD volume label (0x22).
+ * @param resync_only false = boot announce (RP2040 pushes the configuration),
+ *                    true  = label resync (config push only if the RP2040 label changed)
+ */
+int rp2040_send_esp_mac(bool resync_only);
 
 int rp2040_send_sync_time(uint32_t utc_ts, uint8_t flags);
 int rp2040_get_last_time_req(void);

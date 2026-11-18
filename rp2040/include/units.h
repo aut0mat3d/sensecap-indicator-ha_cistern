@@ -3,6 +3,7 @@
  * @brief Unit conversion utilities for RP2040
  *        Used for: (1) Parsing sensor data with unit conversion
  *                 (2) Volume calculation from height values using tank_geometry
+ *        Complete builtin table in flash; /config/units.json only adds or corrects units.
  *
  * @copyright © 2026, SenseCAP Cistern Extension
  */
@@ -19,14 +20,14 @@ extern "C" {
 #endif
 
 /**
- * @brief Initialize units system
- * @param units_json_path Path to units.json file (NULL to use builtin defaults)
- * @return true on success
+ * @brief (Re)load the SD additions / corrections on top of the builtin table
+ * @param units_json_path Path to units.json (NULL or missing file: builtin table only)
+ * @return true (the builtin table is always available)
  */
 bool units_init(const char* units_json_path = nullptr);
 
 /**
- * @brief Shutdown units system
+ * @brief Drop the SD additions (builtin table stays available)
  */
 void units_shutdown(void);
 
@@ -47,6 +48,7 @@ const char* units_get_quantity_type(const char* unit);
 
 /**
  * @brief Convert a value from one unit to another within the same quantity type
+ *        (base = value * factor + offset). Impossible conversions are logged once per unit pair.
  * @param value Value to convert
  * @param from_unit Source unit (e.g., "cm")
  * @param to_unit Target unit (e.g., "m")
@@ -62,9 +64,9 @@ float units_convert(float value, const char* from_unit, const char* to_unit);
 float units_get_factor(const char* unit);
 
 /**
- * @brief Get temperature offset for a unit
- * @param unit Unit symbol (only relevant for temperature units)
- * @return Temperature offset, or 0.0 if not applicable
+ * @brief Get the offset to the base unit (base = value * factor + offset; temperatures only)
+ * @param unit Unit symbol
+ * @return Offset, or 0.0 if not applicable
  */
 float units_get_offset(const char* unit);
 
@@ -81,13 +83,6 @@ const char* units_get_si_base(const char* quantity_type);
  * @return Display symbol, or the unit itself if not found
  */
 const char* units_get_symbol(const char* unit);
-
-/**
- * @brief Get name for a unit
- * @param unit Unit symbol to look up  
- * @return Human-readable name, or the unit itself if not found
- */
-const char* units_get_name(const char* unit);
 
 /**
  * @brief Check if a unit exists in the database

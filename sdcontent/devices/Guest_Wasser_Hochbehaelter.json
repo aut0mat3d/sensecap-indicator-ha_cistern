@@ -3,6 +3,7 @@
   "medium": "water",
   "enabled": true,
   "dev_addr": "05975dc9",
+  "dev_eui": "EUI_001_24E124",
   "decoder": "EM500-SWL",
   "report_interval_sec": 300,
   "offsets": {
@@ -103,6 +104,10 @@
       "max_estimated_count": 0,
       "retention": { "single": 0, "hours": 24, "days": 31, "weeks": 0, "months": 36, "years": 10 }
     }
+  },
+  "mqtt": {
+    "rssi": {},
+    "snr":  {}
   },
   "display_config": {
     "unit_system": "metric",

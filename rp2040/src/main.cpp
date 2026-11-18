@@ -504,15 +504,19 @@ static void handle_packet(const uint8_t* buffer, size_t size)
 
 
         case PKT_TYPE_CMD_SET_ESP_MAC: {
+            /* [1..6] MAC, [7..17] expected label, [18] 1 = label resync only (0 / missing = boot announce) */
             if (size >= 18) {
                 memcpy(g_esp32_mac, &buffer[1], 6);
                 char expected_label[12] = {0};
                 memcpy(expected_label, &buffer[7], 11);
-                sd_card_set_expected_label(expected_label);
-                LogSerial.printf("Stored expected volume label from ESP32: %s\r\n", expected_label);
-                
-                /* SAFE STATUS PUSH: Trigger status evaluation without re-initializing SPI/USB */
-                sd_card_trigger_status_push();
+                bool changed = sd_card_set_expected_label(expected_label);
+                bool resync_only = (size >= 19 && buffer[18] == 1);
+                LogSerial.printf("Stored expected volume label from ESP32: %s (%s%s)\r\n", expected_label,
+                                 resync_only ? "resync" : "boot announce", changed ? ", changed" : "");
+
+                /* SAFE STATUS PUSH: status evaluation without re-initializing SPI/USB; the ESP32 gets
+                 * the configuration after its boot or when the label changed, not on every resync */
+                sd_card_trigger_status_push(!resync_only || changed);
             }
             break;
         }
@@ -1121,7 +1125,7 @@ void loop1()
             static size_t current_stream_idx = 0;
 
             /* Next device only when the link queue can take the whole chunk */
-            if (dev_stream_timer.check() && uart_link_can_send(3 + sizeof(lora_device_config_t))) {
+            if (dev_stream_timer.check() && uart_link_can_send(LORASENSORS_STREAM_CHUNK_SIZE)) {
                 mutex_enter_blocking(&g_comm_mutex);
                 bool has_more = lorasensors_stream_single_device(packetSerial, current_stream_idx);
                 mutex_exit(&g_comm_mutex);

@@ -12,7 +12,16 @@
 /* Extern global PacketSerial instance defined in main.cpp */
 extern PacketSerial packetSerial;
 
-static bool g_config_reload_pending = false;
+/* Config reload requests (MSC end, card event, ESP32 announce) are merged: the reload starts
+ * once no new request arrived for CONFIG_RELOAD_SETTLE_MS, so close triggers load only once */
+#define CONFIG_RELOAD_SETTLE_MS 800
+static volatile bool     g_config_reload_pending = false;
+static volatile uint32_t g_config_reload_ms = 0;
+
+static void request_config_reload(void) {
+    g_config_reload_ms = millis();
+    g_config_reload_pending = true;
+}
 
 /* ── Private MBR Data Structures (Packed) ───────────────────────────────── */
 
@@ -224,7 +233,7 @@ static bool msc_start_stop_cb(uint8_t power_condition, bool start, bool load_eje
         g_sd_initialized = sd.begin(spi_config);
 
         /* Trigger configuration reload in main loop */
-        g_config_reload_pending = true;
+        request_config_reload();
 
         /* Push updated state immediately to ESP32 */
         g_sd_card_event_triggered = true;
@@ -285,7 +294,7 @@ void sd_card_clear_event_pending(void) {
 }
 
 bool sd_card_needs_config_reload(void) {
-    return g_config_reload_pending;
+    return g_config_reload_pending && (millis() - g_config_reload_ms >= CONFIG_RELOAD_SETTLE_MS);
 }
 
 void sd_card_clear_config_reload(void) {
@@ -293,7 +302,7 @@ void sd_card_clear_config_reload(void) {
 }
 
 /* In rp2040/src/sdcard.cpp */
-void sd_card_trigger_status_push(void) {
+void sd_card_trigger_status_push(bool request_reload) {
     uint8_t present = 0, usb_mounted = 0;
     int8_t state = SD_STATE_UNCHECKED;
     uint32_t capacity_mb = 0;
@@ -311,9 +320,9 @@ void sd_card_trigger_status_push(void) {
 
     uart_link_send(res_buf, 19);
 
-    /* Push LoRa config automatically to ESP32 on status query if SD card is valid */
-    if (state == SD_STATE_VALID_FAT32_LFS || state == SD_STATE_VALID_FAT32) {
-        g_config_reload_pending = true;
+    /* Push the configuration to the ESP32 if requested and the SD card is valid */
+    if (request_reload && (state == SD_STATE_VALID_FAT32_LFS || state == SD_STATE_VALID_FAT32)) {
+        request_config_reload();
     }
 }
 
@@ -321,11 +330,12 @@ SdFat32& sd_card_get_fs(void) {
     return sd;
 }
 
-void sd_card_set_expected_label(const char* label) {
-    if (label && strlen(label) > 0) {
-        strncpy(g_expected_label, label, sizeof(g_expected_label) - 1);
-        g_expected_label[11] = '\0';
-    }
+bool sd_card_set_expected_label(const char* label) {
+    if (!label || strlen(label) == 0) return false;
+    bool changed = strncmp(g_expected_label, label, 11) != 0;
+    strncpy(g_expected_label, label, sizeof(g_expected_label) - 1);
+    g_expected_label[11] = '\0';
+    return changed;
 }
 
 void sd_card_msc_toggle(bool enable) {
@@ -344,7 +354,7 @@ void sd_card_msc_toggle(bool enable) {
         g_sd_initialized = sd.begin(spi_config);
 
         /* Trigger configuration reload in main loop */
-        g_config_reload_pending = true;
+        request_config_reload();
     }
 
     /* Push updated MSC state immediately to ESP32 */
@@ -543,7 +553,7 @@ void sd_card_update(PacketSerial &packetSerial) {
                 LogSerial.printf("SD Card Event Pushed! State: %d, Label: %s\r\n", state, volume_label);
 
                 /* Signal main loop to reload LoRa config files from SD */
-                g_config_reload_pending = true;
+                request_config_reload();
             }
         }
     }

@@ -16,6 +16,11 @@
       "corr_factor": 1.0
     }
   },
+  "mqtt": {
+    "SHT41_TEMP":     true,
+    "SHT41_HUMIDITY": true,
+    "dewpoint":       true
+  },
   "display_config": {
     "unit_system": "metric"
   }

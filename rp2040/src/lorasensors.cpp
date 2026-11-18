@@ -32,6 +32,9 @@ typedef struct {
 } device_limit_t;
 static device_limit_t g_device_limits[MAX_LORA_DEVICES][MAX_DEVICE_LIMITS];
 
+/* MQTT key selection per device ("mqtt" block of the device JSON), streamed as 0x46 */
+static lora_mqtt_cfg_t g_device_mqtt[MAX_LORA_DEVICES];
+
 static lora_global_config_t g_global_cfg = {
     .rf_frequency_hz = 868300000,
     .rf_spreading_factor = 10,
@@ -517,12 +520,52 @@ void lorasensors_push_globals(PacketSerial &ps, bool valid_cfg) {
     LogSerial.printf("RP2040: Pushed Globals (0x35) with %u devices announced\r\n", (unsigned)g_device_count);
 }
 
+/**
+ * @brief Send the MQTT key selection of one device (0x46), always, also with zero keys, so the
+ *        ESP32 table matches the SD card after every reload.
+ *
+ * Per key the ESP32 gets the HA "expire_after" time: the explicit "expire_after_sec", otherwise
+ * 2 x expected interval + 60 s (expected interval of the archive channel, else the device
+ * report interval; same staleness rule as the GUI). Units are not sent: the ESP32 takes them from
+ * the telemetry values, so discovery and published values always agree.
+ */
+static void lorasensors_send_mqtt_cfg(size_t dev_idx) {
+    const lora_device_config_t &dev = g_devices[dev_idx];
+    const lora_mqtt_cfg_t &mc = g_device_mqtt[dev_idx];
+
+    uint8_t buf[MQTT_PKT_MAX_SIZE];
+    memset(buf, 0, sizeof(buf));
+    size_t idx = 0;
+    buf[idx++] = static_cast<uint8_t>(PKT_TYPE_PUSH_MQTT_DEV);
+    memcpy(&buf[idx], &dev.dev_addr, 4); idx += 4;
+    buf[idx++] = mc.count;
+
+    for (uint8_t i = 0; i < mc.count; i++) {
+        const lora_mqtt_key_t &k = mc.keys[i];
+        char channel_key[64];
+        snprintf(channel_key, sizeof(channel_key), "%08lX.%s.%s", (unsigned long)dev.dev_addr, dev.decoder, k.key);
+        const data_channel_config_t *cfg = data_storage_get_config(channel_key);
+
+        uint32_t expire = k.expire_after_sec;
+        if (expire == 0) {
+            uint32_t expected = (cfg && cfg->roundtrip_interval > 0) ? cfg->roundtrip_interval : dev.report_interval_sec;
+            if (expected == 0) expected = 300;
+            expire = 2 * expected + 60;
+        }
+
+        memcpy(&buf[idx], k.key, 16);            idx += 16;
+        buf[idx++] = k.flags;
+        memcpy(&buf[idx], &expire, 4);           idx += 4;
+    }
+    uart_link_send(buf, idx);
+}
+
 bool lorasensors_stream_single_device(PacketSerial &ps, size_t dev_idx) {
     if (dev_idx >= g_device_count) {
         return false; /* All devices sent */
     }
 
-    /* Packet 0x3F: Stream single device chunk */
+    /* Packet 0x3F: Stream single device chunk, followed by its MQTT selection (0x46) */
     static_assert(3 + sizeof(lora_device_config_t) <= UART_LINK_MAX_PACKET,
                   "lora_device_config_t no longer fits into one UART link packet");
     uint8_t dev_buf[3 + sizeof(lora_device_config_t)];
@@ -531,6 +574,7 @@ bool lorasensors_stream_single_device(PacketSerial &ps, size_t dev_idx) {
     dev_buf[2] = static_cast<uint8_t>(g_device_count);
     memcpy(&dev_buf[3], &g_devices[dev_idx], sizeof(lora_device_config_t));
     uart_link_send(dev_buf, sizeof(dev_buf));
+    lorasensors_send_mqtt_cfg(dev_idx);
 
     LogSerial.printf("RP2040: Streamed Device [%u/%u]: '%s' (0x%08lX)\r\n",
                   (unsigned)(dev_idx + 1), (unsigned)g_device_count,
@@ -599,6 +643,7 @@ bool lorasensors_load_all(SdFat32 &sd) {
     memset(g_device_decoder_map, -1, sizeof(g_device_decoder_map));
     memset(g_device_offsets, 0, sizeof(g_device_offsets));
     memset(g_device_limits, 0, sizeof(g_device_limits));
+    memset(g_device_mqtt, 0, sizeof(g_device_mqtt));
 
     // Initialize units database from SD with builtin fallback
     units_init("/config/units.json");
@@ -997,6 +1042,56 @@ bool lorasensors_load_all(SdFat32 &sd) {
                                 lim_idx++;
                             }
                         }
+                    }
+
+                    /* Load the MQTT key selection: "mqtt": { "<key>": { "alarm": true, "expire_after_sec": 0 } }
+                     * (or "<key>": true). Only listed keys are published; merged across files of one dev_addr. */
+                    JsonObject mqtt = doc["mqtt"];
+                    if (mqtt) {
+                        lora_mqtt_cfg_t &mc = g_device_mqtt[target_idx];
+                        for (JsonPair m_pair : mqtt) {
+                            const char* m_key = m_pair.key().c_str();
+                            if (strlen(m_key) == 0 || strlen(m_key) >= sizeof(mc.keys[0].key)) {
+                                LogSerial.printf("[MQTT] Dev 0x%08lX: key '%s' skipped (1..15 characters)\r\n",
+                                                 (unsigned long)dev.dev_addr, m_key);
+                                continue;
+                            }
+                            uint8_t flags = 0;
+                            uint32_t expire = 0;
+                            JsonVariant m_val = m_pair.value();
+                            if (m_val.is<bool>()) {
+                                if (m_val.as<bool>()) flags = MQTT_KEY_FLAG_VALUE;
+                            } else if (m_val.is<JsonObject>()) {
+                                JsonObject m_cfg = m_val.as<JsonObject>();
+                                if (m_cfg["value"] | true) flags |= MQTT_KEY_FLAG_VALUE;
+                                if (m_cfg["alarm"] | false) flags |= MQTT_KEY_FLAG_ALARM;
+                                expire = m_cfg["expire_after_sec"] | 0;
+                            } else {
+                                LogSerial.printf("[MQTT] Dev 0x%08lX: key '%s' skipped (expected object or true)\r\n",
+                                                 (unsigned long)dev.dev_addr, m_key);
+                                continue;
+                            }
+                            if (flags == 0) continue;
+
+                            int slot = -1;
+                            for (uint8_t i = 0; i < mc.count; i++) {
+                                if (strcmp(mc.keys[i].key, m_key) == 0) { slot = i; break; }
+                            }
+                            if (slot < 0) {
+                                if (mc.count >= MAX_MQTT_KEYS) {
+                                    LogSerial.printf("[MQTT] Dev 0x%08lX: more than %d keys, '%s' skipped\r\n",
+                                                     (unsigned long)dev.dev_addr, MAX_MQTT_KEYS, m_key);
+                                    continue;
+                                }
+                                slot = mc.count++;
+                            }
+                            lora_mqtt_key_t &mk = mc.keys[slot];
+                            memset(&mk, 0, sizeof(mk));
+                            strncpy(mk.key, m_key, sizeof(mk.key) - 1);
+                            mk.flags = flags;
+                            mk.expire_after_sec = expire;
+                        }
+                        DBG_LORA_PRINTF("Dev 0x%08lX: %u MQTT keys selected", (unsigned long)dev.dev_addr, mc.count);
                     }
 
                     /* Load virtual decoder configurations */

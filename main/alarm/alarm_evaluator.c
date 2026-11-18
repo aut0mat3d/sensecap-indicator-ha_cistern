@@ -174,6 +174,24 @@ void alarm_evaluator_evaluate(uint32_t dev_addr, const char *key, float value) {
     xSemaphoreGive(s_eval_mutex);
 }
 
+int alarm_evaluator_get_key_severity(uint32_t dev_addr, const char *key, bool *has_rules) {
+    if (has_rules) *has_rules = false;
+    if (!key || !s_eval_mutex) return -1;
+
+    int severity = -1;
+    xSemaphoreTake(s_eval_mutex, portMAX_DELAY);
+    for (size_t i = 0; i < s_rules_count; i++) {
+        const alarm_eval_rule_t *r = &s_rules[i];
+        if (r->dev_addr != dev_addr || strcmp(r->key, key) != 0) continue;
+        if (has_rules) *has_rules = true;
+        if (r->is_tripped && (severity < 0 || (int)r->severity < severity)) {
+            severity = (int)r->severity;
+        }
+    }
+    xSemaphoreGive(s_eval_mutex);
+    return severity;
+}
+
 /* ── Telemetry Event Listener ──────────────────────────────────────────── */
 
 static void _alarm_evaluator_telem_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {

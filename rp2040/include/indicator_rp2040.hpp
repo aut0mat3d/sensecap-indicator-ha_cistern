@@ -74,6 +74,7 @@ enum pkt_type {
     PKT_TYPE_RES_SET_OFFSET       = 0x43,  /* RP2040 -> ESP32: Status (uint8_t: 1=OK, 0=ERR) */
     PKT_TYPE_CMD_GET_LAST_VALUE   = 0x44,  /* ESP32 -> RP2040: dev_addr(4) + key[16]: newest archived value */
     PKT_TYPE_RES_LAST_VALUE       = 0x45,  /* RP2040 -> ESP32: dev_addr, key[16], status, value, ts, expected interval, unit[8] */
+    PKT_TYPE_PUSH_MQTT_DEV        = 0x46,  /* RP2040 -> ESP32: MQTT key selection of one device (after its 0x3F) */
     
 
     /* ── 0xA0..0xAF: Power, Hardware & Buzzer Control ─────────────────── */

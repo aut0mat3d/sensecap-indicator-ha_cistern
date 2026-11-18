@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "broker_uri": "mqtt://192.168.1.10:1883",
+  "username": "",
+  "password": "",
+  "client_id": "",
+  "node_name": "SenseCAP Keller",
+  "base_topic": "sensecap",
+  "discovery": true,
+  "discovery_prefix": "homeassistant",
+  "retain_states": true,
+  "local_interval_sec": 60,
+  "keepalive_sec": 60,
+  "ca_file": ""
+}

@@ -80,6 +80,13 @@ uint8_t alarm_evaluator_get_rule_buzzer_mode(const char *source_name, const char
  */
 void alarm_evaluator_evaluate(uint32_t dev_addr, const char *key, float value);
 
+/**
+ * @brief Current alarm state of a device key: most severe tripped rule (hysteresis and damping applied).
+ * @param has_rules Optional: set to true if at least one rule exists for the key.
+ * @return Severity of the most severe tripped rule (0 = danger, 1 = warning, 2 = info), -1 if none.
+ */
+int alarm_evaluator_get_key_severity(uint32_t dev_addr, const char *key, bool *has_rules);
+
 #ifdef __cplusplus
 }
 #endif

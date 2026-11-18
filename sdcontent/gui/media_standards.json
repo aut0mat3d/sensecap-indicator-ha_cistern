@@ -27,13 +27,13 @@
     "lpg": {
       "name_en": "LPG / Propane",
       "name_de": "Fluessiggas / Propan",
-      "color_hex": "0xD35400",
+      "color_hex": "0x8E44AD",
       "unit_default": "l"
     },
     "pellets": {
       "name_en": "Wood Pellets",
       "name_de": "Holzpellets",
-      "color_hex": "0xD4AC0D",
+      "color_hex": "0xC19A6B",
       "unit_default": "kg"
     }
   },

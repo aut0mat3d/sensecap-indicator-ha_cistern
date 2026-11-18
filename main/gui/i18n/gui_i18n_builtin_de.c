@@ -106,6 +106,7 @@ const i18n_entry_t g_i18n_builtin_de[] = {
     {"status.no_data",      "Keine Daten"},
     {"status.stale",        "Veraltet"},
     {"telemetry.battery_soc", "Batterie:"},
+    {"mqtt.alarm",          "Alarm"},
     {"detail.value",        "Aktueller Wert:"},
     {"detail.updated",      "Letzter Wert:"},
     {"detail.status",       "Status:"},

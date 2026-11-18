@@ -9,8 +9,8 @@ and checked against alarm thresholds with buzzer and alarm journal.
 **Status:** early beta — in field test on real hardware.
 
 Origin: forked from [Love4yzp/sensecap-indicator-ha](https://github.com/Love4yzp/sensecap-indicator-ha)
-(Seeed's Home Assistant MQTT panel, v1.1.0). Little of that firmware remains; the MQTT/Home Assistant
-part is still in the tree but not yet adapted (see [Home Assistant / MQTT](#home-assistant--mqtt)).
+(Seeed's Home Assistant MQTT panel, v1.1.0). Little of that firmware remains; its fixed-topic MQTT
+client was replaced by a publisher with Home Assistant discovery (see [Home Assistant / MQTT](#home-assistant--mqtt)).
 
 ---
 
@@ -47,7 +47,8 @@ part is still in the tree but not yet adapted (see [Home Assistant / MQTT](#home
 - [x] GUI languages: English and German built in, more from the SD card
 - [ ] Pages generated from JSON on the SD card (today the start page is the static cistern view)
 - [ ] Export of archive data as CSV, weekly / monthly / yearly aggregation
-- [ ] MQTT / Home Assistant integration for the new data model
+- [x] **MQTT / Home Assistant**: selected keys per device (values, alarm states, reception quality) with HA MQTT discovery, broker settings from the SD card
+- [ ] Home Assistant entities shown on the display (HA → SenseCAP)
 
 ---
 
@@ -193,7 +194,7 @@ Serial console on the ESP32-S3 USB port (prompt `Indicator>`):
 | `alarm_ack` | Acknowledge all active alarms |
 | `lcd_restart` | Diagnostics: driver restart of the RGB stream (GDMA/FIFO) at the next VSYNC |
 | `lcd_rgb_reinit` | Diagnostics: full restart of the RGB LCD engine |
-| `haconfig`, `mqtthelp`, `setmqtt …` | MQTT configuration (from the original firmware) |
+| `mqtt` | MQTT configuration (password hidden), connection state and published entities |
 
 ---
 
@@ -213,10 +214,33 @@ A growing "RGB restarts total" means bounce buffer underruns happened (each is n
 
 ## Home Assistant / MQTT
 
-The MQTT client, the console commands and the Home Assistant examples in
-[`examples/homeassistant/`](examples/homeassistant/) come from the original firmware (topics
-`indicator/sensor`, `indicator/switch/set`, `indicator/switch/state`). They are not yet connected to
-the new device / archive data model; an MQTT interface for the decoded and virtual values is planned.
+The SenseCAP publishes only what each device JSON selects, and Home Assistant creates the entities
+by itself (MQTT discovery), no YAML needed.
+
+1. Copy [`sdcontent/config/mqtt.json`](sdcontent/config/mqtt.json) to `/config/mqtt.json` on the SD card,
+   set `broker_uri` (and `username` / `password` if the broker needs them) and `node_name`.
+2. Add an `mqtt` block to every device JSON whose values should reach HA:
+   ```json
+   "mqtt": {
+     "depth":       { "alarm": true },
+     "volume":      {},
+     "battery_soc": { "alarm": true },
+     "rssi":        {}
+   }
+   ```
+   `"alarm": true` adds the alarm state of the key (`ok` / `info` / `warning` / `danger`, evaluated with
+   hysteresis and damping, so HA does not need its own thresholds). `rssi` / `snr` publish how this
+   SenseCAP receives the sensor.
+3. Reinsert the card (or reboot). The console command `mqtt` shows the connection and every entity.
+
+* Each SenseCAP is one HA device (`sensecap_<MAC>`); its onboard sensors and reception values belong to it.
+* A LoRa sensor is one HA device identified by its `dev_eui` (or `dev_addr`), linked to the SenseCAP that
+  forwards it. Several SenseCAPs (master and listeners) can receive the same sensor: select each sensor key
+  on **one** SenseCAP only, otherwise two writers share one entity.
+* Without `/config/mqtt.json` the SenseCAP makes no network connection to any broker.
+* `mqtts://` works with the ESP-IDF CA bundle or a PEM file on the SD card (`ca_file`).
+
+Topics, payloads and the discovery cleanup: [OVERVIEW_DATAFLOW.md §7](docs_extensions_n_changes/overview/OVERVIEW_DATAFLOW.md).
 
 ---
 

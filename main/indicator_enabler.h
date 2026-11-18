@@ -22,11 +22,10 @@
 
 #include "wifi.h"
 
-#include "mqtt.h"
+#include "mqtt_bridge.h"
 
 #include "cmd.h"
 
-#include "ha.h"
 
 #include "cistern_view.h"
 

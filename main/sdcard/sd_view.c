@@ -616,7 +616,7 @@ static void sd_view_event_handler(void *handler_args, esp_event_base_t base,
 		    strncmp(info->volume_label, info->expected_label, 11) == 0)
 		{
 			ESP_LOGW(TAG, "RP2040 expected label out of sync, re-sending ESP32 MAC");
-			rp2040_send_esp_mac();
+			rp2040_send_esp_mac(true);
 		}
 
 #if CONFIG_GUI_CONFIG_EXTERN
