@@ -39,6 +39,7 @@
 #ifndef VERT_GRAPH_H
 #define VERT_GRAPH_H
 
+#include "gui_theme.h"
 #include "lvgl.h"
 #include "widget_base.h"
 #include <stdbool.h>
@@ -89,15 +90,17 @@ typedef struct {
     lv_color_t bg_color;        ///< Background card color
     lv_color_t bar_color;       ///< Bar indicator color (media color)
     lv_color_t text_color;      ///< Value text color
-    lv_color_t alarm_color;     ///< Alarm level marker and danger color
+    lv_color_t alarm_color;     ///< Optional override of the danger color (empty = theme, gui_theme.h)
 
     float alarm_level_min;      ///< Minimum alarm level (0.0f = disabled)
     float alarm_level_max;      ///< Maximum alarm level (0.0f = disabled)
+    gui_alarm_level_t alarm_severity_min; ///< Level shown below alarm_level_min (NONE = danger)
+    gui_alarm_level_t alarm_severity_max; ///< Level shown above alarm_level_max (NONE = danger)
     float hysteresis_min;       ///< Hysteresis for min alarm
     float hysteresis_max;       ///< Hysteresis for max alarm
 
     bool is_estimated;          ///< Quality flag: true if replacement/fallback value
-    bool is_alarm;              ///< Quality flag: true if active threshold violation
+    gui_alarm_level_t alarm_level; ///< Alarm level set by the caller (crossed alarm levels are added on display)
 
     lv_event_cb_t click_cb;     ///< Click event callback for configuration subpage
     void* user_data;            ///< User data passed to click callback
@@ -151,18 +154,20 @@ void vert_graph_update(vert_graph_t* graph, float value);
  * @param value New numeric value.
  * @param unit Unit string (optional, NULL to keep existing).
  * @param is_estimated True if value is an interpolated replacement value.
- * @param is_alarm True if value violates an active alarm threshold.
+ * @param alarm_level Alarm level determined by the caller; the widget also checks alarm_level_min/max
+ *        itself and shows the higher of both levels.
  */
-void vert_graph_update_value(vert_graph_t *graph, float value, const char *unit, bool is_estimated, bool is_alarm);
+void vert_graph_update_value(vert_graph_t *graph, float value, const char *unit, bool is_estimated,
+                             gui_alarm_level_t alarm_level);
 
 /**
  * @brief Update visual quality status without changing current numeric value.
  *
  * @param graph Pointer to widget instance.
  * @param is_estimated Replacement value flag.
- * @param is_alarm Active threshold violation flag.
+ * @param alarm_level Alarm level determined by the caller.
  */
-void vert_graph_set_status(vert_graph_t *graph, bool is_estimated, bool is_alarm);
+void vert_graph_set_status(vert_graph_t *graph, bool is_estimated, gui_alarm_level_t alarm_level);
 
 /**
  * @brief Dynamically set scale range and refresh labels.

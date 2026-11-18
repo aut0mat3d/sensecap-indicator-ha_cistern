@@ -12,7 +12,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "alarm_model.h"
 #include <math.h>
 
 LV_FONT_DECLARE(ui_font_font0);
@@ -20,12 +19,17 @@ LV_FONT_DECLARE(ui_font_font0);
 #define DEFAULT_BG_COLOR      lv_color_hex(0x282828)
 #define DEFAULT_BAR_COLOR     lv_color_hex(0x3498DB)
 #define DEFAULT_TEXT_COLOR    lv_color_hex(0x9E9E9E)
-#define DEFAULT_ALARM_COLOR   lv_color_hex(0xE74C3C)
 #define DEFAULT_BORDER_COLOR  lv_color_hex(0x000000) /* Permanent seamless black bezel */
 
 static inline bool is_color_empty(lv_color_t c) {
     static const lv_color_t zero = {0};
     return memcmp(&c, &zero, sizeof(lv_color_t)) == 0;
+}
+
+/* Theme color of an alarm level; alarm_color overrides the danger color if set */
+static lv_color_t _level_color(const horiz_bargraph_t *graph, gui_alarm_level_t level) {
+    if (level == GUI_ALARM_DANGER && !is_color_empty(graph->alarm_color)) return graph->alarm_color;
+    return lv_color_hex(gui_theme_alarm_level_color(level, 0x000000));
 }
 
 static void horiz_bargraph_click_handler(lv_event_t *e) {
@@ -43,15 +47,11 @@ static void horiz_bargraph_click_handler(lv_event_t *e) {
 static void _horiz_bargraph_refresh_border(horiz_bargraph_t *graph) {
     if (!graph || !graph->container) return;
 
-    bool current_is_alarm = false;
-    if (graph->data_count > 0 && graph->is_alarm[graph->data_count - 1]) {
-        current_is_alarm = true;
-    }
-
-    if (current_is_alarm) {
-        const alarm_ui_config_t *ui_cfg = alarm_get_ui_config();
-        lv_color_t danger_col = lv_color_hex(ui_cfg ? ui_cfg->colors.color_danger : 0xE74C3C);
-        lv_obj_set_style_border_color(graph->container, danger_col, LV_PART_MAIN);
+    /* The bezel follows the alarm level of the newest point */
+    gui_alarm_level_t current = (graph->data_count > 0) ? graph->alarm_level[graph->data_count - 1]
+                                                        : GUI_ALARM_NONE;
+    if (current != GUI_ALARM_NONE) {
+        lv_obj_set_style_border_color(graph->container, _level_color(graph, current), LV_PART_MAIN);
     } else {
         /* Idle state: permanent black border */
         lv_obj_set_style_border_color(graph->container, DEFAULT_BORDER_COLOR, LV_PART_MAIN);
@@ -78,8 +78,8 @@ static void horiz_bargraph_draw_task_cb(lv_event_t *e) {
                 fill_dsc->opa = LV_OPA_TRANSP;
             } else {
                 /* 1. State determines color (Alarm vs. Configured Media Color) */
-                if (graph->is_alarm[pt_idx]) {
-                    fill_dsc->color = !is_color_empty(graph->alarm_color) ? graph->alarm_color : DEFAULT_ALARM_COLOR;
+                if (graph->alarm_level[pt_idx] != GUI_ALARM_NONE) {
+                    fill_dsc->color = _level_color(graph, graph->alarm_level[pt_idx]);
                 } else {
                     fill_dsc->color = graph->bar_color;
                 }
@@ -96,7 +96,8 @@ static void horiz_bargraph_draw_task_cb(lv_event_t *e) {
 }
 
 static void _horiz_bargraph_update_internal(horiz_bargraph_t *graph, const float *new_data,
-                                            const bool *is_estimated, const bool *is_alarm, uint8_t count) {
+                                            const bool *is_estimated, const gui_alarm_level_t *alarm_level,
+                                            uint8_t count) {
     if (!graph || !graph->chart || !new_data) return;
 
     uint8_t copy_count = (count < HORIZ_BARGRAPH_MAX_POINTS) ? count : HORIZ_BARGRAPH_MAX_POINTS;
@@ -107,7 +108,7 @@ static void _horiz_bargraph_update_internal(horiz_bargraph_t *graph, const float
         graph->data[i] = is_invalid ? 0.0f : new_data[i];
         graph->has_data[i] = !is_invalid;
         graph->is_estimated[i] = (!is_invalid && is_estimated) ? is_estimated[i] : false;
-        graph->is_alarm[i] = (!is_invalid && is_alarm) ? is_alarm[i] : false;
+        graph->alarm_level[i] = (!is_invalid && alarm_level) ? alarm_level[i] : GUI_ALARM_NONE;
     }
 
     lv_chart_set_point_count(graph->chart, copy_count > 0 ? copy_count : 1);
@@ -131,7 +132,7 @@ int horiz_bargraph_init(horiz_bargraph_t *graph) {
     if (is_color_empty(graph->bg_color)) graph->bg_color = DEFAULT_BG_COLOR;
     if (is_color_empty(graph->bar_color)) graph->bar_color = DEFAULT_BAR_COLOR;
     if (is_color_empty(graph->text_color)) graph->text_color = DEFAULT_TEXT_COLOR;
-    if (is_color_empty(graph->alarm_color)) graph->alarm_color = DEFAULT_ALARM_COLOR;
+    /* alarm_color stays empty unless set: alarm colors come from the theme */
 
     /* Fallback to standard 10x3 grid tile geometry (480 x 144 px) if unspecified */
     if (graph->width == 0) graph->width = HORIZ_BARGRAPH_DEFAULT_W;
@@ -239,21 +240,22 @@ void horiz_bargraph_update_data(horiz_bargraph_t *graph, const float *new_data, 
 }
 
 void horiz_bargraph_update_series(horiz_bargraph_t *graph, const float *values,
-                                  const bool *is_estimated, const bool *is_alarm, uint8_t count) {
+                                  const bool *is_estimated, const gui_alarm_level_t *alarm_level, uint8_t count) {
     if (!graph) return;
     lv_port_sem_take();
-    _horiz_bargraph_update_internal(graph, values, is_estimated, is_alarm, count);
+    _horiz_bargraph_update_internal(graph, values, is_estimated, alarm_level, count);
     lv_port_sem_give();
 }
 
-void horiz_bargraph_update_point(horiz_bargraph_t *graph, uint8_t index, float value, bool is_estimated, bool is_alarm) {
+void horiz_bargraph_update_point(horiz_bargraph_t *graph, uint8_t index, float value, bool is_estimated,
+                                 gui_alarm_level_t alarm_level) {
     if (!graph || !graph->chart || index >= HORIZ_BARGRAPH_MAX_POINTS) return;
     lv_port_sem_take();
     bool is_invalid = isnan(value) || isinf(value);
     graph->data[index] = is_invalid ? 0.0f : value;
     graph->has_data[index] = !is_invalid;
     graph->is_estimated[index] = !is_invalid && is_estimated;
-    graph->is_alarm[index] = !is_invalid && is_alarm;
+    graph->alarm_level[index] = is_invalid ? GUI_ALARM_NONE : alarm_level;
     if (index >= graph->data_count) graph->data_count = index + 1;
     if (index < lv_chart_get_point_count(graph->chart)) {
         lv_chart_set_value_by_id(graph->chart, graph->series, index, is_invalid ? 0 : (int32_t)(value + 0.5f));
@@ -416,7 +418,7 @@ void horiz_bargraph_update_zone_data(horiz_bargraph_t *graph, uint8_t zone_idx,
                 graph->data[target_idx] = 0.0f;
                 graph->has_data[target_idx] = false; /* Invisible gap */
                 graph->is_estimated[target_idx] = false;
-                graph->is_alarm[target_idx] = false;
+                graph->alarm_level[target_idx] = GUI_ALARM_NONE;
                 lv_chart_set_value_by_id(graph->chart, graph->series, target_idx, 0);
             }
         }
@@ -432,7 +434,7 @@ void horiz_bargraph_update_zone_data(horiz_bargraph_t *graph, uint8_t zone_idx,
                 graph->data[target_idx] = 0.0f;
                 graph->has_data[target_idx] = false;
                 graph->is_estimated[target_idx] = false;
-                graph->is_alarm[target_idx] = false;
+                graph->alarm_level[target_idx] = GUI_ALARM_NONE;
                 lv_chart_set_value_by_id(graph->chart, graph->series, target_idx, 0);
             }
         }
@@ -448,7 +450,12 @@ void horiz_bargraph_update_zone_data(horiz_bargraph_t *graph, uint8_t zone_idx,
                 graph->data[target_idx] = is_no_data ? 0.0f : pt->value;
                 graph->has_data[target_idx] = !is_no_data; /* FALSE = 100% transparent in draw callback */
                 graph->is_estimated[target_idx] = !is_no_data && ((pt->flags & DATA_FLAG_ESTIMATED) != 0);
-                graph->is_alarm[target_idx] = !is_no_data && ((pt->flags & (DATA_FLAG_ALARM_DANGER | DATA_FLAG_ALARM_WARN)) != 0);
+                gui_alarm_level_t lvl = GUI_ALARM_NONE;
+                if (!is_no_data) {
+                    if (pt->flags & DATA_FLAG_ALARM_DANGER) lvl = GUI_ALARM_DANGER;
+                    else if (pt->flags & DATA_FLAG_ALARM_WARN) lvl = GUI_ALARM_WARNING;
+                }
+                graph->alarm_level[target_idx] = lvl;
 
                 lv_chart_set_value_by_id(graph->chart, graph->series, target_idx, is_no_data ? 0 : (int32_t)(pt->value + 0.5f));
             }
@@ -529,11 +536,13 @@ static void _horiz_bargraph_widget_update(widget_t *self, float value, const cha
     uint8_t target_idx = (graph->data_count > 0) ? (graph->data_count - 1) : 0;
 
     /* Check alarm threshold against configured bounds (NAN != 0) */
-    bool is_alarm = false;
-    if (!isnan(value) && !isinf(value) && !is_color_empty(graph->alarm_color)) {
-        if (value < graph->min_value || value > graph->max_value) is_alarm = true;
+    gui_alarm_level_t level = GUI_ALARM_NONE;
+    /* Generic widget mode: values outside the scale count as danger (as before, when the
+     * always-set default alarm color enabled this check) */
+    if (!isnan(value) && !isinf(value)) {
+        if (value < graph->min_value || value > graph->max_value) level = GUI_ALARM_DANGER;
     }
-    horiz_bargraph_update_point(graph, target_idx, value, false, is_alarm);
+    horiz_bargraph_update_point(graph, target_idx, value, false, level);
 }
 
 static void _horiz_bargraph_widget_destroy(widget_t *self) {

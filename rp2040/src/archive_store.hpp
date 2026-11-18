@@ -104,6 +104,12 @@ size_t arc_scan_range(arc_channel_t* ch, arc_level_t level, uint32_t from_ts, ui
                       arc_visit_fn visit, void* ctx);
 
 /**
+ * @brief Read the oldest record of a level.
+ * @return false if the level is empty or not readable.
+ */
+bool arc_read_first(arc_channel_t* ch, arc_level_t level, void* record_out);
+
+/**
  * @brief Read the newest record of a level.
  * @return false if the level is empty or not readable.
  */

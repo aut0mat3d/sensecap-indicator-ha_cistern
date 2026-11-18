@@ -243,12 +243,21 @@ static void compute_keep_entries(data_channel_config_t* cfg) {
     if (cfg->keep_entries[RET_DAYS] > 0 && hours < 26) hours = 26;
     cfg->keep_entries[RET_HOURS] = hours;
 
-    uint16_t single = cfg->retention[RET_SINGLE];
+    uint32_t single = cfg->retention[RET_SINGLE];
     if (cfg->keep_entries[RET_HOURS] > 0) {
         uint32_t staging = (2 * 3600) / cfg->storage_interval;
-        if (single < staging) single = (uint16_t)staging;
+        if (single < staging) single = staging;
     }
-    cfg->keep_entries[RET_SINGLE] = single;
+    if (single > 0) {
+        /* The cold-start restore needs the newest REAL raw record for as long as its hold is
+         * valid (expected interval + tolerance + P2P allowance). Sporadic keys (battery_soc once
+         * a day) would otherwise lose it to the 5-minute hold records of the staging buffer, and
+         * after a reboot nothing would be archived until the next packet. */
+        uint32_t hold_span = cfg->roundtrip_interval + cfg->tolerance_sec + 6;
+        uint32_t restore_keep = hold_span / cfg->storage_interval + 2;
+        if (single < restore_keep) single = restore_keep;
+    }
+    cfg->keep_entries[RET_SINGLE] = (single > 0xFFFF) ? 0xFFFF : (uint16_t)single;
 
     if (cfg->retention[RET_WEEKS] || cfg->retention[RET_MONTHS] || cfg->retention[RET_YEARS]) {
         LogSerial.printf("[STORAGE] %s: weeks/months/years retention configured but not aggregated yet\r\n",
@@ -955,6 +964,8 @@ static bool raw_collect_visit(const void* record, void* ctx) {
     p->is_estimated = (rec->flag == RT_FLAG_ESTIMATED);
     p->count = 0;
     p->is_gap = false;
+    p->value_min = rec->value;
+    p->value_max = rec->value;
     return true;
 }
 
@@ -969,6 +980,8 @@ static bool agg_collect_visit(const void* record, void* ctx) {
     p->is_estimated = (rec->flags & ARC_AGG_FLAG_DEGRADED) != 0;
     p->count = rec->count;
     p->is_gap = false;
+    p->value_min = rec->min;
+    p->value_max = rec->max;
     return true;
 }
 
@@ -1011,6 +1024,8 @@ static void set_gap(data_point_t* p, uint32_t ts) {
     p->is_estimated = false;
     p->count = 0;
     p->is_gap = true;
+    p->value_min = 0.0f;
+    p->value_max = 0.0f;
 }
 
 static data_point_t* load_and_aggregate_roundtrip(
@@ -1056,9 +1071,14 @@ static data_point_t* load_and_aggregate_roundtrip(
         float sum = 0.0f;
         uint32_t bucket_count = 0;
         bool has_estimated = false;
+        float vmin = 0.0f;
+        float vmax = 0.0f;
 
         while (k < raw_count && raw_points[k].timestamp < (current_bucket + interval_sec)) {
-            sum += raw_points[k].value;
+            float v = raw_points[k].value;
+            if (bucket_count == 0 || v < vmin) vmin = v;
+            if (bucket_count == 0 || v > vmax) vmax = v;
+            sum += v;
             bucket_count++;
             if (raw_points[k].is_estimated) has_estimated = true;
             k++;
@@ -1071,6 +1091,8 @@ static data_point_t* load_and_aggregate_roundtrip(
             sum = (float)live_state->accumulator;
             bucket_count = live_state->sample_count;
             has_estimated = false;
+            /* The accumulator keeps no extremes: use its average */
+            vmin = vmax = sum / (float)bucket_count;
         }
 
         if (bucket_count > 0) {
@@ -1081,6 +1103,8 @@ static data_point_t* load_and_aggregate_roundtrip(
             p->is_estimated = has_estimated;
             p->count = bucket_count;
             p->is_gap = false;
+            p->value_min = vmin;
+            p->value_max = vmax;
             j = k;
         } else {
             /* Missing grid interval: flag as empty gap */
@@ -1148,8 +1172,12 @@ static data_point_t* load_and_aggregate_hourly(
         double weighted_sum = 0.0;
         uint32_t weight_total = 0;
         uint32_t covered = 0;
+        float vmin = 0.0f;
+        float vmax = 0.0f;
 
         while (k < raw_count && raw_points[k].timestamp < (current_bucket + interval_sec)) {
+            if (weight_total == 0 || raw_points[k].value_min < vmin) vmin = raw_points[k].value_min;
+            if (weight_total == 0 || raw_points[k].value_max > vmax) vmax = raw_points[k].value_max;
             uint32_t weight = (raw_points[k].count > 0) ? raw_points[k].count : 1;
             weighted_sum += (double)raw_points[k].value * weight;
             weight_total += weight;
@@ -1170,6 +1198,8 @@ static data_point_t* load_and_aggregate_hourly(
             p->is_estimated = (q == AGG_QUALITY_DEGRADED);
             p->count = covered;
             p->is_gap = false;
+            p->value_min = vmin;
+            p->value_max = vmax;
         } else {
             /* Blackout / gap slot: coverage below min_pct, flag as empty gap */
             set_gap(&result[result_count], current_bucket);
@@ -1307,6 +1337,7 @@ chart_data_point_t* data_storage_query_chart(
     uint32_t max_points,
     float alarm_min,
     float alarm_max,
+    uint8_t alarm_flags,
     uint32_t* actual_interval_sec,
     size_t* count
 ) {
@@ -1352,11 +1383,16 @@ chart_data_point_t* data_storage_query_chart(
             if (is_averaged) {
                 chart_pts[i].flags |= DATA_FLAG_AVERAGED;
             }
-            if (alarm_min > 0.0f && raw_pts[i].value < alarm_min) {
-                chart_pts[i].flags |= DATA_FLAG_ALARM_DANGER;
+            /* Alarm coloring: an aggregated bucket is marked when ANY value behind it crossed
+             * the level (minimum for the falling, maximum for the rising level), so an episode
+             * shows up in hours and days even if the average stays inside the limits */
+            if (alarm_min > 0.0f && raw_pts[i].value_min < alarm_min) {
+                chart_pts[i].flags |= (alarm_flags & CHART_ALARM_MIN_IS_WARNING) ? DATA_FLAG_ALARM_WARN
+                                                                                 : DATA_FLAG_ALARM_DANGER;
             }
-            if (alarm_max > 0.0f && raw_pts[i].value > alarm_max) {
-                chart_pts[i].flags |= DATA_FLAG_ALARM_DANGER;
+            if (alarm_max > 0.0f && raw_pts[i].value_max > alarm_max) {
+                chart_pts[i].flags |= (alarm_flags & CHART_ALARM_MAX_IS_WARNING) ? DATA_FLAG_ALARM_WARN
+                                                                                 : DATA_FLAG_ALARM_DANGER;
             }
         }
     } 
@@ -1364,6 +1400,264 @@ chart_data_point_t* data_storage_query_chart(
     free(raw_pts);
     *count = raw_count;
     return chart_pts;
+}
+
+// ============================================================================
+// LTTB (Largest-Triangle-Three-Buckets) reduction for trend graphs
+// ============================================================================
+
+typedef struct {
+    double   sum;
+    uint32_t n;
+    float    vmin;
+    float    vmax;
+    uint8_t  next;              /* next non-empty bucket (own index if none) */
+} lttb_bucket_t;
+
+/* Static: core 1 has only 8 KB stack; queries run one at a time under g_comm_mutex */
+static lttb_bucket_t s_lttb_buckets[LTTB_MAX_POINTS];
+
+typedef struct {
+    uint32_t start;
+    uint32_t width;
+    uint32_t m;
+    int      pass;              /* 1 = bucket statistics, 2 = point selection */
+    arc_level_t level;          /* level of the records currently visited */
+    uint32_t raw_gap_sec;       /* raw records further apart than this are a data gap */
+    /* Pass 2: previous visited record (gap detection) */
+    bool     have_prev;
+    uint32_t prev_ts;
+    arc_level_t prev_level;
+    /* Pass 2 */
+    int32_t  cur;               /* bucket being selected (-1 = none yet) */
+    int32_t  last_nonempty;
+    bool     have_a;            /* previous selected point exists */
+    double   a_t, a_v;
+    bool     have_best;
+    double   best_t, best_v, best_area;
+    bool     best_est;
+    bool     prev_emitted_gap;
+    bool     any_emitted;
+    chart_data_point_t* out;
+    size_t   out_count;
+    size_t   out_capacity;
+    float    alarm_min, alarm_max;
+    uint8_t  alarm_flags;
+} lttb_ctx_t;
+
+/* Unpack one archive record of the current level into time / value / extremes / estimated */
+static void lttb_record(const lttb_ctx_t* c, const void* record, uint32_t* ts, float* v, float* vmin,
+                        float* vmax, bool* est) {
+    if (c->level == ARC_LEVEL_RAW) {
+        const arc_raw_record_t* r = (const arc_raw_record_t*)record;
+        *ts = r->ts;
+        *v = *vmin = *vmax = r->value;
+        *est = (r->flag == RT_FLAG_ESTIMATED);
+    } else {
+        const arc_agg_record_t* a = (const arc_agg_record_t*)record;
+        *ts = a->ts;
+        *v = a->avg;
+        *vmin = a->min;
+        *vmax = a->max;
+        *est = (a->flags & ARC_AGG_FLAG_DEGRADED) != 0;
+    }
+}
+
+/* Average point (C) of the next non-empty bucket; the bucket itself for the newest one */
+static void lttb_next_avg(const lttb_ctx_t* c, int32_t b, double* t, double* v) {
+    int32_t nb = s_lttb_buckets[b].next;
+    *t = (double)c->start + (double)c->width * ((double)nb + 0.5);
+    *v = s_lttb_buckets[nb].sum / (double)s_lttb_buckets[nb].n;
+}
+
+static void lttb_emit_point(lttb_ctx_t* c, int32_t b) {
+    if (!c->have_best || c->out_count >= c->out_capacity) return;
+    chart_data_point_t* p = &c->out[c->out_count++];
+    p->timestamp = (uint32_t)c->best_t;
+    p->value = (float)c->best_v;
+    p->flags = c->best_est ? DATA_FLAG_ESTIMATED : 0;
+    const lttb_bucket_t* bk = &s_lttb_buckets[b];
+    if (c->alarm_min > 0.0f && bk->vmin < c->alarm_min) {
+        p->flags |= (c->alarm_flags & CHART_ALARM_MIN_IS_WARNING) ? DATA_FLAG_ALARM_WARN : DATA_FLAG_ALARM_DANGER;
+    }
+    if (c->alarm_max > 0.0f && bk->vmax > c->alarm_max) {
+        p->flags |= (c->alarm_flags & CHART_ALARM_MAX_IS_WARNING) ? DATA_FLAG_ALARM_WARN : DATA_FLAG_ALARM_DANGER;
+    }
+    c->have_a = true;
+    c->a_t = c->best_t;
+    c->a_v = c->best_v;
+    c->prev_emitted_gap = false;
+    c->any_emitted = true;
+}
+
+/* NO_DATA marker between two records (breaks the line), placed just after the older one */
+static void lttb_emit_gap(lttb_ctx_t* c, uint32_t before_ts, uint32_t after_ts) {
+    if (!c->any_emitted || c->prev_emitted_gap || c->out_count >= c->out_capacity) return;
+    chart_data_point_t* p = &c->out[c->out_count++];
+    p->timestamp = (after_ts - before_ts > 1) ? before_ts + 1 : before_ts;
+    p->value = 0.0f;
+    p->flags = DATA_FLAG_NO_DATA;
+    c->prev_emitted_gap = true;
+}
+
+/*
+ * Records further apart than the expected spacing of their level (raw: update interval incl.
+ * tolerance, hour / day: 1.5 periods) are separated by a gap marker. A gap is never shorter than
+ * one bucket: sparse data in narrow buckets (e.g. hourly values in 22 min buckets) stays connected,
+ * and missing samples below the chart resolution do not break the line.
+ */
+static uint32_t lttb_gap_limit(const lttb_ctx_t* c, arc_level_t level) {
+    uint32_t limit;
+    if (level == ARC_LEVEL_RAW) limit = c->raw_gap_sec;
+    else if (level == ARC_LEVEL_HOUR) limit = 3600 + 1800;
+    else limit = 86400 + 43200;
+    return (limit > c->width) ? limit : c->width;
+}
+
+static bool lttb_visit(const void* record, void* ctx) {
+    lttb_ctx_t* c = (lttb_ctx_t*)ctx;
+    uint32_t ts;
+    float v, vmin, vmax;
+    bool est;
+    lttb_record(c, record, &ts, &v, &vmin, &vmax, &est);
+    if (ts < c->start) return true;
+    uint32_t b = (ts - c->start) / c->width;
+    if (b >= c->m) return true;
+
+    if (c->pass == 1) {
+        lttb_bucket_t* bk = &s_lttb_buckets[b];
+        if (bk->n == 0 || vmin < bk->vmin) bk->vmin = vmin;
+        if (bk->n == 0 || vmax > bk->vmax) bk->vmax = vmax;
+        bk->sum += v;
+        bk->n++;
+        return true;
+    }
+
+    /* Pass 2: bucket change -> emit the selected point of the finished bucket, mark gaps.
+       A gap limit >= width guarantees that a gap always coincides with a bucket change. */
+    if ((int32_t)b != c->cur) {
+        if (c->cur >= 0) lttb_emit_point(c, c->cur);
+        if (c->have_prev && ts - c->prev_ts > lttb_gap_limit(c, c->prev_level)) {
+            lttb_emit_gap(c, c->prev_ts, ts);
+        }
+        c->cur = (int32_t)b;
+        c->have_best = false;
+    }
+    c->have_prev = true;
+    c->prev_ts = ts;
+    c->prev_level = c->level;
+
+    bool take;
+    if ((int32_t)b == c->last_nonempty) {
+        take = true; /* newest bucket: always keep the newest value */
+    } else if (!c->have_a) {
+        take = !c->have_best; /* first bucket: its first point */
+    } else {
+        double ct, cv;
+        lttb_next_avg(c, (int32_t)b, &ct, &cv);
+        double area = fabs((c->a_t - ct) * ((double)v - c->a_v) - (c->a_t - (double)ts) * (cv - c->a_v));
+        take = !c->have_best || area > c->best_area;
+        if (take) c->best_area = area;
+    }
+    if (take) {
+        c->have_best = true;
+        c->best_t = (double)ts;
+        c->best_v = (double)v;
+        c->best_est = est;
+    }
+    return true;
+}
+
+/* Visit the joined levels in chronological order: day [start, hour_from[, hour [.., raw_from[, raw */
+static void lttb_scan(data_channel_t* channel, lttb_ctx_t* c, uint32_t start, uint32_t end) {
+    arc_raw_record_t raw_first;
+    arc_agg_record_t hour_first;
+    uint32_t raw_from = arc_read_first(&channel->arc, ARC_LEVEL_RAW, &raw_first) ? raw_first.ts : end;
+    uint32_t hour_from = arc_read_first(&channel->arc, ARC_LEVEL_HOUR, &hour_first) ? hour_first.ts : raw_from;
+    if (hour_from > raw_from) hour_from = raw_from;
+
+    if (start < hour_from) {
+        c->level = ARC_LEVEL_DAY;
+        arc_scan_range(&channel->arc, ARC_LEVEL_DAY, start, (hour_from < end) ? hour_from : end, lttb_visit, c);
+    }
+    if (hour_from < end && hour_from < raw_from) {
+        c->level = ARC_LEVEL_HOUR;
+        arc_scan_range(&channel->arc, ARC_LEVEL_HOUR, (start > hour_from) ? start : hour_from,
+                       (raw_from < end) ? raw_from : end, lttb_visit, c);
+    }
+    if (raw_from < end) {
+        c->level = ARC_LEVEL_RAW;
+        arc_scan_range(&channel->arc, ARC_LEVEL_RAW, (start > raw_from) ? start : raw_from, end, lttb_visit, c);
+    }
+}
+
+chart_data_point_t* data_storage_query_lttb(
+    const char* channel_key,
+    uint32_t start_timestamp,
+    uint32_t end_timestamp,
+    uint32_t max_points,
+    float alarm_min,
+    float alarm_max,
+    uint8_t alarm_flags,
+    uint32_t* actual_interval_sec,
+    size_t* count
+) {
+    *count = 0;
+    if (!channel_key || !littlefs_driver_is_mounted() || end_timestamp <= start_timestamp || max_points == 0) {
+        return nullptr;
+    }
+    int32_t idx = find_channel(channel_key);
+    if (idx < 0) return nullptr;
+    data_channel_t* channel = &g_channels[idx];
+
+    uint32_t capacity = (max_points > LTTB_MAX_POINTS) ? LTTB_MAX_POINTS : max_points;
+    uint32_t m = CHART_LTTB_BUCKETS(capacity);
+    uint32_t width = (end_timestamp - start_timestamp + m - 1) / m;
+    if (width == 0) width = 1;
+    *actual_interval_sec = width;
+
+    memset(s_lttb_buckets, 0, sizeof(s_lttb_buckets));
+    lttb_ctx_t c;
+    memset(&c, 0, sizeof(c));
+    c.start = start_timestamp;
+    c.width = width;
+    c.m = m;
+    c.alarm_min = alarm_min;
+    c.alarm_max = alarm_max;
+    c.alarm_flags = alarm_flags;
+    c.raw_gap_sec = channel->config.roundtrip_interval + channel->config.tolerance_sec;
+    if (c.raw_gap_sec < channel->config.storage_interval) c.raw_gap_sec = channel->config.storage_interval;
+
+    /* Pass 1: bucket statistics */
+    c.pass = 1;
+    lttb_scan(channel, &c, start_timestamp, end_timestamp);
+
+    c.last_nonempty = -1;
+    int32_t next = -1;
+    for (int32_t b = (int32_t)m - 1; b >= 0; b--) {
+        s_lttb_buckets[b].next = (uint8_t)((next >= 0) ? next : b);
+        if (s_lttb_buckets[b].n > 0) {
+            if (c.last_nonempty < 0) c.last_nonempty = b;
+            next = b;
+        }
+    }
+    if (c.last_nonempty < 0) return nullptr;
+
+    /* Pass 2: point selection (one point per non-empty bucket, gap markers in between) */
+    c.out_capacity = capacity;
+    c.out = (chart_data_point_t*)malloc(c.out_capacity * sizeof(chart_data_point_t));
+    if (!c.out) return nullptr;
+    c.pass = 2;
+    c.cur = -1;
+    lttb_scan(channel, &c, start_timestamp, end_timestamp);
+    if (c.cur >= 0) lttb_emit_point(&c, c.cur);
+
+    *count = c.out_count;
+    if (c.out_count == 0) {
+        free(c.out);
+        return nullptr;
+    }
+    return c.out;
 }
 
 static const char* TIME_FILE_PATH = "/data/last_time.txt";

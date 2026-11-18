@@ -19,6 +19,7 @@
 #include "i18n.h"
 #include "gui/i18n/gui_i18n.h"
 #include "media_standards.h"
+#include "gui_theme.h"
 #include "chart_query_scheduler.h"
 #include <time.h>
 #include <stdlib.h>
@@ -44,10 +45,15 @@ static const char* TAG = "esp32_rp2040";
 static uint8_t buf[BUF_SIZE];
 static uint8_t data[BUF_SIZE];
 
+/* Chunked file read from the SD card (CMD_READ_FILE / RES_FILE_DATA, stop-and-wait per chunk).
+ * s_file_req_mutex serializes callers; the rx_* fields are handed between caller and UART task. */
 static SemaphoreHandle_t s_file_req_sem = NULL;
+static SemaphoreHandle_t s_file_req_mutex = NULL;
 static char *s_file_rx_buf = NULL;
 static size_t s_file_rx_max = 0;
-static size_t s_file_rx_len = 0;
+static uint32_t s_file_rx_expected_offset = 0;
+static uint16_t s_file_rx_chunk_len = 0;
+static uint32_t s_file_rx_total = 0;
 static bool s_file_rx_success = false;
 
 static chart_data_callback_t s_chart_data_cb = NULL;
@@ -193,46 +199,67 @@ void rp2040_register_chart_data_callback(chart_data_callback_t cb) {
 }
 
 int rp2040_read_file_from_sd(const char *path, char *out_buf, size_t max_len, uint32_t timeout_ms) {
-    if (!path || !out_buf || max_len == 0) return -1;
+    if (!path || !out_buf || max_len == 0 || !s_file_req_mutex || !s_file_req_sem) return -1;
 
-    if (!s_file_req_sem) {
-        s_file_req_sem = xSemaphoreCreateBinary();
-    }
-
-    s_file_rx_buf = out_buf;
-    s_file_rx_max = max_len;
-    s_file_rx_len = 0;
-    s_file_rx_success = false;
-
-    /* Send read file request to RP2040 */
-    uint8_t payload[130] = {0};
-    payload[0] = PKT_TYPE_CMD_READ_FILE;
     size_t path_len = strlen(path);
     if (path_len > 120) path_len = 120;
-    memcpy(&payload[1], path, path_len);
 
-    cobs_encode_result ret;
-    uint8_t cobs_buf[150];
-    ret = cobs_encode(cobs_buf, sizeof(cobs_buf), payload, path_len + 1);
-    if (ret.status != COBS_ENCODE_OK) {
-        s_file_rx_buf = NULL;
-        s_file_rx_max = 0;
-        return -1;
-    }
-    cobs_buf[ret.out_len] = 0x00;
-    _uart_write_safe(ESP32_COMM_PORT_NUM, cobs_buf, ret.out_len + 1);
+    xSemaphoreTake(s_file_req_mutex, portMAX_DELAY);
 
-    /* Wait for response from RP2040 */
-    if (xSemaphoreTake(s_file_req_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
-        if (s_file_rx_success) {
-            return s_file_rx_len;
+    uint32_t offset = 0;
+    uint32_t total = 0;
+    bool ok = false;
+
+    /* One chunk per request: the RP2040 answers with at most 512 bytes plus the total size */
+    for (;;) {
+        s_file_rx_buf = out_buf;
+        s_file_rx_max = max_len;
+        s_file_rx_expected_offset = offset;
+        s_file_rx_chunk_len = 0;
+        s_file_rx_success = false;
+        xSemaphoreTake(s_file_req_sem, 0); /* drop a stale token */
+
+        uint8_t payload[130] = {0};
+        payload[0] = PKT_TYPE_CMD_READ_FILE;
+        memcpy(&payload[1], &offset, sizeof(offset));
+        memcpy(&payload[5], path, path_len);
+
+        uint8_t cobs_buf[160];
+        cobs_encode_result ret = cobs_encode(cobs_buf, sizeof(cobs_buf), payload, path_len + 5);
+        if (ret.status != COBS_ENCODE_OK) break;
+        cobs_buf[ret.out_len] = 0x00;
+        _uart_write_safe(ESP32_COMM_PORT_NUM, cobs_buf, ret.out_len + 1);
+
+        if (xSemaphoreTake(s_file_req_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE || !s_file_rx_success) {
+            break;
+        }
+        total = s_file_rx_total;
+        offset += s_file_rx_chunk_len;
+
+        if (s_file_rx_chunk_len == 0 || offset >= total) {
+            ok = true;
+            break;
+        }
+        if (offset >= max_len - 1) {
+            ESP_LOGW(TAG, "File %s truncated to %u of %lu bytes (buffer too small)",
+                     path, (unsigned)offset, (unsigned long)total);
+            ok = true;
+            break;
         }
     }
 
-    /* Safety fallback on timeout: immediately invalidate pointers to prevent use-after-free */
+    /* Invalidate the buffer pointer so late packets can never write into it */
     s_file_rx_buf = NULL;
     s_file_rx_max = 0;
-    return -1;
+
+    int result = -1;
+    if (ok) {
+        size_t end = (offset < max_len - 1) ? offset : (max_len - 1);
+        out_buf[end] = '\0';
+        result = (int)end;
+    }
+    xSemaphoreGive(s_file_req_mutex);
+    return result;
 }
 
 /**
@@ -326,6 +353,8 @@ static void i18n_reload_task(void *arg) {
         free(lang);
     }
     media_standards_load_from_sd();
+    gui_theme_load_from_sd();
+    gui_theme_check_media_contrast();
     vTaskDelete(NULL);
 }
 
@@ -459,25 +488,30 @@ static bool _packet_handle(uint8_t* p_data, size_t len) {
 			break;
 		}
 		case PKT_TYPE_RES_FILE_DATA: {
-            if (len >= 4) {
+            /* [1] status, [2..3] chunk_len, [4..7] total, [8..11] offset, [12..] data */
+            if (len >= 12) {
                 uint8_t status = p_data[1];
-                uint16_t file_len = 0;
-                memcpy(&file_len, &p_data[2], sizeof(file_len));
+                uint16_t chunk_len = 0;
+                uint32_t total = 0, offset = 0;
+                memcpy(&chunk_len, &p_data[2], sizeof(chunk_len));
+                memcpy(&total, &p_data[4], sizeof(total));
+                memcpy(&offset, &p_data[8], sizeof(offset));
+                if ((size_t)chunk_len > len - 12) chunk_len = (uint16_t)(len - 12);
 
-                if (status == 1 && s_file_rx_buf && s_file_rx_max > 0) {
-                    size_t to_copy = (file_len < s_file_rx_max - 1) ? file_len : (s_file_rx_max - 1);
-                    memcpy(s_file_rx_buf, &p_data[4], to_copy);
-                    s_file_rx_buf[to_copy] = '\0';
-                    s_file_rx_len = to_copy;
+                /* Accept only the chunk the caller is waiting for (late answers are dropped) */
+                if (!s_file_rx_buf || offset != s_file_rx_expected_offset) {
+                    return true;
+                }
+                if (status == 1) {
+                    size_t room = (s_file_rx_max > offset + 1) ? (s_file_rx_max - 1 - offset) : 0;
+                    size_t copy = (chunk_len < room) ? chunk_len : room;
+                    memcpy(s_file_rx_buf + offset, &p_data[12], copy);
+                    s_file_rx_chunk_len = (uint16_t)copy;
+                    s_file_rx_total = total;
                     s_file_rx_success = true;
                 } else {
                     s_file_rx_success = false;
                 }
-
-                /* Clear buffer pointer immediately so late packets can never corrupt heap */
-                s_file_rx_buf = NULL;
-                s_file_rx_max = 0;
-
                 if (s_file_req_sem) {
                     xSemaphoreGive(s_file_req_sem);
                 }
@@ -546,6 +580,25 @@ static bool _packet_handle(uint8_t* p_data, size_t len) {
                 s_upl_ack_chunk = p_data[1];
                 s_upl_ack_ok = (p_data[2] != 0);
                 s_upl_ack_pending = true;
+                return true;
+            }
+            break;
+        }
+        case PKT_TYPE_RES_LAST_VALUE: {
+            /* [1..4] dev_addr, [5..20] key, [21] status, [22..25] value, [26..29] ts,
+             * [30..33] expected interval, [34..41] unit */
+            if (len >= 42) {
+                struct view_data_last_value lv = {0};
+                memcpy(&lv.dev_addr, &p_data[1], 4);
+                memcpy(lv.key, &p_data[5], 16);
+                lv.key[16] = '\0';
+                lv.valid = (p_data[21] != 0);
+                memcpy(&lv.value, &p_data[22], 4);
+                memcpy(&lv.timestamp, &p_data[26], 4);
+                memcpy(&lv.expected_interval_sec, &p_data[30], 4);
+                memcpy(lv.unit, &p_data[34], 8);
+                lv.unit[8] = '\0';
+                _post_event(VIEW_EVENT_ARCHIVE_LAST_VALUE, &lv, sizeof(lv), RP2040_EVT_POST_TIMEOUT_CTRL_MS);
                 return true;
             }
             break;
@@ -771,6 +824,12 @@ void esp32_rp2040_init(void) {
     if (!s_upl_mutex) {
         s_upl_mutex = xSemaphoreCreateMutex();
     }
+    if (!s_file_req_mutex) {
+        s_file_req_mutex = xSemaphoreCreateMutex();
+    }
+    if (!s_file_req_sem) {
+        s_file_req_sem = xSemaphoreCreateBinary();
+    }
     chart_query_scheduler_init();
     /* Core 1, priority above LVGL (6): the RGB panel's bounce-buffer ISR runs on core 0 and copies
      * 28.8 KB from PSRAM per interrupt; under render load it delayed the UART ISR long enough to
@@ -865,8 +924,9 @@ int rp2040_send_lora_raw_frame(uint32_t dev_addr, int16_t rssi, int8_t snr, cons
 
 int rp2040_request_chart_data(uint8_t req_id, uint32_t dev_addr, const char *key,
                               uint32_t start_ts, uint32_t end_ts, uint32_t interval_sec,
-                              uint16_t max_points, float alarm_min, float alarm_max) {
-    uint8_t payload[44] = {0};
+                              uint16_t max_points, float alarm_min, float alarm_max,
+                              uint8_t alarm_flags, uint8_t query_mode) {
+    uint8_t payload[46] = {0};
     payload[0] = PKT_TYPE_CMD_GET_CHART_DATA;
     payload[1] = req_id;
     memcpy(&payload[2], &dev_addr, 4);
@@ -879,6 +939,8 @@ int rp2040_request_chart_data(uint8_t req_id, uint32_t dev_addr, const char *key
     memcpy(&payload[34], &max_points, 2);
     memcpy(&payload[36], &alarm_min, 4);
     memcpy(&payload[40], &alarm_max, 4);
+    payload[44] = alarm_flags; /* CHART_ALARM_*_IS_WARNING */
+    payload[45] = query_mode;  /* CHART_QUERY_MODE_* */
 
     uint8_t cobs_buf[60];
     cobs_encode_result ret = cobs_encode(cobs_buf, sizeof(cobs_buf), payload, sizeof(payload));
@@ -892,6 +954,20 @@ int rp2040_request_chart_data(uint8_t req_id, uint32_t dev_addr, const char *key
     }
     ESP_LOGE(TAG, "UART Tx: COBS encode failed for chart request");
     return -1;
+}
+
+int rp2040_request_last_value(uint32_t dev_addr, const char *key) {
+    if (!key) return -1;
+    uint8_t payload[21] = {0};
+    payload[0] = PKT_TYPE_CMD_GET_LAST_VALUE;
+    memcpy(&payload[1], &dev_addr, 4);
+    strncpy((char *)&payload[5], key, 15);
+
+    uint8_t cobs_buf[32];
+    cobs_encode_result ret = cobs_encode(cobs_buf, sizeof(cobs_buf), payload, sizeof(payload));
+    if (ret.status != COBS_ENCODE_OK) return -1;
+    cobs_buf[ret.out_len] = 0x00;
+    return _uart_write_safe(ESP32_COMM_PORT_NUM, cobs_buf, ret.out_len + 1);
 }
 
 int rp2040_alarm_set(uint16_t t_on_ms, uint16_t t_off_ms) {

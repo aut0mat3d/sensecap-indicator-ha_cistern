@@ -160,7 +160,7 @@ typedef struct {
 | Function | Description |
 |----------|-------------|
 | `void keyvalue_card_update_value(keyvalue_card_t* widget, uint8_t pair_index, const char* value)` | Update value text by index (simple string) |
-| `void keyvalue_card_update_binding(keyvalue_card_t* widget, const char* key, float value, const char* unit, bool is_estimated, bool is_alarm)` | Update value by binding key with quality flags |
+| `void keyvalue_card_update_binding(keyvalue_card_t* widget, const char* key, float value, const char* unit, bool is_estimated, gui_alarm_level_t alarm_level)` | Update value by binding key with quality flag and alarm level (value text and bezel in the theme color) |
 | `void keyvalue_card_update_label(keyvalue_card_t* widget, uint8_t pair_index, const char* label)` | Update label text by index |
 | `void keyvalue_card_set_title(keyvalue_card_t* widget, const char* title)` | Set or update card title (NULL to hide) |
 

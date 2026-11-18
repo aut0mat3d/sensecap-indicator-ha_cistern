@@ -41,10 +41,32 @@ Listener nodes (no keys) ignore direct sensor uplinks and only accept the master
 
 ```
 widget ─► chart_query_scheduler_subscribe(dev_addr, key, zone, step, points, ...)
-scheduler (bucket boundary crossed) ─► 0x3B GET_CHART_DATA ─► RP2040 data_storage_query_chart()
+scheduler (bucket boundary crossed) ─► 0x3B GET_CHART_DATA ─► RP2040 data_storage_query_chart()   (mode GRID)
+                                                              └► RP2040 data_storage_query_lttb()   (mode LTTB)
 RP2040 ─► 0x3C RES_CHART_DATA (req_id, status, step, count, chart_data_point_t[]) ─► chart callback ─► widget
 ```
 `cistern_view.c` subscribes 3 zones for `depth`: 7 × 86400 s, 12 × 7200 s, 11 × 300 s (zone 3 = live value).
+The scheduler has 24 subscription slots of up to 100 points each (`CHART_SUB_MAX_POINTS`), held in PSRAM.
+
+**Query modes (byte 45 of `0x3B`):**
+
+* `CHART_QUERY_MODE_GRID` (0): one value per grid step, right-aligned, empty steps as `DATA_FLAG_NO_DATA` (bar charts).
+* `CHART_QUERY_MODE_LTTB` (1): Largest-Triangle-Three-Buckets reduction for point/line charts (`trend_graph`).
+  The window is split into `CHART_LTTB_BUCKETS(pts)` = 2/3 · pts time buckets (66 for 100 points, so gap
+  markers still fit); `step` in the answer is the bucket width. Day, hour and raw levels are joined
+  chronologically (day records before the first hour record, hour records before the first raw record).
+  Two streaming passes over the archive (bucket statistics, then selection), no record buffer:
+  one point per non-empty bucket at its real timestamp, the newest value is always kept, a
+  `DATA_FLAG_NO_DATA` marker separates records further apart than the expected spacing of their level
+  (raw: update interval + tolerance, hour 1.5 h, day 1.5 d, never less than one bucket). Alarm flags come
+  from the bucket minimum / maximum as in GRID mode; `DATA_FLAG_ESTIMATED` from the selected record.
+
+**Alarm coloring of history bars:** the archive stores values and quality flags only, no alarm state.
+Each query carries the current alarm levels of the key and their severities; the RP2040 marks a
+bucket `DATA_FLAG_ALARM_WARN` or `DATA_FLAG_ALARM_DANGER` when any value behind it crossed a level
+(bucket minimum for the falling level, maximum for the rising level, so episodes inside an hour or day
+are visible). Hysteresis and damping are not applied here; the alarm journal records what actually
+alarmed. The view re-queries the history when the device config arrives or a threshold is changed.
 Only one query is in flight at a time; after each answer the scheduler waits `CHART_QUERY_GAP_MS` (100 ms) before the next one, so pages with many charts fill gradually instead of in one burst.
 
 ## 5a. Link flow control (both directions)
@@ -86,10 +108,10 @@ Rule: a page may take longer to fill, but neither MCU may stall. No side sends l
 | `0x35` | PUSH_LORA_CFG | R→E | globals + device count |
 | `0x36` | CMD_LORA_RAW_FRAME | E→R | DevAddr(4) RSSI(2) SNR(1) Len(1) Payload |
 | `0x37` | CMD_SET_TIME_CFG | E→R | posix_tz[64] + time_format[8] |
-| `0x38` | CMD_READ_FILE | E→R | null-terminated path (FAT32) |
-| `0x39` | RES_FILE_DATA | R→E | status + len(2) + data |
+| `0x38` | CMD_READ_FILE | E→R | offset (uint32) + path; one chunk per request (stop-and-wait) |
+| `0x39` | RES_FILE_DATA | R→E | status, chunk_len (uint16), total size (uint32), offset (uint32), data (max 512 B); the ESP32 requests the next offset until the file is complete |
 | `0x3A` | CMD_SYNC_TIME | E→R | utc_ts(4) + flags(1) |
-| `0x3B` | CMD_GET_CHART_DATA | E→R | req_id, dev_addr, key, start, end, step, pts |
+| `0x3B` | CMD_GET_CHART_DATA | E→R | req_id, dev_addr, key, start, end, step, pts, alarm_min, alarm_max, alarm flags (byte 44, `CHART_ALARM_MIN/MAX_IS_WARNING`), query mode (byte 45, `CHART_QUERY_MODE_GRID/LTTB`, §5) |
 | `0x3C` | RES_CHART_DATA | R→E | req_id, status, step, count, points[] |
 | `0x3D` | CMD_GET_TIME | E→R | – |
 | `0x3E` | RES_TIME | R→E | last_utc(4) |
@@ -98,6 +120,8 @@ Rule: a page may take longer to fill, but neither MCU may stall. No side sends l
 | `0x41` | RES_SET_THRESHOLD | R→E | 1 = OK, 0 = ERR |
 | `0x42` | CMD_SET_OFFSET | E→R | patch offset in device JSON on SD |
 | `0x43` | RES_SET_OFFSET | R→E | 1 = OK, 0 = ERR |
+| `0x44` | CMD_GET_LAST_VALUE | E→R | dev_addr(4) + key[16]: newest archived value of a key |
+| `0x45` | RES_LAST_VALUE | R→E | dev_addr, key[16], status (1 = value), value (float), timestamp, expected interval (s), unit[8]; posted on the ESP32 as `VIEW_EVENT_ARCHIVE_LAST_VALUE` |
 | `0xA0` | CMD_COLLECT_INTERVAL | E→R | defined, not handled |
 | `0xA1/0xA2` | CMD_BEEP_ON/OFF | E→R | legacy click |
 | `0xA3/0xA4` | CMD_SHUTDOWN / POWER_ON | E→R | sensor power |
@@ -112,7 +136,7 @@ Rule: a page may take longer to fill, but neither MCU may stall. No side sends l
 | `0xBB` | LORA_TELEMETRY | R→E | DevAddr, FCnt, type, context, key, unit, value |
 | `0xBC` | LOCAL_TELEMETRY | R→E | onboard/Grove sensors |
 
-Free IDs for planned extensions: `0x44`–`0x47` (GET_LAST_VALUE, CLEAR_CHANNEL_HISTORY per NTTW roadmap).
+Free IDs for planned extensions: `0x46`–`0x47` (CLEAR_CHANNEL_HISTORY per NTTW roadmap).
 
 ## 7. Differences found vs. AGENTS.md
 

@@ -22,7 +22,9 @@ typedef enum {
     HEADER_SLOT_LEFT    = 0, /* Leftmost: Usually Back or Settings */
     HEADER_SLOT_RIGHT_1 = 1, /* Rightmost: Default WiFi Status */
     HEADER_SLOT_RIGHT_2 = 2, /* Second from right: Default LoRa Status */
-    HEADER_SLOT_RIGHT_3 = 3  /* Third from right: Extra action button */
+    HEADER_SLOT_RIGHT_3 = 3, /* Third from right: Extra action button */
+    HEADER_SLOT_LEFT_2  = 4, /* Right of the left slot: page specific indicator (e.g. battery) */
+    HEADER_SLOT_COUNT
 } header_slot_t;
 
 typedef enum {
@@ -68,6 +70,19 @@ void gui_header_set_slot_image(header_slot_t slot, const lv_image_dsc_t *img_src
 /**
  * @brief Show or hide the entire header (useful for custom full-screen pages).
  */
+/**
+ * @brief Get a slot as host container for a custom widget (e.g. battery_icon) and show it.
+ *        Label and image of the slot are hidden; the caller creates its widget inside and owns it
+ *        (gui_header_clear() only hides the slot). Call with the LVGL lock held or from LVGL context.
+ * @return Slot container, or NULL if the header is not initialized.
+ */
+lv_obj_t *gui_header_get_slot_container(header_slot_t slot);
+
+/**
+ * @brief Hide a slot (e.g. when the page has no indicator for it).
+ */
+void gui_header_hide_slot(header_slot_t slot);
+
 void gui_header_set_visible(bool visible);
 
 /* Global status icon updates for Slot 1 (Rightmost: WiFi) and Slot 2 (LoRa) */

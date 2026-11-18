@@ -5,6 +5,7 @@
  * @copyright © 2026, SenseCAP Cistern Extension
  */
 
+#include "gui_theme.h"
 #include "config_controller.h"
 #include "lv_port.h"
 #include "gui/i18n/gui_i18n.h"
@@ -79,9 +80,9 @@ static void _format_field_value_text(const config_field_value_t *val, const conf
         }
         case CONFIG_FIELD_ENUM: {
             snprintf(out_buf, out_size, "%s", val->enum_val);
-            if (strcasecmp(val->enum_val, "danger") == 0)       *out_color = lv_color_hex(0xE74C3C);
-            else if (strcasecmp(val->enum_val, "warning") == 0) *out_color = lv_color_hex(0xF39C12);
-            else if (strcasecmp(val->enum_val, "info") == 0)    *out_color = lv_color_hex(0x9E9E9E);
+            if (strcasecmp(val->enum_val, "danger") == 0)       *out_color = lv_color_hex(gui_theme_severity_color(0));
+            else if (strcasecmp(val->enum_val, "warning") == 0) *out_color = lv_color_hex(gui_theme_severity_color(1));
+            else if (strcasecmp(val->enum_val, "info") == 0)    *out_color = lv_color_hex(gui_theme_severity_color(2));
             break;
         }
     }

@@ -11,7 +11,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "alarm_model.h"
 #include <math.h>
 
 LV_FONT_DECLARE(ui_font_font0);
@@ -41,18 +40,14 @@ static void keyvalue_card_click_handler(lv_event_t *e) {
 static void _keyvalue_card_refresh_border(keyvalue_card_t *widget) {
     if (!widget || !widget->container) return;
 
-    bool any_alarm = false;
+    /* The bezel shows the highest alarm level of all pairs */
+    gui_alarm_level_t top = GUI_ALARM_NONE;
     for (uint8_t i = 0; i < widget->pair_count && i < keyvalue_card_MAX_PAIRS; i++) {
-        if (widget->pairs[i].is_alarm) {
-            any_alarm = true;
-            break;
-        }
+        if (widget->pairs[i].alarm_level > top) top = widget->pairs[i].alarm_level;
     }
 
-    if (any_alarm) {
-        const alarm_ui_config_t *ui_cfg = alarm_get_ui_config();
-        lv_color_t color_danger = lv_color_hex(ui_cfg ? ui_cfg->colors.color_danger : 0xE74C3C);
-        lv_obj_set_style_border_color(widget->container, color_danger, LV_PART_MAIN);
+    if (top != GUI_ALARM_NONE) {
+        lv_obj_set_style_border_color(widget->container, lv_color_hex(gui_theme_alarm_level_color(top, 0)), LV_PART_MAIN);
     } else {
         /* Idle state: permanent black border */
         lv_obj_set_style_border_color(widget->container, DEFAULT_BORDER_COLOR, LV_PART_MAIN);
@@ -196,7 +191,7 @@ int keyvalue_card_add_pair(keyvalue_card_t *widget, const char *binding_key, con
     pair->unit = unit;
     pair->label_color = DEFAULT_LABEL_COLOR;
     pair->value_color = !is_color_empty(value_color) ? value_color : DEFAULT_VALUE_COLOR;
-    pair->is_alarm = false;
+    pair->alarm_level = GUI_ALARM_NONE;
     pair->is_estimated = false;
 
     if (widget->container) {
@@ -216,7 +211,7 @@ void keyvalue_card_update_value(keyvalue_card_t *widget, uint8_t pair_index, con
 }
 
 void keyvalue_card_update_binding(keyvalue_card_t *widget, const char *key, float value,
-                                  const char *unit, bool is_estimated, bool is_alarm) {
+                                  const char *unit, bool is_estimated, gui_alarm_level_t alarm_level) {
     if (!widget || !key) return;
 
     bool is_invalid = isnan(value) || isinf(value);
@@ -230,24 +225,23 @@ void keyvalue_card_update_binding(keyvalue_card_t *widget, const char *key, floa
             if (is_invalid) {
                 if (u[0] != '\0') snprintf(buf, sizeof(buf), "-- %s", u);
                 else snprintf(buf, sizeof(buf), "--");
-                widget->pairs[i].is_alarm = false;
+                widget->pairs[i].alarm_level = GUI_ALARM_NONE;
                 widget->pairs[i].is_estimated = false;
             } else {
                 if (u[0] != '\0') snprintf(buf, sizeof(buf), "%.2f %s", value, u);
                 else snprintf(buf, sizeof(buf), "%.2f", value);
                 /* Update pair quality and alarm state */
-                widget->pairs[i].is_alarm = is_alarm;
+                widget->pairs[i].alarm_level = alarm_level;
                 widget->pairs[i].is_estimated = is_estimated;
             }
 
             if (widget->values[i]) {
                 lv_label_set_text(widget->values[i], buf);
 
-                const alarm_ui_config_t *ui_cfg = alarm_get_ui_config();
-                lv_color_t color_danger = lv_color_hex(ui_cfg ? ui_cfg->colors.color_danger : 0xE74C3C);
-
-                if (!is_invalid && is_alarm) {
-                    lv_obj_set_style_text_color(widget->values[i], color_danger, LV_PART_MAIN);
+                if (!is_invalid && alarm_level != GUI_ALARM_NONE) {
+                    lv_obj_set_style_text_color(widget->values[i],
+                                                lv_color_hex(gui_theme_alarm_level_color(alarm_level, 0)),
+                                                LV_PART_MAIN);
                 } else if (!is_invalid && is_estimated) {
                     lv_obj_set_style_text_color(widget->values[i], lv_color_hex(0xBDC3C7), LV_PART_MAIN);
                 } else {
@@ -331,7 +325,7 @@ static void _keyvalue_card_widget_update(widget_t *self, float value, const char
     if (!self || !self->user_data) return;
     keyvalue_card_t *widget = (keyvalue_card_t *)self->user_data;
     if (self->binding_key[0] != '\0') {
-        keyvalue_card_update_binding(widget, self->binding_key, value, unit, false, false);
+        keyvalue_card_update_binding(widget, self->binding_key, value, unit, false, GUI_ALARM_NONE);
     } else {
         char buf[64];
         bool is_invalid = isnan(value) || isinf(value);

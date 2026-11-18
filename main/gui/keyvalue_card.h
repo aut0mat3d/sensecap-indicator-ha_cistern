@@ -38,6 +38,7 @@
 #ifndef KEYVALUE_CARD_H
 #define KEYVALUE_CARD_H
 
+#include "gui_theme.h"
 #include "lvgl.h"
 #include "widget_base.h"
 #include <stdbool.h>
@@ -85,7 +86,7 @@ typedef struct {
     lv_color_t  label_color;       ///< Color for label text
     lv_color_t  value_color;       ///< Color for value text
     const lv_font_t* font;         ///< Font override for value (optional)
-    bool        is_alarm;          ///< Quality flag: true if current value violates alarm threshold
+    gui_alarm_level_t alarm_level; ///< Alarm level of the current value (colors value text and bezel)
     bool        is_estimated;      ///< Quality flag: true if current value is interpolated/fallback
 } keyvalue_card_pair_t;
 
@@ -173,10 +174,10 @@ void keyvalue_card_update_value(keyvalue_card_t* widget, uint8_t pair_index, con
  * @param value New numeric float value.
  * @param unit Unit string (optional, NULL to use pair default).
  * @param is_estimated True if value is an interpolated fallback.
- * @param is_alarm True if value violates an active alarm threshold.
+ * @param alarm_level Alarm level of the value (GUI_ALARM_NONE / WARNING / DANGER).
  */
 void keyvalue_card_update_binding(keyvalue_card_t *widget, const char *key, float value,
-                                  const char *unit, bool is_estimated, bool is_alarm);
+                                  const char *unit, bool is_estimated, gui_alarm_level_t alarm_level);
 
 /**
  * @brief Update label text by zero-based pair index.

@@ -157,3 +157,25 @@ const char *media_get_unit(const char *medium_id) {
     }
     return "";
 }
+
+size_t media_standards_count(void) {
+    media_lock();
+    size_t n = s_media_count;
+    media_unlock();
+    return n;
+}
+
+bool media_standards_get_entry(size_t index, char *id_out, size_t id_len, uint32_t *color_out) {
+    bool ok = false;
+    media_lock();
+    if (index < s_media_count) {
+        if (id_out && id_len > 0) {
+            strncpy(id_out, s_media_table[index].id, id_len - 1);
+            id_out[id_len - 1] = '\0';
+        }
+        if (color_out) *color_out = s_media_table[index].color_hex;
+        ok = true;
+    }
+    media_unlock();
+    return ok;
+}

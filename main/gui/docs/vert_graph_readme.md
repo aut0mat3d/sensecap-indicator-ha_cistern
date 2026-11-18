@@ -101,7 +101,9 @@ typedef struct {
     
     /* Data Quality */
     bool is_estimated;         // true = value is interpolated/estimated
-    bool is_alarm;             // true = active alarm condition
+    gui_alarm_level_t alarm_level;        // level set by the caller (NONE / WARNING / DANGER)
+    gui_alarm_level_t alarm_severity_min; // level shown below alarm_level_min (NONE = danger)
+    gui_alarm_level_t alarm_severity_max; // level shown above alarm_level_max (NONE = danger)
     
     /* Callback */
     lv_event_cb_t click_cb;    // Click handler for config subpage
@@ -132,8 +134,8 @@ typedef struct {
 | Function | Description |
 |----------|-------------|
 | `void vert_graph_update(vert_graph_t* graph, float value)` | Update with new value (keeps existing unit, status flags) |
-| `void vert_graph_update_value(vert_graph_t* graph, float value, const char* unit, bool is_estimated, bool is_alarm)` | Full update with value, unit, and quality flags |
-| `void vert_graph_set_status(vert_graph_t* graph, bool is_estimated, bool is_alarm)` | Update only the quality status flags |
+| `void vert_graph_update_value(vert_graph_t* graph, float value, const char* unit, bool is_estimated, gui_alarm_level_t alarm_level)` | Full update with value, unit, quality flag and alarm level |
+| `void vert_graph_set_status(vert_graph_t* graph, bool is_estimated, gui_alarm_level_t alarm_level)` | Update only the quality status and alarm level |
 
 ### Configuration
 
@@ -163,7 +165,7 @@ The vertical graph supports three distinct visual states based on data quality:
 - **Border**: 2px light grey (0xBDC3C7) outline
 - **Appearance**: Semi-transparent bar with outline, indicating interpolated/replacement value
 
-### Alarm State (`is_alarm = true`)
+### Alarm State (`alarm_level` WARNING / DANGER, colors from `gui_theme`)
 - **Bar**: 100% opacity, uses `alarm_color` (default: red 0xE74C3C)
 - **Border**: 2px white outline
 - **Appearance**: Red bar with white border, indicating active threshold violation

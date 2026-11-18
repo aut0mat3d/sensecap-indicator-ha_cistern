@@ -41,7 +41,7 @@ typedef struct {
 
 static lv_obj_t *s_header_cont = NULL;
 static lv_obj_t *s_lbl_title = NULL;
-static header_slot_ui_t s_slots[4];
+static header_slot_ui_t s_slots[HEADER_SLOT_COUNT];
 
 /* Alarm States */
 static bool s_alarm_active = false;
@@ -298,7 +298,7 @@ void gui_header_init(lv_obj_t *parent) {
     lv_obj_align(s_lbl_title, LV_ALIGN_CENTER, 0, 0);
 
     /* Initialize Slots with transparent backgrounds (no grey pills) */
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < HEADER_SLOT_COUNT; i++) {
         s_slots[i].btn = lv_button_create(s_header_cont);
         lv_obj_set_style_radius(s_slots[i].btn, 6, LV_PART_MAIN);
         
@@ -330,6 +330,10 @@ void gui_header_init(lv_obj_t *parent) {
     /* Left (Settings / Back) */
     lv_obj_set_size(s_slots[HEADER_SLOT_LEFT].btn, SLOT_W_EDGE, SLOT_HEIGHT);
     lv_obj_set_pos(s_slots[HEADER_SLOT_LEFT].btn, 10, SLOT_Y_OFFSET);
+
+    /* Left 2 (page specific indicator right of the settings gear) */
+    lv_obj_set_size(s_slots[HEADER_SLOT_LEFT_2].btn, SLOT_W_EDGE, SLOT_HEIGHT);
+    lv_obj_set_pos(s_slots[HEADER_SLOT_LEFT_2].btn, 10 + SLOT_W_EDGE + 6, SLOT_Y_OFFSET);
 
     /* Right 1 (Outer: WiFi) */
     lv_obj_set_size(s_slots[HEADER_SLOT_RIGHT_1].btn, SLOT_W_EDGE, SLOT_HEIGHT);
@@ -371,7 +375,7 @@ void gui_header_clear(void) {
     if (s_lbl_title) lv_label_set_text(s_lbl_title, "");
 
     /* Wipe custom buttons & callbacks on all slots */
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < HEADER_SLOT_COUNT; i++) {
         if (!s_slots[i].btn) continue;
 
         lv_obj_add_flag(s_slots[i].btn, LV_OBJ_FLAG_HIDDEN);
@@ -417,7 +421,7 @@ void gui_header_set_title(const char *title) {
 }
 
 void gui_header_set_slot(header_slot_t slot, const char *text, lv_event_cb_t cb, void *user_data) {
-    if (slot > 3 || !s_slots[slot].btn) return;
+    if (slot >= HEADER_SLOT_COUNT || !s_slots[slot].btn) return;
 
     lv_port_sem_take();
     if (s_slots[slot].img) lv_obj_add_flag(s_slots[slot].img, LV_OBJ_FLAG_HIDDEN);
@@ -434,7 +438,7 @@ void gui_header_set_slot(header_slot_t slot, const char *text, lv_event_cb_t cb,
 }
 
 void gui_header_set_slot_image(header_slot_t slot, const lv_image_dsc_t *img_src, lv_event_cb_t cb, void *user_data) {
-    if (slot > 3 || !s_slots[slot].btn || !img_src) return;
+    if (slot >= HEADER_SLOT_COUNT || !s_slots[slot].btn || !img_src) return;
 
     lv_port_sem_take();
     if (s_slots[slot].lbl) lv_obj_add_flag(s_slots[slot].lbl, LV_OBJ_FLAG_HIDDEN);
@@ -447,6 +451,23 @@ void gui_header_set_slot_image(header_slot_t slot, const lv_image_dsc_t *img_src
         lv_obj_add_event_cb(s_slots[slot].btn, cb, LV_EVENT_CLICKED, user_data);
     }
     lv_obj_remove_flag(s_slots[slot].btn, LV_OBJ_FLAG_HIDDEN);
+    lv_port_sem_give();
+}
+
+lv_obj_t *gui_header_get_slot_container(header_slot_t slot) {
+    if (slot >= HEADER_SLOT_COUNT || !s_slots[slot].btn) return NULL;
+    lv_port_sem_take();
+    if (s_slots[slot].lbl) lv_obj_add_flag(s_slots[slot].lbl, LV_OBJ_FLAG_HIDDEN);
+    if (s_slots[slot].img) lv_obj_add_flag(s_slots[slot].img, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_slots[slot].btn, LV_OBJ_FLAG_HIDDEN);
+    lv_port_sem_give();
+    return s_slots[slot].btn;
+}
+
+void gui_header_hide_slot(header_slot_t slot) {
+    if (slot >= HEADER_SLOT_COUNT || !s_slots[slot].btn) return;
+    lv_port_sem_take();
+    lv_obj_add_flag(s_slots[slot].btn, LV_OBJ_FLAG_HIDDEN);
     lv_port_sem_give();
 }
 

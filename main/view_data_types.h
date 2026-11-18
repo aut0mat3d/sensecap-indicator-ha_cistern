@@ -128,6 +128,21 @@ typedef enum {
 /* ── LoRa Telemetry ------────────────────────────────────────────────────── */
 #define VIEW_EVENT_LORA_TELEMETRY  (0x7F)
 
+/* ── Newest archived value of a device key (answer to rp2040_request_last_value) ──
+ * P: rp2040/rp2040.c (RES_LAST_VALUE 0x45)  C: widgets bound to (dev_addr, key), e.g. battery_icon
+ * Payload: struct view_data_last_value */
+#define VIEW_EVENT_ARCHIVE_LAST_VALUE  (0x7E)
+
+struct view_data_last_value {
+    uint32_t dev_addr;
+    char     key[24];
+    char     unit[12];
+    bool     valid;                 /* false: no archived value for this key */
+    float    value;
+    uint32_t timestamp;             /* UTC of the value */
+    uint32_t expected_interval_sec; /* expected update interval of the key (archive config) */
+};
+
 typedef enum {
     LORA_VAL_TYPE_FLOAT  = 0,
     LORA_VAL_TYPE_INT    = 1,

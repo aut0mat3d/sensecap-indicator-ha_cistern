@@ -208,6 +208,14 @@ void lora_model_resolve_threshold(const lora_device_config_t *dev, const lora_th
                                   float *out_val, float *out_hyst);
 
 /**
+ * @brief Most severe threshold of a device key that a value crosses (display evaluation:
+ *        direction and resolved level, no hysteresis or damping).
+ * @param has_thresholds Optional: set to true if the key has at least one threshold.
+ * @return Severity of the crossed threshold (0 = danger, 1 = warning, 2 = info), -1 if none.
+ */
+int lora_model_crossed_severity(uint32_t dev_addr, const char *key, float value, bool *has_thresholds);
+
+/**
  * @brief Get total active P2P mesh peers.
  */
 size_t lora_model_get_peer_count(void);

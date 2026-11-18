@@ -3,6 +3,7 @@
  * @brief Implementation of the modular sensor card widget.
  */
 
+#include "gui_theme.h"
 #include "sensor_card.h"
 #include "lv_port.h"
 #include <stdio.h>
@@ -15,7 +16,8 @@ LV_FONT_DECLARE(ui_font_font2);
 
 #define SENSOR_BG_COLOR       lv_color_hex(0x282828)
 #define SENSOR_TITLE_COLOR    lv_color_hex(0x9E9E9E)
-#define SENSOR_ALARM_COLOR    lv_color_hex(0xE74C3C)
+/* Danger color from the theme (/gui/theme.json) */
+#define SENSOR_ALARM_COLOR    lv_color_hex(gui_theme_severity_color(0))
 #define SENSOR_IDLE_BORDER    lv_color_hex(0x000000)
 
 static void sensor_card_click_handler(lv_event_t *e) {

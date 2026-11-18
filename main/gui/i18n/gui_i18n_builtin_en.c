@@ -102,6 +102,19 @@ const i18n_entry_t g_i18n_builtin_en[] = {
     {"settings.alarms",     "Alarms"},
     {"settings.ip_none",    "IP: not connected"},
 
+    /* Data point detail page (key_detail_view) and trend graph presets */
+    {"status.no_data",      "No data"},
+    {"status.stale",        "Stale"},
+    {"telemetry.battery_soc", "Battery:"},
+    {"detail.value",        "Current value:"},
+    {"detail.updated",      "Last value:"},
+    {"detail.status",       "Status:"},
+    {"detail.interval",     "Expected interval:"},
+    {"detail.device",       "Device:"},
+    {"trend.24h",           "24 h"},
+    {"trend.7d",            "7 days"},
+    {"trend.31d",           "31 days"},
+
     /* End-of-table sentinel */
     {NULL, NULL}
 };

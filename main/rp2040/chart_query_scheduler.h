@@ -17,19 +17,19 @@
 extern "C" {
 #endif
 
-#define CHART_SCHEDULER_MAX_SUBSCRIPTIONS  64
+#define CHART_SCHEDULER_MAX_SUBSCRIPTIONS  24
 #define CHART_SCHEDULER_QUEUE_SIZE        16
 #define CHART_QUERY_TIMEOUT_MS            2500
 /* Pause after a finished query before the next one is dispatched: the widget can consume and
  * draw its data before the next response arrives (pages with many charts load gradually) */
 #define CHART_QUERY_GAP_MS                100
-#define CHART_SUB_MAX_POINTS              32
+#define CHART_SUB_MAX_POINTS              100  /* trend graphs: LTTB-reduced points */
 
 /**
  * @brief Structure representing a historical telemetry subscription for a widget.
  */
 typedef struct {
-    int8_t             sub_id;          /* Subscription ID (0..63, or -1 if unused) */
+    int8_t             sub_id;          /* Subscription ID (0..CHART_SCHEDULER_MAX_SUBSCRIPTIONS-1, or -1 if unused) */
     uint32_t           dev_addr;        /* Device address */
     char               key[32];         /* Telemetry key (e.g. "depth") */
     uint8_t            zone_idx;        /* Zone index (0=daily, 1=hourly, 2=sub-hourly) */
@@ -37,6 +37,8 @@ typedef struct {
     uint16_t           point_count;     /* Number of points requested (e.g. 11, 12, 7) */
     float              val_min;         /* Scale minimum value */
     float              val_max;         /* Scale maximum value */
+    uint8_t            alarm_flags;     /* CHART_ALARM_*_IS_WARNING for val_min / val_max */
+    uint8_t            query_mode;      /* CHART_QUERY_MODE_GRID (default) or CHART_QUERY_MODE_LTTB */
     bool               is_active;       /* Active state (true = page currently visible) */
 
     uint32_t           last_queried_bucket; /* Timestamp of the last queried bucket to prevent duplicate requests */
@@ -44,6 +46,7 @@ typedef struct {
     /* Handshake channel for LVGL rendering */
     bool               new_data_ready;  /* True when new archive data was received from RP2040 */
     uint16_t           data_count;      /* Number of valid points in data_buffer */
+    uint32_t           data_step;       /* Bucket interval of the data in data_buffer (from the response) */
     chart_data_point_t data_buffer[CHART_SUB_MAX_POINTS]; /* RAM point buffer */
 } chart_subscription_t;
 
@@ -62,11 +65,14 @@ void chart_query_scheduler_init(void);
  * @param point_count Number of data points.
  * @param val_min Minimum range value.
  * @param val_max Maximum range value.
- * @return Subscription ID (0..63) on success, -1 if table is full.
+ * @param alarm_flags CHART_ALARM_*_IS_WARNING: which of val_min / val_max is a warning level
+ *                    (bit cleared = danger). Both values are the alarm levels the RP2040 uses
+ *                    to mark history buckets.
+ * @return Subscription ID (0..CHART_SCHEDULER_MAX_SUBSCRIPTIONS-1) on success, -1 if table is full.
  */
 int8_t chart_query_scheduler_subscribe(uint32_t dev_addr, const char *key, uint8_t zone_idx,
                                       uint32_t interval_sec, uint16_t point_count,
-                                      float val_min, float val_max);
+                                      float val_min, float val_max, uint8_t alarm_flags);
 
 /**
  * @brief Sets active state of an individual subscription.
@@ -133,6 +139,30 @@ void chart_query_scheduler_update(void);
  * @return True if a matching subscription was found and enqueued.
  */
 bool chart_query_scheduler_trigger_poll(uint32_t dev_addr, const char *key, uint8_t zone_idx);
+
+/**
+ * @brief Query an explicit time range [start_ts, end_ts[ for a subscription (step and point count
+ *        of the subscription). Used for free time windows; deactivate the subscription first if the
+ *        periodic grid trigger must not replace the window.
+ * @return false if the subscription is unknown or the queue is full.
+ */
+bool chart_query_scheduler_poll_range(int8_t sub_id, uint32_t start_ts, uint32_t end_ts);
+
+/**
+ * @brief Set the query mode of a subscription (CHART_QUERY_MODE_GRID / CHART_QUERY_MODE_LTTB).
+ */
+void chart_query_scheduler_set_query_mode(int8_t sub_id, uint8_t query_mode);
+
+/**
+ * @brief Release a subscription slot. Queued requests of it are discarded on response.
+ */
+void chart_query_scheduler_unsubscribe(int8_t sub_id);
+
+/**
+ * @brief Bucket interval of the data last delivered to a subscription (0 = none yet).
+ *        Lets a widget drop a late answer that belongs to a previous step setting.
+ */
+uint32_t chart_query_scheduler_get_data_step(int8_t sub_id);
 
 #ifdef __cplusplus
 }

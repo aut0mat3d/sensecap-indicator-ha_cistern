@@ -220,6 +220,23 @@ size_t arc_scan_range(arc_channel_t* ch, arc_level_t level, uint32_t from_ts, ui
     return visited;
 }
 
+bool arc_read_first(arc_channel_t* ch, arc_level_t level, void* record_out) {
+    if (!ch || !record_out || level >= ARC_LEVEL_COUNT || !littlefs_driver_is_mounted()) return false;
+    if (!ch->scanned && !arc_channel_scan(ch)) return false;
+
+    arc_level_state_t* st = &ch->level[level];
+    if (!st->has_segments) return false;
+
+    size_t rec_size = arc_record_size(level);
+    /* The oldest segment can be empty right after a rollover: try the next one as well */
+    for (uint32_t seq = st->first_seq; seq <= st->last_seq && seq <= st->first_seq + 1; seq++) {
+        char path[96];
+        build_segment_path(ch, level, seq, path, sizeof(path));
+        if (littlefs_driver_read_at(path, 0, (uint8_t*)record_out, rec_size) == (int32_t)rec_size) return true;
+    }
+    return false;
+}
+
 bool arc_read_last(arc_channel_t* ch, arc_level_t level, void* record_out) {
     if (!ch || !record_out || level >= ARC_LEVEL_COUNT || !littlefs_driver_is_mounted()) return false;
     if (!ch->scanned && !arc_channel_scan(ch)) return false;

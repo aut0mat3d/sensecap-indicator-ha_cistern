@@ -3,6 +3,7 @@
  * @brief ESP32-S3 LoRa Receiver, Frame Processing & TX Queue Engine using Seeed HAL.
  */
 
+#include "esp_attr.h"
 #include "lora_model.h"
 #include "radio.h"
 #include <stdint.h>
@@ -25,7 +26,8 @@ static int16_t s_last_noise_floor = -100;
 bool s_time_synced_via_ntp = false;
 
 static lora_global_config_t g_rf_cfg;
-static lora_device_config_t g_devices[MAX_LORA_DEVICES];
+/* In PSRAM (20 KB): task context only, keeps internal DRAM for Wi-Fi/lwIP */
+EXT_RAM_BSS_ATTR static lora_device_config_t g_devices[MAX_LORA_DEVICES];
 static uint8_t              g_device_count = 0;
 static bool                 g_radio_active = false;
 /* Radio (re)configuration requested by the UART task (0x35), applied by the LoRa task:
@@ -1195,6 +1197,26 @@ lora_device_config_t* lora_model_get_device_by_addr(uint32_t dev_addr) {
         }
     }
     return NULL;
+}
+
+int lora_model_crossed_severity(uint32_t dev_addr, const char *key, float value, bool *has_thresholds) {
+    if (has_thresholds) *has_thresholds = false;
+    lora_device_config_t *dev = lora_model_get_device_by_addr(dev_addr);
+    if (!dev || !key) return -1;
+
+    int severity = -1;
+    for (uint8_t t = 0; t < dev->threshold_count; t++) {
+        const lora_threshold_config_t *th = &dev->thresholds[t];
+        if (!th->valid || strcmp(th->key, key) != 0) continue;
+        if (has_thresholds) *has_thresholds = true;
+
+        float limit, hyst;
+        lora_model_resolve_threshold(dev, th, &limit, &hyst);
+        bool crossed = (th->op == 0) ? (value < limit) : (value > limit);
+        /* Lower number = more severe (0 danger, 1 warning, 2 info) */
+        if (crossed && (severity < 0 || th->severity < severity)) severity = th->severity;
+    }
+    return severity;
 }
 
 void lora_model_resolve_threshold(const lora_device_config_t *dev, const lora_threshold_config_t *th,

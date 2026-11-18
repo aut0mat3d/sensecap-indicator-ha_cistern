@@ -538,42 +538,101 @@ static void handle_packet(const uint8_t* buffer, size_t size)
         }
 
         case PKT_TYPE_CMD_READ_FILE: {
-            if (size < 2) break;
+            /* Chunked file read (the ESP32 requests one chunk at a time, stop-and-wait):
+             * Request:  [1..4] offset (uint32), [5..] path (not null-terminated)
+             * Response: [1] status (1 = OK, 0 = not found / error), [2..3] chunk length (uint16),
+             *           [4..7] total file size (uint32), [8..11] offset of this chunk (uint32),
+             *           [12..] chunk data (max FILE_CHUNK_BYTES) */
+            const size_t FILE_CHUNK_BYTES = 512;
+            if (size < 6) break;
 
+            uint32_t offset = 0;
+            memcpy(&offset, &buffer[1], sizeof(offset));
             char file_path[128] = {0};
-            size_t path_len = size - 1;
+            size_t path_len = size - 5;
             if (path_len > sizeof(file_path) - 1) path_len = sizeof(file_path) - 1;
-            memcpy(file_path, &buffer[1], path_len);
+            memcpy(file_path, &buffer[5], path_len);
             file_path[path_len] = '\0';
 
-            LogSerial.printf("RP2040: File request from ESP32: %s\r\n", file_path);
-
-            uint8_t res_buf[1024];
+            uint8_t res_buf[12 + FILE_CHUNK_BYTES];
             res_buf[0] = static_cast<uint8_t>(PKT_TYPE_RES_FILE_DATA);
+            uint16_t chunk_len = 0;
+            uint32_t total = 0;
 
             File32 f = sd_card_get_fs().open(file_path, O_READ);
             if (!f) {
                 LogSerial.printf("RP2040: File not found or read error: %s\r\n", file_path);
-                res_buf[1] = 0; // Status: Failed / Not found
-                uint16_t len = 0;
-                memcpy(&res_buf[2], &len, sizeof(len));
-                uart_link_send(res_buf, 4);
+                res_buf[1] = 0;
+                memcpy(&res_buf[2], &chunk_len, sizeof(chunk_len));
+                memcpy(&res_buf[4], &total, sizeof(total));
+                memcpy(&res_buf[8], &offset, sizeof(offset));
+                uart_link_send(res_buf, 12);
                 break;
             }
 
-            uint16_t bytes_read = f.read(&res_buf[4], sizeof(res_buf) - 4);
+            total = f.size();
+            bool ok = true;
+            if (offset < total) {
+                ok = f.seek(offset);
+                if (ok) {
+                    int n = f.read(&res_buf[12], FILE_CHUNK_BYTES);
+                    ok = (n >= 0);
+                    chunk_len = (n > 0) ? (uint16_t)n : 0;
+                }
+            }
             f.close();
 
-            res_buf[1] = 1; // Status: Success
-            memcpy(&res_buf[2], &bytes_read, sizeof(bytes_read));
+            res_buf[1] = ok ? 1 : 0;
+            memcpy(&res_buf[2], &chunk_len, sizeof(chunk_len));
+            memcpy(&res_buf[4], &total, sizeof(total));
+            memcpy(&res_buf[8], &offset, sizeof(offset));
+            uart_link_send(res_buf, 12 + chunk_len);
+            if (offset == 0) {
+                LogSerial.printf("RP2040: File request from ESP32: %s (%lu bytes)\r\n",
+                                 file_path, (unsigned long)total);
+            }
+            break;
+        }
 
-            uart_link_send(res_buf, 4 + bytes_read);
-            LogSerial.printf("RP2040: Sent %u bytes for %s\r\n", bytes_read, file_path);
+        case PKT_TYPE_CMD_GET_LAST_VALUE: {
+            /* Request:  [1..4] dev_addr, [5..20] key (char[16])
+             * Response: [1..4] dev_addr, [5..20] key, [21] status (1 = value available),
+             *           [22..25] value (float), [26..29] timestamp of the value (UTC),
+             *           [30..33] expected interval of the key in seconds, [34..41] unit (char[8])
+             * Source: the archive channel state (last real value, restored from LittleFS at boot) */
+            if (size < 21) break;
+
+            uint32_t dev_addr = 0;
+            memcpy(&dev_addr, &buffer[1], 4);
+            char key[17] = {0};
+            memcpy(key, &buffer[5], 16);
+
+            uint8_t res_buf[42] = {0};
+            res_buf[0] = static_cast<uint8_t>(PKT_TYPE_RES_LAST_VALUE);
+            memcpy(&res_buf[1], &dev_addr, 4);
+            memcpy(&res_buf[5], key, 16);
+
+            const lora_device_config_t *dev = lorasensors_find_device(dev_addr);
+            if (dev) {
+                char channel_key[64];
+                snprintf(channel_key, sizeof(channel_key), "%08lX.%s.%s", (unsigned long)dev_addr, dev->decoder, key);
+                const data_channel_config_t *cfg = data_storage_get_config(channel_key);
+                const data_channel_state_t *st = data_storage_get_state(channel_key);
+                if (cfg && st && st->has_last_value) {
+                    res_buf[21] = 1;
+                    memcpy(&res_buf[22], &st->last_value, 4);
+                    memcpy(&res_buf[26], &st->last_rx_time, 4);
+                    uint32_t interval = cfg->roundtrip_interval;
+                    memcpy(&res_buf[30], &interval, 4);
+                    strncpy((char *)&res_buf[34], cfg->unit, 8);
+                }
+            }
+            uart_link_send(res_buf, sizeof(res_buf));
             break;
         }
 
         case PKT_TYPE_CMD_GET_CHART_DATA: {
-            /* Payload-Struktur:
+            /* Payload layout:
              * [1]: req_id (uint8_t)
              * [2..5]: dev_addr (uint32_t)
              * [6..21]: key (char[16], null-terminated)
@@ -583,6 +642,8 @@ static void handle_packet(const uint8_t* buffer, size_t size)
              * [34..35]: max_points (uint16_t)
              * [36..39]: alarm_min (float)
              * [40..43]: alarm_max (float)
+             * [44]:     alarm severity flags (CHART_ALARM_*_IS_WARNING), optional
+             * [45]:     query mode (CHART_QUERY_MODE_GRID / CHART_QUERY_MODE_LTTB), optional
              */
             if (size < 44) {
                 LogSerial.printf("[RP2040] CMD_GET_CHART_DATA error: packet too short (%u bytes)\r\n", (unsigned)size);
@@ -606,8 +667,10 @@ static void handle_packet(const uint8_t* buffer, size_t size)
             memcpy(&max_points, &buffer[34], 2);
             memcpy(&alarm_min, &buffer[36], 4);
             memcpy(&alarm_max, &buffer[40], 4);
+            uint8_t alarm_flags = (size >= 45) ? buffer[44] : 0; /* missing: both levels danger */
+            uint8_t query_mode = (size >= 46) ? buffer[45] : CHART_QUERY_MODE_GRID;
 
-            /* Device suchen, um Decoder-Namen für den Pfad zu ermitteln */
+            /* Look up the device to get the decoder name for the channel key */
             const lora_device_config_t *dev = lorasensors_find_device(dev_addr);
             const char *decoder = dev ? dev->decoder : "EM500-SWL";
 
@@ -621,13 +684,16 @@ static void handle_packet(const uint8_t* buffer, size_t size)
 */
             uint32_t actual_interval = interval_sec;
             size_t pt_count = 0;
-            chart_data_point_t *pts = data_storage_query_chart(
-                channel_key, start_ts, end_ts, interval_sec, max_points, alarm_min, alarm_max, &actual_interval, &pt_count);
+            chart_data_point_t *pts = (query_mode == CHART_QUERY_MODE_LTTB)
+                ? data_storage_query_lttb(channel_key, start_ts, end_ts, max_points, alarm_min, alarm_max,
+                                          alarm_flags, &actual_interval, &pt_count)
+                : data_storage_query_chart(channel_key, start_ts, end_ts, interval_sec, max_points, alarm_min,
+                                           alarm_max, alarm_flags, &actual_interval, &pt_count);
 /*
             LogSerial.printf("[RP2040] Chart Result: Zone %u returned %u points (actual step: %lu s)\r\n",
                           req_id, (unsigned)pt_count, (unsigned long)actual_interval);
 */            
-            /* Antwort aufbauen:
+            /* Response layout:
              * [0]: PKT_TYPE_RES_CHART_DATA (0x3C)
              * [1]: req_id (Zone ID)
              * [2]: status (0 = OK, 1 = Empty / Not Found)
@@ -635,13 +701,13 @@ static void handle_packet(const uint8_t* buffer, size_t size)
              * [7..8]: count (uint16_t)
              * [9..]: chart_data_point_t array (count * 9 Bytes)
              */
-            static uint8_t res_buf[512];
+            static uint8_t res_buf[9 + LTTB_MAX_POINTS * sizeof(chart_data_point_t)];
             res_buf[0] = static_cast<uint8_t>(PKT_TYPE_RES_CHART_DATA);
             res_buf[1] = req_id;
             res_buf[2] = (pts && pt_count > 0) ? 0 : 1;
             memcpy(&res_buf[3], &actual_interval, 4);
 
-            uint16_t safe_count = (pt_count > 40) ? 40 : (uint16_t)pt_count;
+            uint16_t safe_count = (pt_count > LTTB_MAX_POINTS) ? LTTB_MAX_POINTS : (uint16_t)pt_count;
             memcpy(&res_buf[7], &safe_count, 2);
 
             size_t payload_size = 9;
@@ -940,8 +1006,32 @@ void loop()
 
 /* ── Core 1 Setup & Loop (Communication & Storage Domain) ─────────────── */
 
+/**
+ * @brief SdFat file timestamps on the FAT32 partition (config files written back after GUI edits,
+ *        alarm journal): real local time once the clock is valid, so changed files can be
+ *        recognized on a PC (backups). Without a valid clock SdFat's default date is kept
+ *        (1 January of the compile year).
+ */
+static void fat_date_time_cb(uint16_t* fat_date, uint16_t* fat_time, uint8_t* ms10)
+{
+    time_t now = ::time(NULL);
+    if (!data_storage_is_time_valid() || now < 1700000000) {
+        *fat_date = FS_DEFAULT_DATE;
+        *fat_time = FS_DEFAULT_TIME;
+        *ms10 = 0;
+        return;
+    }
+    struct tm lt;
+    localtime_r(&now, &lt); /* TZ from the global config on the SD card */
+    *fat_date = FS_DATE(lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday);
+    *fat_time = FS_TIME(lt.tm_hour, lt.tm_min, lt.tm_sec);
+    *ms10 = (lt.tm_sec & 1) ? 100 : 0; /* FAT stores seconds in 2 s steps */
+}
+
 void setup1()
 {
+    FsDateTime::setCallback(fat_date_time_cb);
+
     packetSerial.setStream(&Serial1);
     packetSerial.setPacketHandler(&onPacketReceived);
     g_sys_state = SYS_STATE_BOOT;

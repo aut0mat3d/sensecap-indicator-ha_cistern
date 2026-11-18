@@ -39,6 +39,7 @@ part is still in the tree but not yet adapted (see [Home Assistant / MQTT](#home
 - [x] **Archive** on a LittleFS partition of the SD card: append-only binary segments per device / key / level (raw grid, hourly, daily), retention per level, RAM queue while the card is missing, cold-start restore
 - [x] **Data quality model**: hold values within the expected interval, limited substitute values, coverage-based hourly/daily aggregates (solid / degraded / gap)
 - [x] **Charts**: multi-zone history bar graph (7 days / 24 h / 55 min + live), serialized chart queries
+- [x] **Battery indicator and detail page**: battery icon in the header bound to a device key, tap opens a long-term trend page (24 h / 7 days / 31 days)
 - [x] **Alarms**: percent or absolute thresholds with direction, hysteresis and damping, editable on the device and written back to the device JSON; buzzer patterns, mute, acknowledge, persistent alarm journal
 - [x] **Onboard sensors**: SCD41 (CO₂), SGP40 (VOC), SHT41 / AHT20, ambient light
 - [x] **Offline time**: SNTP, P2P time, or last known time from the SD card; no time-dependent work before the time is valid
@@ -169,6 +170,7 @@ Related: [#19070](https://github.com/espressif/esp-idf/issues/19070) (bounce buf
 | Panel init order | reset (IO expander IO0_5) + ST7701S init **before** the RGB stream starts | defined panel state after warm and cold starts |
 | `CONFIG_LV_USE_CLIB_MALLOC` | y | LVGL 9 must allocate from the ESP heap; the built-in 64 KB pool live-locks the render task |
 | `CONFIG_LCD_RGB_RESTART_IN_VSYNC` | off | would restart (now fully) on every frame |
+| `CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY` | y | large static tables (`EXT_RAM_BSS_ATTR`: chart scheduler slots, LoRa device table, alarm ring buffer, ~52 KB) live in PSRAM; internal DRAM stays free for DMA, Wi-Fi and lwIP (`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP` stays off) |
 
 `scripts/test_lcd_rgb_config.py` checks several of these settings.
 

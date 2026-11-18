@@ -9,8 +9,11 @@
 
 #include "cistern_view.h"
 #include "vert_graph.h"
+#include "gui_theme.h"
 #include "keyvalue_card.h"
 #include "horiz_bargraph.h"
+#include "battery_icon.h"
+#include "key_detail_view.h"
 #include "gui_header.h"
 #include "gui_footer.h"
 #include "i18n/gui_i18n.h"
@@ -32,6 +35,7 @@ static const char *TAG = "cistern-view";
 /* Primary Cistern Sensor Identification (matches Wasser_Hochbehaelter.json) */
 #define CISTERN_DEV_ADDR               0x05975DC9
 #define CISTERN_KEY_DEPTH              "depth"
+#define CISTERN_KEY_BATTERY            "battery_soc"
 #define CISTERN_FALLBACK_MIN_DEPTH_CM  0.0f
 #define CISTERN_FALLBACK_MAX_DEPTH_CM  140.0f
 
@@ -47,6 +51,10 @@ static esp_event_handler_instance_t s_telemetry_handler = NULL;
 /* Subscription handles for chart query scheduler (Zone 0: 7d, Zone 1: 24h, Zone 2: 55m) */
 static int8_t s_zone_subs[3] = {-1, -1, -1};
 
+/* Battery indicator of the cistern sensor in the header slot right of the settings gear */
+static battery_icon_t s_battery_icon;
+static bool           s_battery_icon_created = false;
+
 /* State flags */
 static bool   s_initial_chart_loaded = false;
 static bool   s_dev_cfg_applied = false;
@@ -59,7 +67,10 @@ static time_t s_last_rx_time = 0;
  */
 static bool cistern_resolve_depth_config(float *out_min, float *out_max,
                                          float *out_alarm_min, float *out_alarm_max,
-                                         float *out_hyst_min, float *out_hyst_max) {
+                                         float *out_hyst_min, float *out_hyst_max,
+                                         gui_alarm_level_t *out_sev_min, gui_alarm_level_t *out_sev_max) {
+    gui_alarm_level_t sev_min = GUI_ALARM_DANGER;
+    gui_alarm_level_t sev_max = GUI_ALARM_DANGER;
     float min_val   = CISTERN_FALLBACK_MIN_DEPTH_CM;
     float max_val   = CISTERN_FALLBACK_MAX_DEPTH_CM;
     float alarm_min = 0.0f;
@@ -75,6 +86,8 @@ static bool cistern_resolve_depth_config(float *out_min, float *out_max,
         if (out_alarm_max) *out_alarm_max = alarm_max;
         if (out_hyst_min) *out_hyst_min = hyst_min;
         if (out_hyst_max) *out_hyst_max = hyst_max;
+        if (out_sev_min) *out_sev_min = sev_min;
+        if (out_sev_max) *out_sev_max = sev_max;
         return false;
     }
 
@@ -103,9 +116,11 @@ static bool cistern_resolve_depth_config(float *out_min, float *out_max,
         if (th->op == 0) { /* THRESHOLD_OP_LESS_THAN (falling / low level) */
             alarm_min = eval_val;
             hyst_min  = eval_hyst;
+            sev_min   = gui_theme_level_from_severity(th->severity);
         } else {           /* THRESHOLD_OP_GREATER_THAN (rising / high level) */
             alarm_max = eval_val;
             hyst_max  = eval_hyst;
+            sev_max   = gui_theme_level_from_severity(th->severity);
         }
     }
 
@@ -115,7 +130,33 @@ static bool cistern_resolve_depth_config(float *out_min, float *out_max,
     if (out_alarm_max) *out_alarm_max = alarm_max;
     if (out_hyst_min) *out_hyst_min = hyst_min;
     if (out_hyst_max) *out_hyst_max = hyst_max;
+    if (out_sev_min) *out_sev_min = sev_min;
+    if (out_sev_max) *out_sev_max = sev_max;
     return true;
+}
+
+/* Display alarm level of a depth value (same levels and severities as the vertical bar) */
+static gui_alarm_level_t cistern_depth_alarm_level(float val) {
+    if (isnan(val)) return GUI_ALARM_NONE;
+    if (s_vert_graph.alarm_level_min > 0.0f && val < s_vert_graph.alarm_level_min) {
+        return (s_vert_graph.alarm_severity_min != GUI_ALARM_NONE) ? s_vert_graph.alarm_severity_min : GUI_ALARM_DANGER;
+    }
+    if (s_vert_graph.alarm_level_max > 0.0f && val > s_vert_graph.alarm_level_max) {
+        return (s_vert_graph.alarm_severity_max != GUI_ALARM_NONE) ? s_vert_graph.alarm_severity_max : GUI_ALARM_DANGER;
+    }
+    return GUI_ALARM_NONE;
+}
+
+static uint8_t cistern_level_to_flags(gui_alarm_level_t level) {
+    if (level == GUI_ALARM_DANGER) return DATA_FLAG_ALARM_DANGER;
+    if (level == GUI_ALARM_WARNING) return DATA_FLAG_ALARM_WARN;
+    return 0;
+}
+
+static gui_alarm_level_t cistern_flags_to_level(uint8_t flags) {
+    if (flags & DATA_FLAG_ALARM_DANGER) return GUI_ALARM_DANGER;
+    if (flags & DATA_FLAG_ALARM_WARN) return GUI_ALARM_WARNING;
+    return GUI_ALARM_NONE;
 }
 
 static void cistern_update_last_rx_ui(time_t rx_ts) {
@@ -131,21 +172,80 @@ static void cistern_update_last_rx_ui(time_t rx_ts) {
 
 /* ── Autonomous 1-Second Timer Callback (Clock & Handshake Check) ──────── */
 
+/* History zones of the horizontal bar graph: step and number of buckets per zone */
+static const struct {
+    uint32_t step_sec;
+    uint16_t points;
+} s_zone_cfg[3] = {
+    { 86400, 7 },   /* Zone 0: 7 days   */
+    { 7200,  12 },  /* Zone 1: 24 hours */
+    { 300,   11 },  /* Zone 2: 55 min   */
+};
+
+/* Alarm levels the chart subscriptions currently use (the RP2040 colors history buckets with them) */
+static float   s_chart_alarm_min = 0.0f;
+static float   s_chart_alarm_max = 0.0f;
+static uint8_t s_chart_alarm_flags = 0;   /* CHART_ALARM_*_IS_WARNING */
+
+/**
+ * @brief Hand new depth alarm levels to the chart subscriptions and re-query the history so the
+ *        bars are recolored. Needed because the device config usually arrives after the view was
+ *        created (levels 0 = no coloring) and thresholds can be changed in the config dialog.
+ */
+static void cistern_apply_chart_alarm_levels(float alarm_min, float alarm_max, uint8_t alarm_flags) {
+    if (alarm_min == s_chart_alarm_min && alarm_max == s_chart_alarm_max && alarm_flags == s_chart_alarm_flags) return;
+    s_chart_alarm_min = alarm_min;
+    s_chart_alarm_max = alarm_max;
+    s_chart_alarm_flags = alarm_flags;
+
+    for (uint8_t z = 0; z < 3; z++) {
+        /* Subscribing again with the same device/key/zone updates the existing subscription */
+        s_zone_subs[z] = chart_query_scheduler_subscribe(CISTERN_DEV_ADDR, CISTERN_KEY_DEPTH, z,
+                                                         s_zone_cfg[z].step_sec, s_zone_cfg[z].points,
+                                                         alarm_min, alarm_max, alarm_flags);
+        if (s_zone_subs[z] >= 0 && time(NULL) >= 1700000000) {
+            chart_query_scheduler_trigger_poll(CISTERN_DEV_ADDR, CISTERN_KEY_DEPTH, z);
+        }
+    }
+    ESP_LOGI(TAG, "Chart alarm levels updated: min=%.1f cm (%s), max=%.1f cm (%s), history re-queried",
+             alarm_min, (alarm_flags & CHART_ALARM_MIN_IS_WARNING) ? "warning" : "danger",
+             alarm_max, (alarm_flags & CHART_ALARM_MAX_IS_WARNING) ? "warning" : "danger");
+}
+
+/**
+ * @brief Resolve the depth configuration of the device and apply it to the vertical bar (scale,
+ *        alarm levels, severities) and to the chart subscriptions. Used when the device config
+ *        arrives after the view was created and after thresholds were changed in the dialog.
+ * @return false if the device config is not available yet.
+ */
+static bool cistern_apply_depth_config(void) {
+    float min_d, max_d, alm_min, alm_max, hyst_min, hyst_max;
+    gui_alarm_level_t sev_min, sev_max;
+    if (!cistern_resolve_depth_config(&min_d, &max_d, &alm_min, &alm_max, &hyst_min, &hyst_max,
+                                      &sev_min, &sev_max)) {
+        return false;
+    }
+    s_vert_graph.alarm_severity_min = sev_min;
+    s_vert_graph.alarm_severity_max = sev_max;
+    vert_graph_set_range(&s_vert_graph, min_d, max_d);
+    vert_graph_set_alarm_levels(&s_vert_graph, alm_min, alm_max, hyst_min, hyst_max);
+    s_horiz_graph.min_value = min_d;
+    s_horiz_graph.max_value = max_d;
+
+    uint8_t flags = ((sev_min == GUI_ALARM_WARNING) ? CHART_ALARM_MIN_IS_WARNING : 0) |
+                    ((sev_max == GUI_ALARM_WARNING) ? CHART_ALARM_MAX_IS_WARNING : 0);
+    cistern_apply_chart_alarm_levels(alm_min, alm_max, flags);
+    ESP_LOGI(TAG, "Applied device depth config: range=[%.1f..%.1f] cm, alarm_min=%.1f cm, alarm_max=%.1f cm",
+             min_d, max_d, alm_min, alm_max);
+    return true;
+}
+
 static void cistern_clock_timer_cb(lv_timer_t *timer) {
     time_t now = time(NULL);
 
     /* 0. Late-binding sync if device config arrived via UART after view init */
     if (!s_dev_cfg_applied) {
-        float min_d, max_d, alm_min, alm_max, hyst_min, hyst_max;
-        if (cistern_resolve_depth_config(&min_d, &max_d, &alm_min, &alm_max, &hyst_min, &hyst_max)) {
-            s_dev_cfg_applied = true;
-            vert_graph_set_range(&s_vert_graph, min_d, max_d);
-            vert_graph_set_alarm_levels(&s_vert_graph, alm_min, alm_max, hyst_min, hyst_max);
-            s_horiz_graph.min_value = min_d;
-            s_horiz_graph.max_value = max_d;
-            ESP_LOGI(TAG, "Applied device depth config: range=[%.1f..%.1f] cm, alarm_min=%.1f cm, alarm_max=%.1f cm",
-                     min_d, max_d, alm_min, alm_max);
-        }
+        s_dev_cfg_applied = cistern_apply_depth_config();
     }
 
     /* 0b. Late-binding main color from the device medium (/gui/media_standards.json).
@@ -197,14 +297,16 @@ static void cistern_clock_timer_cb(lv_timer_t *timer) {
                     } else {
                         if (p->flags & DATA_FLAG_ESTIMATED) strcat(flag_str, "[ESTIMATED] ");
                         if (p->flags & DATA_FLAG_AVERAGED)  strcat(flag_str, "[AVERAGED] ");
-                        if (p->flags & DATA_FLAG_ALARM_DANGER) strcat(flag_str, "[ALARM] ");
+                        if (p->flags & DATA_FLAG_ALARM_DANGER) strcat(flag_str, "[DANGER] ");
+                        if (p->flags & DATA_FLAG_ALARM_WARN)   strcat(flag_str, "[WARN] ");
                         if (p->flags == 0) strcat(flag_str, "[REAL] ");
                     }
                 
 
-                /* DEBUG LOGGING */
+                /* Per-slot dump only at debug level: console output blocks the LVGL task
+                 * (115200 Bd, ~70 ms for a full zone) */
                 if (z == 2) {
-                        ESP_LOGI(TAG, "  Slot %2u: %02d:%02d val=%.2f %s",
+                        ESP_LOGD(TAG, "  Slot %2u: %02d:%02d val=%.2f %s",
                                  i, tm_buf.tm_hour, tm_buf.tm_min, p->value, flag_str);
                     }
                 }
@@ -225,10 +327,10 @@ static void cistern_clock_timer_cb(lv_timer_t *timer) {
                     if (valid_idx >= 0) {
                         const chart_data_point_t *last_pt = &pts[valid_idx];
                         bool is_est = (last_pt->flags & DATA_FLAG_ESTIMATED) != 0;
-                        bool is_alarm = (last_pt->flags & (DATA_FLAG_ALARM_DANGER | DATA_FLAG_ALARM_WARN)) != 0;
+                        gui_alarm_level_t level = cistern_flags_to_level(last_pt->flags);
 
-                        vert_graph_update_value(&s_vert_graph, last_pt->value, "cm", is_est, is_alarm);
-                        keyvalue_card_update_binding(&s_keyvalue_card, "depth", last_pt->value, "cm", is_est, is_alarm);
+                        vert_graph_update_value(&s_vert_graph, last_pt->value, "cm", is_est, level);
+                        keyvalue_card_update_binding(&s_keyvalue_card, "depth", last_pt->value, "cm", is_est, level);
 
                         horiz_bargraph_update_zone_data(&s_horiz_graph, 3, last_pt, 1);
 
@@ -245,7 +347,8 @@ static void cistern_clock_timer_cb(lv_timer_t *timer) {
     /* 3. Autonomous Live Stale Timeout Check (Interval: 300s + 15s grace) */
     if (s_last_rx_time > 0 && (now - s_last_rx_time) > 315) {
         /* Dim vertical bar to 50% opacity and prepend ~ */
-        vert_graph_set_status(&s_vert_graph, true, s_vert_graph.is_alarm);
+        gui_alarm_level_t stale_level = cistern_depth_alarm_level(s_vert_graph.current_value);
+        vert_graph_set_status(&s_vert_graph, true, stale_level);
 
         /* Dim live bar (Zone 3) to 50% opacity */
         chart_data_point_t stale_live_pt = {
@@ -253,9 +356,7 @@ static void cistern_clock_timer_cb(lv_timer_t *timer) {
             .value = s_vert_graph.current_value,
             .flags = DATA_FLAG_ESTIMATED
         };
-        if (s_vert_graph.is_alarm) {
-            stale_live_pt.flags |= DATA_FLAG_ALARM_DANGER;
-        }
+        stale_live_pt.flags |= cistern_level_to_flags(stale_level);
         horiz_bargraph_update_zone_data(&s_horiz_graph, 3, &stale_live_pt, 1);
     }
 }
@@ -263,15 +364,31 @@ static void cistern_clock_timer_cb(lv_timer_t *timer) {
 /* ── User Interaction Handlers ─────────────────────────────────────────── */
 
 static void cistern_view_on_threshold_updated(uint32_t dev_addr, const char *key, uint8_t op, float value, float hyst) {
+    (void)op;
+    (void)value;
+    (void)hyst;
     if (dev_addr == CISTERN_DEV_ADDR && (strcmp(key, "depth") == 0 || strcmp(key, "level") == 0)) {
-        if (op == 0) {
-            /* THRESHOLD_OP_LESS_THAN: Update dry-run minimum level marker */
-            vert_graph_set_alarm_levels(&s_vert_graph, value, s_vert_graph.alarm_level_max, hyst, s_vert_graph.hysteresis_max);
-        } else {
-            /* THRESHOLD_OP_GREATER_THAN: Update overflow maximum level marker */
-            vert_graph_set_alarm_levels(&s_vert_graph, s_vert_graph.alarm_level_min, value, s_vert_graph.hysteresis_min, hyst);
-        }
+        /* The dialog already updated the device config in RAM (values and severity): resolve it
+         * again so markers, colors and chart history use exactly the evaluator's levels */
+        cistern_apply_depth_config();
     }
+}
+
+static void on_battery_icon_clicked(lv_event_t *e) {
+    (void)e;
+    key_detail_view_show(CISTERN_DEV_ADDR, CISTERN_KEY_BATTERY);
+}
+
+/* Battery indicator bound to the cistern sensor, hosted in the header slot right of the gear */
+static void cistern_create_battery_icon(void) {
+    lv_obj_t *slot = gui_header_get_slot_container(HEADER_SLOT_LEFT_2);
+    if (!slot) return;
+    memset(&s_battery_icon, 0, sizeof(s_battery_icon));
+    s_battery_icon.parent = slot;
+    s_battery_icon.dev_addr = CISTERN_DEV_ADDR;
+    strlcpy(s_battery_icon.key, CISTERN_KEY_BATTERY, sizeof(s_battery_icon.key));
+    s_battery_icon.click_cb = on_battery_icon_clicked;
+    s_battery_icon_created = (battery_icon_init(&s_battery_icon) == 0);
 }
 
 static void on_vert_graph_clicked(lv_event_t *e) {
@@ -304,25 +421,17 @@ static void cistern_telemetry_event_handler(void *handler_args, esp_event_base_t
     /* This static view shows exactly one device; equal keys of other devices must not leak in */
     if (telem->dev_addr != CISTERN_DEV_ADDR) return;
     bool is_estimated = false;
-    bool is_alarm = false;
 
-    /* 1. Evaluate alarm threshold for primary depth/level sensor */
+    /* 1. Evaluate alarm level for primary depth/level sensor */
     bool is_depth = (strcmp(telem->key, "depth") == 0 || strcmp(telem->key, "level") == 0);
-    if (is_depth) {
-        if (s_vert_graph.alarm_level_min > 0.0f && val < s_vert_graph.alarm_level_min) {
-            is_alarm = true;
-        }
-        if (s_vert_graph.alarm_level_max > 0.0f && val > s_vert_graph.alarm_level_max) {
-            is_alarm = true;
-        }
-    }
+    gui_alarm_level_t level = is_depth ? cistern_depth_alarm_level(val) : GUI_ALARM_NONE;
 
     /* 2. Update Text Card (6x5 Grid) */
-    keyvalue_card_update_binding(&s_keyvalue_card, telem->key, val, telem->unit, is_estimated, is_alarm);
+    keyvalue_card_update_binding(&s_keyvalue_card, telem->key, val, telem->unit, is_estimated, level);
 
     /* 3. Primary depth sensor updates: Vertical bar and Live Slot (Zone 3) */
     if (is_depth) {
-        vert_graph_update_value(&s_vert_graph, val, telem->unit, is_estimated, is_alarm);
+        vert_graph_update_value(&s_vert_graph, val, telem->unit, is_estimated, level);
 
         /* Update Live-Bargraph in Zone 3 (most-right bar) ONLY for depth */
         chart_data_point_t live_pt = {
@@ -330,7 +439,7 @@ static void cistern_telemetry_event_handler(void *handler_args, esp_event_base_t
             .value = val,
             .flags = 0
         };
-        if (is_alarm) live_pt.flags |= DATA_FLAG_ALARM_DANGER;
+        live_pt.flags |= cistern_level_to_flags(level);
         if (is_estimated) live_pt.flags |= DATA_FLAG_ESTIMATED;
 
         horiz_bargraph_update_zone_data(&s_horiz_graph, 3, &live_pt, 1);
@@ -352,6 +461,7 @@ int cistern_view_init(void) {
     /* 1. Configure Header */
     gui_header_clear();
     gui_header_set_title("Hochbehälter");
+    cistern_create_battery_icon();
 
     /* 2. Configure Clean Footer */
     s_initial_chart_loaded = false;
@@ -365,9 +475,12 @@ int cistern_view_init(void) {
     float alarm_max_cm = 0.0f;
     float hyst_min_cm  = 0.0f;
     float hyst_max_cm  = 0.0f;
+    gui_alarm_level_t sev_min = GUI_ALARM_DANGER;
+    gui_alarm_level_t sev_max = GUI_ALARM_DANGER;
     s_dev_cfg_applied = cistern_resolve_depth_config(&min_depth_cm, &max_depth_cm,
                                                      &alarm_min_cm, &alarm_max_cm,
-                                                     &hyst_min_cm, &hyst_max_cm);
+                                                     &hyst_min_cm, &hyst_max_cm,
+                                                     &sev_min, &sev_max);
 
     /* ========================================================================
      * 10x8 SEAMLESS GRID GEOMETRY CALCULATIONS
@@ -389,7 +502,9 @@ int cistern_view_init(void) {
     s_vert_graph.alarm_level_max = alarm_max_cm;
     s_vert_graph.hysteresis_min = hyst_min_cm;
     s_vert_graph.hysteresis_max = hyst_max_cm;
-    s_vert_graph.alarm_color = lv_color_hex(0xE74C3C);
+    s_vert_graph.alarm_severity_min = sev_min;
+    s_vert_graph.alarm_severity_max = sev_max;
+    /* Alarm colors come from the theme (gui_theme.h, /gui/theme.json) */
 
     strncpy(s_vert_graph.unit, "cm", sizeof(s_vert_graph.unit) - 1);
     s_vert_graph.bar_color = lv_color_hex(0x3498DB);
@@ -439,9 +554,16 @@ int cistern_view_init(void) {
     s_initial_chart_loaded = false;
 
     /* Register subscriptions in chart_query_scheduler */
-    s_zone_subs[0] = chart_query_scheduler_subscribe(CISTERN_DEV_ADDR, CISTERN_KEY_DEPTH, 0, 86400, 7, alarm_min_cm, alarm_max_cm);
-    s_zone_subs[1] = chart_query_scheduler_subscribe(CISTERN_DEV_ADDR, CISTERN_KEY_DEPTH, 1, 7200, 12, alarm_min_cm, alarm_max_cm);
-    s_zone_subs[2] = chart_query_scheduler_subscribe(CISTERN_DEV_ADDR, CISTERN_KEY_DEPTH, 2, 300, 11, alarm_min_cm, alarm_max_cm);
+    uint8_t init_alarm_flags = ((sev_min == GUI_ALARM_WARNING) ? CHART_ALARM_MIN_IS_WARNING : 0) |
+                               ((sev_max == GUI_ALARM_WARNING) ? CHART_ALARM_MAX_IS_WARNING : 0);
+    for (uint8_t z = 0; z < 3; z++) {
+        s_zone_subs[z] = chart_query_scheduler_subscribe(CISTERN_DEV_ADDR, CISTERN_KEY_DEPTH, z,
+                                                         s_zone_cfg[z].step_sec, s_zone_cfg[z].points,
+                                                         alarm_min_cm, alarm_max_cm, init_alarm_flags);
+    }
+    s_chart_alarm_min = alarm_min_cm;
+    s_chart_alarm_max = alarm_max_cm;
+    s_chart_alarm_flags = init_alarm_flags;
 
     /* Activate subscriptions for this view */
     for (int i = 0; i < 3; i++) {
@@ -484,6 +606,13 @@ void cistern_view_destroy(void) {
         s_telemetry_handler = NULL;
     }
 
+    key_detail_view_hide();
+    if (s_battery_icon_created) {
+        battery_icon_destroy(&s_battery_icon);
+        s_battery_icon_created = false;
+    }
+    gui_header_hide_slot(HEADER_SLOT_LEFT_2);
+
     vert_graph_destroy(&s_vert_graph);
     keyvalue_card_destroy(&s_keyvalue_card);
     horiz_bargraph_destroy(&s_horiz_graph);
@@ -499,10 +628,12 @@ void cistern_view_set_visible(bool visible) {
         if (s_vert_graph.container)   lv_obj_remove_flag(s_vert_graph.container, LV_OBJ_FLAG_HIDDEN);
         if (s_keyvalue_card.container) lv_obj_remove_flag(s_keyvalue_card.container, LV_OBJ_FLAG_HIDDEN);
         if (s_horiz_graph.container)  lv_obj_remove_flag(s_horiz_graph.container, LV_OBJ_FLAG_HIDDEN);
+        if (s_battery_icon_created)   battery_icon_set_visible(&s_battery_icon, true);
     } else {
         if (s_vert_graph.container)   lv_obj_add_flag(s_vert_graph.container, LV_OBJ_FLAG_HIDDEN);
         if (s_keyvalue_card.container) lv_obj_add_flag(s_keyvalue_card.container, LV_OBJ_FLAG_HIDDEN);
         if (s_horiz_graph.container)  lv_obj_add_flag(s_horiz_graph.container, LV_OBJ_FLAG_HIDDEN);
+        if (s_battery_icon_created)   battery_icon_set_visible(&s_battery_icon, false);
     }
     lv_port_sem_give();
 }

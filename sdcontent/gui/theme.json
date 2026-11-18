@@ -1,0 +1,15 @@
+{
+  "alarm": {
+    "danger": "0xE74C3C",
+    "warning": "0xF1C40F",
+    "info": "0x9E9E9E",
+    "ok": "0x2ECC71"
+  },
+  "alarm_state": {
+    "incoming": "0xE74C3C",
+    "going": "0x2ECC71",
+    "muted": "0x95A5A6",
+    "retriggered": "0x3498DB",
+    "acknowledged": "0x7F8C8D"
+  }
+}

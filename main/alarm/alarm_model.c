@@ -5,6 +5,7 @@
  * @copyright © 2026, SenseCAP Cistern Extension
  */
 
+#include "esp_attr.h"
 #include "alarm_model.h"
 #include <string.h>
 #include <stdlib.h>
@@ -21,6 +22,7 @@
 #include "rp2040.h"
 #include "view_data.h"
 #include "alarm_evaluator.h"
+#include "gui_theme.h"
 
 static const char* TAG = "alarm_model";
 
@@ -59,7 +61,8 @@ static bool s_sd_card_ready = false;
 static bool s_history_loaded = false;
 
 /* Append-only event journal ringbuffer */
-static alarm_entry_t      s_ringbuffer[ALARM_RINGBUFFER_SIZE];
+/* In PSRAM (9 KB): task context only, keeps internal DRAM for Wi-Fi/lwIP */
+EXT_RAM_BSS_ATTR static alarm_entry_t s_ringbuffer[ALARM_RINGBUFFER_SIZE];
 static size_t             s_ringbuffer_count = 0;
 static size_t             s_ringbuffer_head = 0;
 static size_t             s_ringbuffer_tail = 0;
@@ -77,25 +80,20 @@ static uint8_t            s_current_buzzer_pattern = 0xFF;
 // UI & Configuration Helpers
 // ============================================================================
 
-static uint32_t _parse_hex_color(const char *hex_str, uint32_t fallback) {
-    if (!hex_str || hex_str[0] == '\0') return fallback;
-    if (strncmp(hex_str, "0x", 2) == 0 || strncmp(hex_str, "0X", 2) == 0) hex_str += 2;
-    char *endptr = NULL;
-    uint32_t val = (uint32_t)strtoul(hex_str, &endptr, 16);
-    return (endptr != hex_str) ? val : fallback;
-}
-
 static alarm_ui_config_t _get_default_ui_config(void) {
     alarm_ui_config_t cfg;
 
-    cfg.colors.color_danger       = _parse_hex_color(gui_i18n_get("colors.color_danger"), 0xE74C3C);
-    cfg.colors.color_warning      = _parse_hex_color(gui_i18n_get("colors.color_warning"), 0xF39C12);
-    cfg.colors.color_info         = _parse_hex_color(gui_i18n_get("colors.color_info"), 0x9E9E9E);
-    cfg.colors.color_incoming     = _parse_hex_color(gui_i18n_get("colors.color_incoming"), 0xE74C3C);
-    cfg.colors.color_going        = _parse_hex_color(gui_i18n_get("colors.color_going"), 0x2ECC71);
-    cfg.colors.color_muted        = _parse_hex_color(gui_i18n_get("colors.color_muted"), 0x95A5A6);
-    cfg.colors.color_retriggered  = _parse_hex_color(gui_i18n_get("colors.color_retriggered"), 0x3498DB);
-    cfg.colors.color_acknowledged = _parse_hex_color(gui_i18n_get("colors.color_acknowledged"), 0x7F8C8D);
+    /* Colors are language independent: /gui/theme.json via gui_theme (built-in defaults) */
+    gui_theme_colors_t theme;
+    gui_theme_get_colors(&theme);
+    cfg.colors.color_danger       = theme.alarm_danger;
+    cfg.colors.color_warning      = theme.alarm_warning;
+    cfg.colors.color_info         = theme.alarm_info;
+    cfg.colors.color_incoming     = theme.state_incoming;
+    cfg.colors.color_going        = theme.state_going;
+    cfg.colors.color_muted        = theme.state_muted;
+    cfg.colors.color_retriggered  = theme.state_retriggered;
+    cfg.colors.color_acknowledged = theme.state_acknowledged;
 
     strlcpy(cfg.texts.danger,       gui_i18n_get("texts.danger"), sizeof(cfg.texts.danger));
     strlcpy(cfg.texts.warning,      gui_i18n_get("texts.warning"), sizeof(cfg.texts.warning));

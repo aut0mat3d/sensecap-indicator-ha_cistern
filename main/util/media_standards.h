@@ -1,6 +1,9 @@
 #ifndef MEDIA_STANDARDS_H
 #define MEDIA_STANDARDS_H
 
+#include <stdbool.h>
+#include <stddef.h>
+
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -39,6 +42,15 @@ int media_standards_load_from_sd(void);
  *        Views compare it with their last applied revision to re-apply colors.
  */
 uint32_t media_standards_get_revision(void);
+
+/** Number of loaded media types */
+size_t media_standards_count(void);
+
+/**
+ * @brief Copy id and color of the media type at index (0 .. media_standards_count() - 1).
+ * @return false if the index is out of range.
+ */
+bool media_standards_get_entry(size_t index, char *id_out, size_t id_len, uint32_t *color_out);
 
 void media_standards_clear(void);
 void media_standards_add(const char *id, uint32_t color_hex, const char *unit);

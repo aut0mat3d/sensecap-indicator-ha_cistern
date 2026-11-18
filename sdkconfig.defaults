@@ -99,6 +99,9 @@ CONFIG_LV_SPRINTF_USE_FLOAT=y
 # Memory & PSRAM
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=n
+# Large static buffers marked EXT_RAM_BSS_ATTR (chart subscriptions, device table, alarm journal)
+# live in PSRAM; Wi-Fi/lwIP buffers stay in internal DRAM (PSRAM bus is shared with the RGB panel)
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 

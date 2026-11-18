@@ -26,7 +26,9 @@ Application-specific settings therefore never belong in a decoder file.
 | `devices/<name>.json` | RP2040 `lorasensors_load_all` (devices, thresholds, virtual decoders, streamed to ESP32 via `0x3F`), `data_storage_load_devices` (archive channels) | see schema below |
 | `gui/media_standards.json` | ESP32 `media_standards_load_from_sd()` (after config push, together with the language files); `cistern_view` applies `media_get_color(device.medium)` as main color of its graphs | `media_types.<id>`: name EN/DE, `color_hex` (user-defined main color), `unit_default` |
 | `gui/lang/<lang>/common.json` | ESP32 `gui_i18n_reload_from_sd` via `0x38` | GUI string overrides |
-| `gui/lang/<lang>/alarm_config.json` | ESP32 `gui_i18n` / `alarm_model` | alarm colors, texts, HW button behavior |
+| `gui/lang/<lang>/alarm_config.json` | ESP32 `gui_i18n` / `alarm_model` | alarm texts, HW button behavior (colors moved to `gui/theme.json`) |
+| `gui/theme.json` | ESP32 `gui_theme_load_from_sd()` (together with the language files and media); built-in defaults if missing | `alarm.{danger,warning,info}`, `alarm_state.{incoming,going,muted,retriggered,acknowledged}` as `"0xRRGGBB"`. Language independent. After loading, every medium color closer than 120 (redmean distance) to the danger or warning color is reported in the log. |
+| `alarm_history.bin` (root) | written by the RP2040 (`0xA9` chunks, staged as `alarm_history.tmp`, renamed after the last acknowledged chunk), streamed back with `0xAB` | binary alarm journal: `uint16 entry_size`, `uint16 count`, then `count` x `alarm_entry_t` (oldest first, max 50). Readable with an external tool. |
 
 ## Device JSON schema (`devices/*.json`)
 
@@ -61,11 +63,13 @@ Application-specific settings therefore never belong in a decoder file.
 
 Thresholds: `direction` is mandatory (`"falling"` = alarm below the value, `"rising"` = alarm above); a threshold without a valid direction is skipped with a log message, the direction is never derived from the `id`. Percent values (`value_percent`, `hysteresis_percent`) refer to `limits[key]` (`val_min..val_max`), else to the tank depth. GUI edits rewrite exactly this entry in the device file (value, hysteresis, damping, severity, buzzer mode); `id`, `key` and `direction` are not editable.
 
+File timestamps on the FAT32 partition: files written by the RP2040 (alarm journal, device JSON after threshold / offset edits) carry the real local time once the clock is valid (SdFat date callback, TZ from the global config); before that SdFat uses 1 January of the compile year.
+
 Archive keys may be decoder keys (`depth`, `battery_soc`) or virtual keys (`volume`, `flowrate`).
 Retention: number of entries kept per level; `0` disables the level. `weeks`, `months` and `years` are parsed but not aggregated yet (planned NTTW phase).
 
 Current limits of the engine (until the NTTW rework):
-* Each level is aggregated from the next finer one. A disabled finer level that is needed as a source is kept as a small staging level: `raw` with 2 hours of buckets when hourly is active, `hour` with at least 26 entries when daily is active (covers 25-hour DST days).
+* Each level is aggregated from the next finer one. A disabled finer level that is needed as a source is kept as a small staging level: `raw` with 2 hours of buckets when hourly is active (at least the hold span interval + tolerance, so the newest real value survives for the cold-start restore even for hourly keys), `hour` with at least 26 entries when daily is active (covers 25-hour DST days).
 * Grid: values are stored on a wall-clock grid of `min(expected interval, 300 s)`. Each grid bucket gets a flag: `0` real sample, `2` hold (no new sample, but the next packet is not overdue yet: covers intervals longer than the grid and the asynchronous sensor clock), `1` substitute (packet overdue).
 * Quality model for hours, days and multi-hour chart buckets: coverage = (real + hold buckets) / expected buckets. Coverage ≥ `solid_pct` → regular value; ≥ `min_pct` → value flagged ESTIMATED (50 % opacity); below → gap. Substitutes never count as coverage; with `use_estimated` they enter the average. A day sums the coverage of its hours.
 * Substitute values: after a missed packet the last value is held without the ESTIMATED flag until `interval_sec + tolerance_sec + 6 s` has passed. After that, up to `max_estimated_count` buckets are written with the ESTIMATED flag, then nothing (chart gap). After a reboot no substitutes are written until the first real packet arrives.

@@ -60,8 +60,8 @@ enum pkt_type {
     PKT_TYPE_PUSH_LORA_CFG        = 0x35,  /* Globals & total device count */
     PKT_TYPE_CMD_LORA_RAW_FRAME   = 0x36,  /* Payload: DevAddr(4B) + RSSI(2B) + SNR(1B) + Size(1B) + Payload(NB) */
     PKT_TYPE_CMD_SET_TIME_CFG     = 0x37,  /* Payload: posix_tz[64] + time_format[8] */
-    PKT_TYPE_CMD_READ_FILE        = 0x38,  /* Payload: path string (null-terminated) */
-    PKT_TYPE_RES_FILE_DATA        = 0x39,  /* Payload: status(uint8_t) + length(uint16_t) + data[] */
+    PKT_TYPE_CMD_READ_FILE        = 0x38,  /* Payload: offset(uint32_t) + path (chunked read) */
+    PKT_TYPE_RES_FILE_DATA        = 0x39,  /* Payload: status(uint8_t) + chunk_len(uint16_t) + total(uint32_t) + offset(uint32_t) + data[] (max 512 B) */
     PKT_TYPE_CMD_SYNC_TIME        = 0x3A,  /* Payload: utc_ts(uint32_t) + flags(uint8_t) */
     PKT_TYPE_CMD_GET_CHART_DATA   = 0x3B,  /* Request: zone query from ESP32 */
     PKT_TYPE_RES_CHART_DATA       = 0x3C,  /* Response: packed array of chart_data_point_t */
@@ -72,6 +72,8 @@ enum pkt_type {
     PKT_TYPE_RES_SET_THRESHOLD    = 0x41,  /* RP2040 -> ESP32: Status (uint8_t: 1=OK, 0=ERR) */
     PKT_TYPE_CMD_SET_OFFSET       = 0x42,  /* ESP32 -> RP2040: Patch offset entry on SD */
     PKT_TYPE_RES_SET_OFFSET       = 0x43,  /* RP2040 -> ESP32: Status (uint8_t: 1=OK, 0=ERR) */
+    PKT_TYPE_CMD_GET_LAST_VALUE   = 0x44,  /* ESP32 -> RP2040: dev_addr(4) + key[16]: newest archived value */
+    PKT_TYPE_RES_LAST_VALUE       = 0x45,  /* RP2040 -> ESP32: dev_addr, key[16], status, value, ts, expected interval, unit[8] */
     
 
     /* ── 0xA0..0xAF: Power, Hardware & Buzzer Control ─────────────────── */

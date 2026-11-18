@@ -42,6 +42,7 @@
 #include "lvgl.h"
 #include "widget_base.h"
 #include "rp2040.h"
+#include "gui_theme.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -119,7 +120,7 @@ typedef struct {
     /* Data storage: cached scalar arrays */
     float data[HORIZ_BARGRAPH_MAX_POINTS];           ///< Array of numeric values
     bool  is_estimated[HORIZ_BARGRAPH_MAX_POINTS];   ///< Quality flag: true if interpolated/fallback
-    bool  is_alarm[HORIZ_BARGRAPH_MAX_POINTS];       ///< Alarm flag: true if point violates threshold
+    gui_alarm_level_t alarm_level[HORIZ_BARGRAPH_MAX_POINTS]; ///< Alarm level of the point (bar color)
     bool  has_data[HORIZ_BARGRAPH_MAX_POINTS];       ///< Presence flag: false if slot is an empty gap
     uint8_t data_count;                              ///< Current number of valid data slots
     float min_value;                                 ///< Minimum Y-axis scale value
@@ -137,7 +138,7 @@ typedef struct {
     lv_color_t bg_color;        ///< Background card color
     lv_color_t bar_color;       ///< Default bar/line color (media color)
     lv_color_t text_color;      ///< Axis label text color
-    lv_color_t alarm_color;     ///< Alarm highlight color
+    lv_color_t alarm_color;     ///< Optional override of the danger color (empty = theme, gui_theme.h)
 
     lv_event_cb_t click_cb;     ///< Click event callback for subpage navigation
     void* user_data;            ///< Custom user context passed to click callback
@@ -196,11 +197,11 @@ void horiz_bargraph_update_data(horiz_bargraph_t *graph, const float *new_data, 
  * @param graph Pointer to widget instance.
  * @param values Array of numeric float values.
  * @param is_estimated Array of boolean flags (true if point is an estimated fallback).
- * @param is_alarm Array of boolean flags (true if point exceeds threshold).
+ * @param alarm_level Array of alarm levels (NULL = no alarm).
  * @param count Number of points in the update.
  */
 void horiz_bargraph_update_series(horiz_bargraph_t *graph, const float *values,
-                                  const bool *is_estimated, const bool *is_alarm, uint8_t count);
+                                  const bool *is_estimated, const gui_alarm_level_t *alarm_level, uint8_t count);
 
 /**
  * @brief Update a single data point by index.
@@ -209,9 +210,10 @@ void horiz_bargraph_update_series(horiz_bargraph_t *graph, const float *values,
  * @param index Target zero-based point index.
  * @param value New numeric value.
  * @param is_estimated True if point is an estimated fallback.
- * @param is_alarm True if point violates an active threshold.
+ * @param alarm_level Alarm level of the point.
  */
-void horiz_bargraph_update_point(horiz_bargraph_t *graph, uint8_t index, float value, bool is_estimated, bool is_alarm);
+void horiz_bargraph_update_point(horiz_bargraph_t *graph, uint8_t index, float value, bool is_estimated,
+                                 gui_alarm_level_t alarm_level);
 
 /**
  * @brief Configure time/division axis labels for single-zone / legacy mode.

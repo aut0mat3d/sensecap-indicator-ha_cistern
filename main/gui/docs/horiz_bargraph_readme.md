@@ -94,7 +94,7 @@ typedef struct {
     /* Data Series */
     float data[HORIZ_BARGRAPH_MAX_POINTS];           // Array of data values
     bool  is_estimated[HORIZ_BARGRAPH_MAX_POINTS];   // Per-point: true if estimated
-    bool  is_alarm[HORIZ_BARGRAPH_MAX_POINTS];       // Per-point: true if alarm
+    gui_alarm_level_t alarm_level[HORIZ_BARGRAPH_MAX_POINTS]; // Per-point: NONE / WARNING / DANGER (theme colors)
     uint8_t data_count;                              // Number of valid data points
     float min_value;                                 // Minimum Y-axis value
     float max_value;                                 // Maximum Y-axis value
@@ -152,8 +152,8 @@ horiz_bargraph_set_type(&my_graph, HORIZ_BARGRAPH_TYPE_LINE);
 | Function | Description |
 |----------|-------------|
 | `void horiz_bargraph_update_data(horiz_bargraph_t* graph, const float* new_data, uint8_t count)` | Update with simple scalar array (no quality flags) |
-| `void horiz_bargraph_update_series(horiz_bargraph_t* graph, const float* values, const bool* is_estimated, const bool* is_alarm, uint8_t count)` | Update with per-point quality flags |
-| `void horiz_bargraph_update_point(horiz_bargraph_t* graph, uint8_t index, float value, bool is_estimated, bool is_alarm)` | Update a single data point |
+| `void horiz_bargraph_update_series(horiz_bargraph_t* graph, const float* values, const bool* is_estimated, const gui_alarm_level_t* alarm_level, uint8_t count)` | Update with per-point quality flags and alarm levels |
+| `void horiz_bargraph_update_point(horiz_bargraph_t* graph, uint8_t index, float value, bool is_estimated, gui_alarm_level_t alarm_level)` | Update a single data point |
 
 ### Configuration
 

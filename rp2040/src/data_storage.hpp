@@ -39,6 +39,8 @@ typedef struct {
     bool is_estimated;    /// True if this is an estimated/replacement value
     uint32_t count;       /// Covered samples behind an aggregated point (hourly/daily), 0 for raw points
     bool is_gap;          /// True if no value exists for this slot (DATA_FLAG_NO_DATA)
+    float value_min;      /// Lowest value behind the point (raw points: = value)
+    float value_max;      /// Highest value behind the point (raw points: = value)
 } data_point_t;
 
 /** Aggregated data point for hourly/daily storage */
@@ -203,6 +205,18 @@ data_channel_state_t* data_storage_get_state(const char* channel_key);
 #define DATA_FLAG_AVERAGED      0x02  ///< Aggregated value over time window
 #define DATA_FLAG_ALARM_WARN    0x04  ///< Warning threshold active
 #define DATA_FLAG_ALARM_DANGER  0x08  ///< Danger / Alarm threshold active
+
+/* Severity of the chart query alarm levels (CMD_GET_CHART_DATA byte 44, same bits on the ESP32):
+ * a set bit marks the level as warning (DATA_FLAG_ALARM_WARN), a cleared bit as danger */
+#define CHART_ALARM_MIN_IS_WARNING  0x01
+#define CHART_ALARM_MAX_IS_WARNING  0x02
+
+/* Chart query mode (CMD_GET_CHART_DATA byte 45, same values on the ESP32) */
+#define CHART_QUERY_MODE_GRID  0   ///< one value per interval bucket (fixed grid)
+#define CHART_QUERY_MODE_LTTB  1   ///< LTTB-reduced representative points with real timestamps
+/* LTTB time buckets for max_points: points plus one gap marker per gap always fit into max_points */
+#define CHART_LTTB_BUCKETS(max_points)  ((((max_points) * 2) / 3) < 2 ? 2 : (((max_points) * 2) / 3))
+#define LTTB_MAX_POINTS        100 ///< upper bound for max_points in LTTB mode
 #define DATA_FLAG_NO_DATA       0x10  ///< Gap / missing interval (e.g. power outage)
 
 typedef struct __attribute__((packed)) {
@@ -219,6 +233,32 @@ chart_data_point_t* data_storage_query_chart(
     uint32_t max_points,
     float alarm_min,
     float alarm_max,
+    uint8_t alarm_flags,
+    uint32_t* actual_interval_sec,
+    size_t* count
+);
+
+/**
+ * @brief Reduce the archived values of [start_timestamp, end_timestamp[ to at most max_points
+ *        representative points (Largest-Triangle-Three-Buckets on equal time buckets).
+ *
+ * Sources: daily, hourly and raw records joined without overlap (each level is used from where
+ * the next finer one ends). Two streaming passes over the archive, memory independent of the
+ * amount of stored data. Each emitted point keeps its real timestamp; a run of empty buckets
+ * between data yields one DATA_FLAG_NO_DATA marker (line break). Alarm flags come from the
+ * minimum / maximum of the bucket, so an episode is marked even if another point is chosen.
+ *
+ * @param actual_interval_sec Out: bucket width in seconds.
+ * @return Malloc'd array (caller frees) or nullptr.
+ */
+chart_data_point_t* data_storage_query_lttb(
+    const char* channel_key,
+    uint32_t start_timestamp,
+    uint32_t end_timestamp,
+    uint32_t max_points,
+    float alarm_min,
+    float alarm_max,
+    uint8_t alarm_flags,
     uint32_t* actual_interval_sec,
     size_t* count
 );

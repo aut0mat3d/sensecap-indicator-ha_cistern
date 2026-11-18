@@ -54,6 +54,20 @@ typedef struct __attribute__((packed)) {
 #define DATA_FLAG_ALARM_DANGER  0x08
 #define DATA_FLAG_NO_DATA       0x10
 
+/* Severity of the chart query alarm levels (CMD_GET_CHART_DATA byte 44, same bits on the RP2040):
+ * a set bit marks the level as warning (DATA_FLAG_ALARM_WARN), a cleared bit as danger */
+#define CHART_ALARM_MIN_IS_WARNING  0x01
+#define CHART_ALARM_MAX_IS_WARNING  0x02
+
+/* Chart query mode (CMD_GET_CHART_DATA byte 45, same values on the RP2040):
+ *  GRID: one value per bucket of interval_sec (fixed grid, gaps as DATA_FLAG_NO_DATA)
+ *  LTTB: window [start, end[ reduced to at most max_points representative points with their real
+ *        timestamps (Largest-Triangle-Three-Buckets on time buckets; one NO_DATA marker per gap) */
+#define CHART_QUERY_MODE_GRID  0
+#define CHART_QUERY_MODE_LTTB  1
+/* LTTB time buckets for max_points: points plus one gap marker per gap always fit into max_points */
+#define CHART_LTTB_BUCKETS(max_points)  ((((max_points) * 2) / 3) < 2 ? 2 : (((max_points) * 2) / 3))
+
 typedef struct __attribute__((packed)) {
     uint32_t timestamp;
     float    value;
@@ -81,8 +95,8 @@ enum pkt_type_cmd
     PKT_TYPE_PUSH_LORA_CFG        = 0x35,  /* Globals & total device count */
     PKT_TYPE_CMD_LORA_RAW_FRAME   = 0x36,  /* Payload: DevAddr(4B) + RSSI(2B) + SNR(1B) + Size(1B) + RawData(NB) */
     PKT_TYPE_CMD_SET_TIME_CFG     = 0x37,  /* Payload: posix_tz[64] + time_format[8] */
-    PKT_TYPE_CMD_READ_FILE        = 0x38,  /* Payload: path string (null-terminated) */
-    PKT_TYPE_RES_FILE_DATA        = 0x39,  /* Payload: status(uint8_t) + length(uint16_t) + data[] */
+    PKT_TYPE_CMD_READ_FILE        = 0x38,  /* Payload: offset(uint32_t) + path (chunked read) */
+    PKT_TYPE_RES_FILE_DATA        = 0x39,  /* Payload: status(uint8_t) + chunk_len(uint16_t) + total(uint32_t) + offset(uint32_t) + data[] (max 512 B) */
     PKT_TYPE_CMD_SYNC_TIME        = 0x3A,
     PKT_TYPE_CMD_GET_CHART_DATA   = 0x3B,  /* Request: zone query from ESP32 */
     PKT_TYPE_RES_CHART_DATA       = 0x3C,  /* Response: packed array of chart_data_point_t */
@@ -93,6 +107,8 @@ enum pkt_type_cmd
     PKT_TYPE_RES_SET_THRESHOLD    = 0x41,  /* RP2040 -> ESP32: Status (uint8_t: 1=OK, 0=ERR) */
     PKT_TYPE_CMD_SET_OFFSET       = 0x42,  /* ESP32 -> RP2040: Patch offset entry on SD */
     PKT_TYPE_RES_SET_OFFSET       = 0x43,  /* RP2040 -> ESP32: Status (uint8_t: 1=OK, 0=ERR) */
+    PKT_TYPE_CMD_GET_LAST_VALUE   = 0x44,  /* ESP32 -> RP2040: dev_addr(4) + key[16]: newest archived value */
+    PKT_TYPE_RES_LAST_VALUE       = 0x45,  /* RP2040 -> ESP32: dev_addr, key[16], status, value, ts, expected interval, unit[8] */
 
 
     /* ── 0xA0..0xAF: Power, Hardware & Buzzer Control ─────────────────── */
@@ -147,8 +163,16 @@ void rp2040_register_chart_data_callback(chart_data_callback_t cb);
  */
 int rp2040_request_chart_data(uint8_t req_id, uint32_t dev_addr, const char *key,
                               uint32_t start_ts, uint32_t end_ts, uint32_t interval_sec,
-                              uint16_t max_points, float alarm_min, float alarm_max);
+                              uint16_t max_points, float alarm_min, float alarm_max,
+                              uint8_t alarm_flags, uint8_t query_mode);
 
+
+/**
+ * @brief Ask the RP2040 for the newest archived value of a device key. The answer arrives as
+ *        VIEW_EVENT_ARCHIVE_LAST_VALUE (struct view_data_last_value), also when nothing is archived.
+ * @return Number of UART bytes written, or -1 on error.
+ */
+int rp2040_request_last_value(uint32_t dev_addr, const char *key);
 
 /* Alarm (Buzzer) */
 int rp2040_alarm_set(uint16_t t_on_ms, uint16_t t_off_ms);

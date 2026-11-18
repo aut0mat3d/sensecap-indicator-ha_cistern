@@ -5,6 +5,7 @@
  * @copyright © 2026, SenseCAP Cistern Extension
  */
 
+#include "esp_attr.h"
 #include "chart_query_scheduler.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -33,11 +34,14 @@ typedef struct {
     uint16_t point_count;
     float    val_min;
     float    val_max;
+    uint8_t  alarm_flags;
+    uint8_t  query_mode;
     bool     valid;
 } query_queue_item_t;
 
 /* Subscription database (allocated once in BSS) */
-static chart_subscription_t s_subs[CHART_SCHEDULER_MAX_SUBSCRIPTIONS];
+/* In PSRAM: ~0.9 KB per slot with 100 points (internal DRAM is scarce, Wi-Fi/lwIP stay there) */
+EXT_RAM_BSS_ATTR static chart_subscription_t s_subs[CHART_SCHEDULER_MAX_SUBSCRIPTIONS];
 
 /* FIFO Request Queue */
 static query_queue_item_t   s_queue[CHART_SCHEDULER_QUEUE_SIZE];
@@ -80,6 +84,8 @@ static bool _enqueue_query_internal(int8_t sub_id, uint32_t start_ts, uint32_t e
     item->point_count = sub->point_count;
     item->val_min = sub->val_min;
     item->val_max = sub->val_max;
+    item->alarm_flags = sub->alarm_flags;
+    item->query_mode = sub->query_mode;
     item->valid = true;
 
     s_q_tail = (s_q_tail + 1) % CHART_SCHEDULER_QUEUE_SIZE;
@@ -145,7 +151,7 @@ void chart_query_scheduler_init(void) {
 
 int8_t chart_query_scheduler_subscribe(uint32_t dev_addr, const char *key, uint8_t zone_idx,
                                       uint32_t interval_sec, uint16_t point_count,
-                                      float val_min, float val_max) {
+                                      float val_min, float val_max, uint8_t alarm_flags) {
     if (!key) return -1;
 
     /* Defensive auto-initialization if called before model init */
@@ -167,6 +173,7 @@ int8_t chart_query_scheduler_subscribe(uint32_t dev_addr, const char *key, uint8
             s_subs[i].point_count = (point_count <= CHART_SUB_MAX_POINTS) ? point_count : CHART_SUB_MAX_POINTS;
             s_subs[i].val_min = val_min;
             s_subs[i].val_max = val_max;
+            s_subs[i].alarm_flags = alarm_flags;
 
             xSemaphoreGive(s_sched_mutex);
             return (int8_t)i;
@@ -198,9 +205,12 @@ int8_t chart_query_scheduler_subscribe(uint32_t dev_addr, const char *key, uint8
     sub->point_count = (point_count <= CHART_SUB_MAX_POINTS) ? point_count : CHART_SUB_MAX_POINTS;
     sub->val_min = val_min;
     sub->val_max = val_max;
+    sub->alarm_flags = alarm_flags;
+    sub->query_mode = CHART_QUERY_MODE_GRID;
     sub->is_active = false;
     sub->new_data_ready = false;
     sub->data_count = 0;
+    sub->data_step = 0;
     sub->last_queried_bucket = 0;
 
     xSemaphoreGive(s_sched_mutex);
@@ -298,6 +308,7 @@ void chart_query_scheduler_on_response(uint8_t req_id, uint8_t status, uint32_t 
             if (sub_id >= 0 && sub_id < CHART_SCHEDULER_MAX_SUBSCRIPTIONS && s_subs[sub_id].sub_id >= 0) {
                 chart_subscription_t *sub = &s_subs[sub_id];
 
+                sub->data_step = step;
                 uint16_t copy_pts = (count <= CHART_SUB_MAX_POINTS) ? count : CHART_SUB_MAX_POINTS;
                 if (pts && copy_pts > 0) {
                     memcpy(sub->data_buffer, pts, copy_pts * sizeof(chart_data_point_t));
@@ -396,7 +407,8 @@ void chart_query_scheduler_update(void) {
 
         rp2040_request_chart_data(next->req_id, next->dev_addr, next->key,
                                   next->start_ts, next->end_ts, next->step_sec,
-                                  next->point_count, next->val_min, next->val_max);
+                                  next->point_count, next->val_min, next->val_max,
+                                  next->alarm_flags, next->query_mode);
 
         s_request_sent_ms = now_ms;
         s_state = SCHED_STATE_AWAIT_RESPONSE;
@@ -428,4 +440,41 @@ bool chart_query_scheduler_trigger_poll(uint32_t dev_addr, const char *key, uint
     ESP_LOGW(TAG, "Manual poll failed: No subscription for dev=0x%08lX, key='%s', zone=%u",
              (unsigned long)dev_addr, key, zone_idx);
     return false;
+}
+bool chart_query_scheduler_poll_range(int8_t sub_id, uint32_t start_ts, uint32_t end_ts) {
+    if (sub_id < 0 || sub_id >= CHART_SCHEDULER_MAX_SUBSCRIPTIONS || !s_sched_mutex || end_ts <= start_ts) {
+        return false;
+    }
+    xSemaphoreTake(s_sched_mutex, portMAX_DELAY);
+    bool ok = (s_subs[sub_id].sub_id >= 0) && _enqueue_query_internal(sub_id, start_ts, end_ts);
+    xSemaphoreGive(s_sched_mutex);
+    return ok;
+}
+
+void chart_query_scheduler_unsubscribe(int8_t sub_id) {
+    if (sub_id < 0 || sub_id >= CHART_SCHEDULER_MAX_SUBSCRIPTIONS || !s_sched_mutex) return;
+    xSemaphoreTake(s_sched_mutex, portMAX_DELAY);
+    /* Queued requests (incl. the one in flight) are detached: their answers are dropped */
+    for (uint8_t i = 0, idx = s_q_head; i < s_q_count; i++, idx = (idx + 1) % CHART_SCHEDULER_QUEUE_SIZE) {
+        if (s_queue[idx].sub_id == sub_id) s_queue[idx].sub_id = -1;
+    }
+    s_subs[sub_id].sub_id = -1;
+    s_subs[sub_id].is_active = false;
+    s_subs[sub_id].new_data_ready = false;
+    s_subs[sub_id].data_count = 0;
+    s_subs[sub_id].data_step = 0;
+    s_subs[sub_id].last_queried_bucket = 0;
+    xSemaphoreGive(s_sched_mutex);
+}
+
+uint32_t chart_query_scheduler_get_data_step(int8_t sub_id) {
+    if (sub_id < 0 || sub_id >= CHART_SCHEDULER_MAX_SUBSCRIPTIONS) return 0;
+    return s_subs[sub_id].data_step;
+}
+
+void chart_query_scheduler_set_query_mode(int8_t sub_id, uint8_t query_mode) {
+    if (sub_id < 0 || sub_id >= CHART_SCHEDULER_MAX_SUBSCRIPTIONS || !s_sched_mutex) return;
+    xSemaphoreTake(s_sched_mutex, portMAX_DELAY);
+    if (s_subs[sub_id].sub_id >= 0) s_subs[sub_id].query_mode = query_mode;
+    xSemaphoreGive(s_sched_mutex);
 }

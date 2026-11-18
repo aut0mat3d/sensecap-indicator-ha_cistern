@@ -12,7 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "alarm_model.h"
+#include "gui_theme.h"
 #include <math.h>
 
 LV_FONT_DECLARE(ui_font_font0);
@@ -20,7 +20,6 @@ LV_FONT_DECLARE(ui_font_font0);
 #define DEFAULT_BG_COLOR      lv_color_hex(0x282828)
 #define DEFAULT_BAR_COLOR     lv_color_hex(0x3498DB)
 #define DEFAULT_TEXT_COLOR    lv_color_hex(0xFFFFFF)
-#define DEFAULT_ALARM_COLOR   lv_color_hex(0xE74C3C)
 #define DEFAULT_BORDER_COLOR  lv_color_hex(0x000000) /* Permanent seamless black bezel */
 
 static inline bool is_color_empty(lv_color_t c) {
@@ -40,7 +39,19 @@ static void vert_graph_click_handler(lv_event_t *e) {
  * @brief Internal lock-free update function to prevent semaphore deadlocks when
  *        called by other API functions that already hold the LVGL lock.
  */
-static void _vert_graph_update_internal(vert_graph_t *graph, float value, const char *unit, bool is_estimated, bool is_alarm) {
+/* Level used when a value crosses alarm_level_min / alarm_level_max (unset = danger) */
+static gui_alarm_level_t _crossed_level(gui_alarm_level_t configured) {
+    return (configured == GUI_ALARM_NONE) ? GUI_ALARM_DANGER : configured;
+}
+
+/* Theme color of an alarm level; alarm_color overrides the danger color if set */
+static lv_color_t _level_color(const vert_graph_t *graph, gui_alarm_level_t level) {
+    if (level == GUI_ALARM_DANGER && !is_color_empty(graph->alarm_color)) return graph->alarm_color;
+    return lv_color_hex(gui_theme_alarm_level_color(level, 0x000000));
+}
+
+static void _vert_graph_update_internal(vert_graph_t *graph, float value, const char *unit, bool is_estimated,
+                                        gui_alarm_level_t alarm_level) {
     if (!graph || !graph->bar) return;
 
     /* 1. Update unit strings if provided and different */
@@ -57,10 +68,9 @@ static void _vert_graph_update_internal(vert_graph_t *graph, float value, const 
         }
     }
 
-    const alarm_ui_config_t *ui_cfg = alarm_get_ui_config();
-    lv_color_t color_danger  = lv_color_hex(ui_cfg ? ui_cfg->colors.color_danger : 0xE74C3C);
-    lv_color_t color_warning = lv_color_hex(ui_cfg ? ui_cfg->colors.color_warning : 0xF39C12);
-    lv_color_t color_info    = lv_color_hex(ui_cfg ? ui_cfg->colors.color_info : 0x9E9E9E);
+    gui_theme_colors_t theme;
+    gui_theme_get_colors(&theme);
+    lv_color_t color_info = lv_color_hex(theme.alarm_info);
 
     float range = graph->max_value - graph->min_value;
 
@@ -68,7 +78,7 @@ static void _vert_graph_update_internal(vert_graph_t *graph, float value, const 
     if (isnan(value)) {
         graph->current_value = NAN;
         graph->is_estimated = false;
-        graph->is_alarm = false;
+        graph->alarm_level = GUI_ALARM_NONE;
         lv_bar_set_value(graph->bar, 0, LV_ANIM_OFF);
         lv_obj_set_style_bg_color(graph->bar, graph->bar_color, LV_PART_INDICATOR);
         lv_obj_set_style_bg_opa(graph->bar, LV_OPA_COVER, LV_PART_INDICATOR);
@@ -95,33 +105,25 @@ static void _vert_graph_update_internal(vert_graph_t *graph, float value, const 
         /* LV_ANIM_OFF prevents render bursts during boot */
         lv_bar_set_value(graph->bar, bar_val, LV_ANIM_OFF);
 
+        /* 4. Alarm level: caller's level or a crossed alarm level, whichever is higher */
+        gui_alarm_level_t level = alarm_level;
+        if (graph->alarm_level_min > 0.0f && display_val < graph->alarm_level_min) {
+            gui_alarm_level_t crossed = _crossed_level(graph->alarm_severity_min);
+            if (crossed > level) level = crossed;
+        } else if (graph->alarm_level_max > 0.0f && display_val > graph->alarm_level_max) {
+            gui_alarm_level_t crossed = _crossed_level(graph->alarm_severity_max);
+            if (crossed > level) level = crossed;
+        }
+
         graph->current_value = display_val;
         graph->is_estimated = is_estimated;
-        graph->is_alarm = is_alarm;
+        /* Keep only the caller's level: internal refreshes pass it back in, the crossed alarm
+         * levels are evaluated again on every update (no sticky alarm) */
+        graph->alarm_level = alarm_level;
 
-        /* 4. Autonomous Threshold & Status Color Evaluation */
-        bool is_danger = is_alarm;
-        bool is_warn = false;
-
-        /* Automatic threshold check against configured alarm levels */
-        if (graph->alarm_level_min > 0.0f && display_val < graph->alarm_level_min) {
-            is_danger = true;
-        } else if (graph->alarm_level_max > 0.0f && display_val > graph->alarm_level_max) {
-            is_danger = true;
-        }
-
-        /* Prefer custom widget override if defined, otherwise use global JSON palette */
-        lv_color_t active_danger = !is_color_empty(graph->alarm_color) ? graph->alarm_color : color_danger;
-        lv_color_t active_fill_color;
-
-        if (is_danger) {
-            active_fill_color = active_danger;
-        } else if (is_warn) {
-            active_fill_color = color_warning;
-        } else {
-            active_fill_color = graph->bar_color;
-        }
-        lv_obj_set_style_bg_color(graph->bar, active_fill_color, LV_PART_INDICATOR);
+        lv_color_t level_color = _level_color(graph, level);
+        lv_obj_set_style_bg_color(graph->bar, (level != GUI_ALARM_NONE) ? level_color : graph->bar_color,
+                                  LV_PART_INDICATOR);
 
         /* 4b. Quality determines opacity and indicator border emphasis */
         if (is_estimated) {
@@ -130,7 +132,7 @@ static void _vert_graph_update_internal(vert_graph_t *graph, float value, const 
             lv_obj_set_style_border_color(graph->bar, color_info, LV_PART_INDICATOR);
         } else {
             lv_obj_set_style_bg_opa(graph->bar, LV_OPA_COVER, LV_PART_INDICATOR);
-            if (is_danger || is_warn) {
+            if (level != GUI_ALARM_NONE) {
                 lv_obj_set_style_border_width(graph->bar, 2, LV_PART_INDICATOR);
                 lv_obj_set_style_border_color(graph->bar, lv_color_white(), LV_PART_INDICATOR);
             } else {
@@ -152,13 +154,9 @@ static void _vert_graph_update_internal(vert_graph_t *graph, float value, const 
 
         /* 4d. Dynamic Card Internal Bezel for Threshold Violations (Strictly internal border, zero outline) */
         if (graph->container) {
-            if (is_danger) {
-                lv_obj_set_style_border_color(graph->container, active_danger, LV_PART_MAIN);
-            } else if (is_warn) {
-                lv_obj_set_style_border_color(graph->container, color_warning, LV_PART_MAIN);
-            } else {
-                lv_obj_set_style_border_color(graph->container, DEFAULT_BORDER_COLOR, LV_PART_MAIN);
-            }
+            lv_obj_set_style_border_color(graph->container,
+                                          (level != GUI_ALARM_NONE) ? level_color : DEFAULT_BORDER_COLOR,
+                                          LV_PART_MAIN);
         }
     }
 
@@ -173,6 +171,8 @@ static void _vert_graph_update_internal(vert_graph_t *graph, float value, const 
             if (marker_y < 0) marker_y = 0;
             if (marker_y > bar_h - 3) marker_y = bar_h - 3;
             lv_obj_set_pos(graph->alarm_marker_min, 0, marker_y);
+            lv_obj_set_style_bg_color(graph->alarm_marker_min,
+                                      _level_color(graph, _crossed_level(graph->alarm_severity_min)), LV_PART_MAIN);
             lv_obj_remove_flag(graph->alarm_marker_min, LV_OBJ_FLAG_HIDDEN);
         } else {
             lv_obj_add_flag(graph->alarm_marker_min, LV_OBJ_FLAG_HIDDEN);
@@ -187,6 +187,8 @@ static void _vert_graph_update_internal(vert_graph_t *graph, float value, const 
             if (marker_y < 0) marker_y = 0;
             if (marker_y > bar_h - 3) marker_y = bar_h - 3;
             lv_obj_set_pos(graph->alarm_marker_max, 0, marker_y);
+            lv_obj_set_style_bg_color(graph->alarm_marker_max,
+                                      _level_color(graph, _crossed_level(graph->alarm_severity_max)), LV_PART_MAIN);
             lv_obj_remove_flag(graph->alarm_marker_max, LV_OBJ_FLAG_HIDDEN);
         } else {
             lv_obj_add_flag(graph->alarm_marker_max, LV_OBJ_FLAG_HIDDEN);
@@ -204,7 +206,7 @@ int vert_graph_init(vert_graph_t *graph) {
     if (is_color_empty(graph->bg_color)) graph->bg_color = DEFAULT_BG_COLOR;
     if (is_color_empty(graph->bar_color)) graph->bar_color = DEFAULT_BAR_COLOR;
     if (is_color_empty(graph->text_color)) graph->text_color = DEFAULT_TEXT_COLOR;
-    if (is_color_empty(graph->alarm_color)) graph->alarm_color = DEFAULT_ALARM_COLOR;
+    /* alarm_color stays empty unless set: alarm colors come from the theme */
 
     /* Fallback to standard 4x5 grid tile geometry (192 x 240 px) if unspecified */
     if (graph->width == 0) graph->width = VERT_GRAPH_DEFAULT_W;
@@ -250,14 +252,14 @@ int vert_graph_init(vert_graph_t *graph) {
     graph->alarm_marker_min = lv_obj_create(graph->bar);
     lv_obj_set_size(graph->alarm_marker_min, bar_w, 3);
     lv_obj_set_style_radius(graph->alarm_marker_min, 0, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(graph->alarm_marker_min, graph->alarm_color, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(graph->alarm_marker_min, _level_color(graph, _crossed_level(graph->alarm_severity_min)), LV_PART_MAIN);
     lv_obj_set_style_border_width(graph->alarm_marker_min, 0, LV_PART_MAIN);
     lv_obj_add_flag(graph->alarm_marker_min, LV_OBJ_FLAG_HIDDEN);
 
     graph->alarm_marker_max = lv_obj_create(graph->bar);
     lv_obj_set_size(graph->alarm_marker_max, bar_w, 3);
     lv_obj_set_style_radius(graph->alarm_marker_max, 0, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(graph->alarm_marker_max, graph->alarm_color, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(graph->alarm_marker_max, _level_color(graph, _crossed_level(graph->alarm_severity_max)), LV_PART_MAIN);
     lv_obj_set_style_border_width(graph->alarm_marker_max, 0, LV_PART_MAIN);
     lv_obj_add_flag(graph->alarm_marker_max, LV_OBJ_FLAG_HIDDEN);
 
@@ -294,7 +296,7 @@ int vert_graph_init(vert_graph_t *graph) {
     lv_obj_set_pos(graph->lbl_min, label_x, bar_y + bar_h - 16);
 
     /* Apply initial configured value immediately */
-    _vert_graph_update_internal(graph, graph->current_value, graph->unit, graph->is_estimated, graph->is_alarm);
+    _vert_graph_update_internal(graph, graph->current_value, graph->unit, graph->is_estimated, graph->alarm_level);
     lv_port_sem_give();
     return 0;
 }
@@ -302,21 +304,22 @@ int vert_graph_init(vert_graph_t *graph) {
 void vert_graph_update(vert_graph_t *graph, float value) {
     if (!graph) return;
     lv_port_sem_take();
-    _vert_graph_update_internal(graph, value, NULL, graph->is_estimated, graph->is_alarm);
+    _vert_graph_update_internal(graph, value, NULL, graph->is_estimated, graph->alarm_level);
     lv_port_sem_give();
 }
 
-void vert_graph_update_value(vert_graph_t *graph, float value, const char *unit, bool is_estimated, bool is_alarm) {
+void vert_graph_update_value(vert_graph_t *graph, float value, const char *unit, bool is_estimated,
+                             gui_alarm_level_t alarm_level) {
     if (!graph) return;
     lv_port_sem_take();
-    _vert_graph_update_internal(graph, value, unit, is_estimated, is_alarm);
+    _vert_graph_update_internal(graph, value, unit, is_estimated, alarm_level);
     lv_port_sem_give();
 }
 
-void vert_graph_set_status(vert_graph_t *graph, bool is_estimated, bool is_alarm) {
+void vert_graph_set_status(vert_graph_t *graph, bool is_estimated, gui_alarm_level_t alarm_level) {
     if (!graph) return;
     lv_port_sem_take();
-    _vert_graph_update_internal(graph, graph->current_value, NULL, is_estimated, is_alarm);
+    _vert_graph_update_internal(graph, graph->current_value, NULL, is_estimated, alarm_level);
     lv_port_sem_give();
 }
 
@@ -340,7 +343,7 @@ void vert_graph_set_range(vert_graph_t *graph, float min_val, float max_val) {
         lv_label_set_text(graph->lbl_min, buf);
     }
 
-    _vert_graph_update_internal(graph, graph->current_value, NULL, graph->is_estimated, graph->is_alarm);
+    _vert_graph_update_internal(graph, graph->current_value, NULL, graph->is_estimated, graph->alarm_level);
     lv_port_sem_give();
 }
 
@@ -348,7 +351,7 @@ void vert_graph_set_media_color(vert_graph_t *graph, lv_color_t color) {
     if (!graph) return;
     lv_port_sem_take();
     graph->bar_color = color;
-    _vert_graph_update_internal(graph, graph->current_value, NULL, graph->is_estimated, graph->is_alarm);
+    _vert_graph_update_internal(graph, graph->current_value, NULL, graph->is_estimated, graph->alarm_level);
     lv_port_sem_give();
 }
 
@@ -359,7 +362,7 @@ void vert_graph_set_alarm_levels(vert_graph_t *graph, float min_alarm, float max
     graph->alarm_level_max = max_alarm;
     graph->hysteresis_min = hysteresis_min;
     graph->hysteresis_max = hysteresis_max;
-    _vert_graph_update_internal(graph, graph->current_value, NULL, graph->is_estimated, graph->is_alarm);
+    _vert_graph_update_internal(graph, graph->current_value, NULL, graph->is_estimated, graph->alarm_level);
     lv_port_sem_give();
 }
 
@@ -388,7 +391,7 @@ void vert_graph_destroy(vert_graph_t *graph) {
 static void _vert_graph_widget_update(widget_t *self, float value, const char *unit) {
     if (!self || !self->user_data) return;
     vert_graph_t *graph = (vert_graph_t *)self->user_data;
-    vert_graph_update_value(graph, value, unit, graph->is_estimated, graph->is_alarm);
+    vert_graph_update_value(graph, value, unit, graph->is_estimated, graph->alarm_level);
 }
 
 static void _vert_graph_widget_destroy(widget_t *self) {

@@ -21,7 +21,7 @@
     "oil": {
       "name_en": "Fuel Oil / Diesel",
       "name_de": "Heizoel / Diesel",
-      "color_hex": "0xF39C12",
+      "color_hex": "0x9C6B30",
       "unit_default": "l"
     },
     "lpg": {
