@@ -124,8 +124,8 @@ with a trend graph of `flowrate` of the cistern device.
 ### 3.4 Suggested order
 
 1. Decide the vert_graph tap / thresholds access (3.2.2) and the page layout (3.2.3).
-2. ~~`archive.flowrate`~~ done; open: should the Guest file archive flowrate too? After some days,
-   measure the 7-day trend query time (raw level) before raising `single` further.
+2. ~~`archive.flowrate`~~ done (cistern and Guest file). After some days, measure the 7-day trend
+   query time (raw level) before raising `single` further.
 3. RP2040 `calc_derivative`: no fake 0 after boot, decide `interval_sec`.
 4. `trend_graph` auto scale for signed small values + zero line (+ optional min/max band); update
    `main/gui/docs/trend_graph_readme.md`.

@@ -103,6 +103,11 @@
       "tolerance_sec": 15,
       "max_estimated_count": 0,
       "retention": { "single": 0, "hours": 24, "days": 31, "weeks": 0, "months": 36, "years": 10 }
+    },
+    "flowrate": {
+      "tolerance_sec": 15,
+      "max_estimated_count": 0,
+      "retention": { "single": 2016, "hours": 48, "days": 32, "weeks": 0, "months": 0, "years": 0 }
     }
   },
   "mqtt": {
