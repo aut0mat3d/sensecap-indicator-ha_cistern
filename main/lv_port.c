@@ -30,6 +30,7 @@ static lv_indev_t *s_indev_button = NULL;
  *  - longest LVGL lock hold by another task through lv_port_sem_take()/give() */
 static int64_t s_diag_touch_gap_max_us = 0;
 static int64_t s_diag_touch_read_max_us = 0;
+static uint32_t s_diag_touch_err = 0;      /* failed touch reads in the period (I2C) */
 static int64_t s_diag_lock_hold_max_us = 0;
 static char    s_diag_lock_holder[16] = "-";
 static int64_t s_lock_take_us = 0;
@@ -122,8 +123,9 @@ static void touchpad_read(lv_indev_t *indev, lv_indev_data_t *data)
 
     static int32_t x = 0;
     static int32_t y = 0;
+    static bool    s_pressed = false;   /* state of the last successful read */
 
-    indev_data_t indev_data;
+    indev_data_t indev_data = {0};
 #if LV_PORT_RENDER_DIAG
     static int64_t s_last_read_us = 0;
     static bool s_was_pressed = false;
@@ -140,6 +142,13 @@ static void touchpad_read(lv_indev_t *indev, lv_indev_data_t *data)
     s_was_pressed = (read_err == ESP_OK) && indev_data.pressed;
 #endif
     if (ESP_OK != read_err) {
+        /* Keep the state of the last valid read: an I2C error never creates a press */
+#if LV_PORT_RENDER_DIAG
+        s_diag_touch_err++;
+#endif
+        data->state = s_pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+        data->point.x = x;
+        data->point.y = y;
         return;
     }
 
@@ -149,10 +158,12 @@ static void touchpad_read(lv_indev_t *indev, lv_indev_data_t *data)
         data->point.y = CONFIG_LCD_EVB_SCREEN_HEIGHT - indev_data.y;
         x = data->point.x;
         y = data->point.y;
+        s_pressed = true;
     } else {
         data->state = LV_INDEV_STATE_RELEASED;
         data->point.x = x;
         data->point.y = y;
+        s_pressed = false;
     }
 }
 
@@ -185,13 +196,14 @@ static void render_diag_cb(lv_event_t *e)
         /* RGB stream restarts after a bounce buffer desync (patched driver, components/esp_lcd) */
         uint32_t restarts = esp_lcd_rgb_panel_get_restart_count(bsp_lcd_get_panel_handle());
         ESP_LOGI(TAG, "[RENDER] %us: %lu frames, render avg %.1f ms, max %.1f ms, RGB restarts total %lu | "
-                      "touch gap max %.0f ms, touch read max %.1f ms, lock hold max %.1f ms (%s)",
+                      "touch gap max %.0f ms, touch read max %.1f ms, touch read errors %lu, lock hold max %.1f ms (%s)",
                  (unsigned)(LV_PORT_RENDER_DIAG_PERIOD_MS / 1000), (unsigned long)s_frames,
                  (double)s_sum_us / (double)s_frames / 1000.0, (double)s_max_us / 1000.0,
                  (unsigned long)restarts,
                  (double)s_diag_touch_gap_max_us / 1000.0, (double)s_diag_touch_read_max_us / 1000.0,
-                 (double)s_diag_lock_hold_max_us / 1000.0, s_diag_lock_holder);
+                 (unsigned long)s_diag_touch_err, (double)s_diag_lock_hold_max_us / 1000.0, s_diag_lock_holder);
         s_diag_touch_gap_max_us = 0;
+        s_diag_touch_err = 0;
         s_diag_touch_read_max_us = 0;
         s_diag_lock_hold_max_us = 0;
         strlcpy(s_diag_lock_holder, "-", sizeof(s_diag_lock_holder));

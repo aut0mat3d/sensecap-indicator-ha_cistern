@@ -87,13 +87,16 @@ esp_err_t indev_get_major_value(indev_data_t *data)
             }
             err_cnt=0;
         } else {
-            // i2c read  error
+            /* I2C read error: never report a touch from undefined data (caused ghost presses at
+             * random / clamped coordinates, e.g. the settings gear at the top left) */
+            data->pressed = false;
             err_cnt++;
             if( err_cnt > 100) {
                 err_cnt = 0;
                 ESP_LOGE("indev", "indev_tp_read err, reset...");
                 indev_reset();
             }
+            return ESP_FAIL;
         }
         break;
     case BSP_INDEV_HID:

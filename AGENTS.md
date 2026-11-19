@@ -11,6 +11,7 @@ Detailed, code-verified maps (read these before larger changes):
 | [docs_extensions_n_changes/overview/OVERVIEW_RP2040.md](docs_extensions_n_changes/overview/OVERVIEW_RP2040.md) | RP2040 core split, files, data path |
 | [docs_extensions_n_changes/overview/OVERVIEW_SDCARD.md](docs_extensions_n_changes/overview/OVERVIEW_SDCARD.md) | SD card layout, decoder vs. device JSON, `archive` schema |
 | [docs_extensions_n_changes/overview/OVERVIEW_DATAFLOW.md](docs_extensions_n_changes/overview/OVERVIEW_DATAFLOW.md) | End-to-end flows, P2P frame types, complete UART packet table |
+| [docs_extensions_n_changes/NEXT_STEPS.md](docs_extensions_n_changes/NEXT_STEPS.md) | **Start here in a new session:** uncommitted work, running verifications, next feature spec, backlog |
 
 Keep these documents in sync when changing architecture, protocol or JSON schemas.
 

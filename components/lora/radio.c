@@ -431,7 +431,8 @@ bool RxContinuous = false;
 PacketStatus_t RadioPktStatus;
 uint8_t RadioRxPayload[255];
 
-bool IrqFired = false;
+/* [CISTERN PATCH] volatile: set by the IO expander task, consumed by the LoRa task */
+volatile bool IrqFired = false;
 
 /*
  * SX126x DIO IRQ callback functions prototype
@@ -1259,9 +1260,11 @@ void RadioOnRxTimeoutIrq( void* context )
 
 void RadioOnDioIrq( void* context )
 {
+    /* [CISTERN PATCH] Only flag the interrupt. RadioIrqProcess() runs in the LoRa task
+     * (lora_model_update), which owns all SX1262 SPI access: processing here (IO expander task)
+     * raced with that task, and a TxDone read and cleared by the wrong side left the radio in
+     * standby with the TX path blocked for good. */
     IrqFired = true;
-
-    RadioIrqProcess();
 }
 
 void RadioIrqProcess( void )

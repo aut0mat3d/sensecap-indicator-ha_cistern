@@ -138,20 +138,33 @@ static esp_err_t ft5x06_get_touch_points_num(uint8_t *touch_points_num)
 
 esp_err_t ft5x06_read_pos(uint8_t *touch_points_num, uint16_t *x, uint16_t *y)
 {
-    esp_err_t ret_val = ESP_OK;
-    static uint8_t data[4];
+    uint8_t status = 0;
+    uint8_t data[4] = {0};
 
-    ret_val |= ft5x06_get_touch_points_num(touch_points_num);
-
-    if (0 == *touch_points_num) {
-    } else {
-        ret_val |= ft5x06_read_bytes(FT5x06_TOUCH1_XH, 4, data);
-
-        *x = ((data[0] & 0x0f) << 8) + data[1];
-        *y = ((data[2] & 0x0f) << 8) + data[3];
+    *touch_points_num = 0;
+    esp_err_t ret_val = ft5x06_get_touch_points_num(&status);
+    if (ret_val != ESP_OK) {
+        return ret_val;
+    }
+    /* TD_STATUS: number of points in bits 3..0, valid 1..5 (0x0F / 0xFF while the controller is busy) */
+    uint8_t points = status & 0x0F;
+    if (points == 0 || points > 5) {
+        return ESP_OK;
     }
 
-    return ret_val;
+    ret_val = ft5x06_read_bytes(FT5x06_TOUCH1_XH, 4, data);
+    if (ret_val != ESP_OK) {
+        return ret_val;
+    }
+    /* Event flag (XH bits 7..6): 0 = press down, 1 = lift up, 2 = contact, 3 = no event */
+    uint8_t event = data[0] >> 6;
+    if (event == 1 || event == 3) {
+        return ESP_OK;
+    }
+    *touch_points_num = points;
+    *x = ((data[0] & 0x0f) << 8) + data[1];
+    *y = ((data[2] & 0x0f) << 8) + data[3];
+    return ESP_OK;
 }
 
 esp_err_t fx5x06_read_gesture(ft5x06_gesture_t *gesture)

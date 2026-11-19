@@ -96,6 +96,23 @@ A listener SenseCAP (no keys) can publish the same sensor values; select each se
 Archive keys may be decoder keys (`depth`, `battery_soc`) or virtual keys (`volume`, `flowrate`).
 Retention: number of entries kept per level; `0` disables the level. `weeks`, `months` and `years` are parsed but not aggregated yet (planned NTTW phase).
 
+Retention limits (code-verified, `data_storage.cpp` parse / `compute_keep_entries`, `archive_store`):
+
+| Level | Hard maximum | Time span at the maximum | Disk at the maximum |
+|---|---|---|---|
+| `single` | 65535 (larger values are clamped, `uint16_t`) | 65535 × grid (300 s) ≈ 227 days | 9 B/record, 455 per 4 KB segment → 145 segments ≈ 580 KB |
+| `hours` | 65535 | ≈ 7.5 years | 23 B/record, 178 per segment → 369 segments ≈ 1.5 MB |
+| `days` | 65535 | ≈ 179 years | as hours |
+
+* Neither RAM nor the LittleFS partition (1 GB, 262144 blocks) is a practical limit; RAM per channel is
+  independent of the retention.
+* What a larger retention costs is **chart query time**: the trend query (LTTB) reads every part of the
+  requested window from the finest level that still covers it (raw, then hour, then day). With
+  `single` = 2016 (7 days) a 7-day window is read from ~2016 raw records (~5 segments); with 8928
+  (31 days) a 31-day window reads ~20 segments (~80 KB) from the SD card. The cost is bounded by the
+  window, not by the retention. The ESP32 waits at most `CHART_QUERY_TIMEOUT_MS` (2500 ms) per answer.
+* Useful values for a 5-minute grid: 288 = 24 h, 2016 = 7 days, 8928 = 31 days.
+
 Current limits of the engine (until the NTTW rework):
 * Each level is aggregated from the next finer one. A disabled finer level that is needed as a source is kept as a small staging level: `raw` with 2 hours of buckets when hourly is active (at least the hold span interval + tolerance, so the newest real value survives for the cold-start restore even for hourly keys), `hour` with at least 26 entries when daily is active (covers 25-hour DST days).
 * Grid: values are stored on a wall-clock grid of `min(expected interval, 300 s)`. Each grid bucket gets a flag: `0` real sample, `2` hold (no new sample, but the next packet is not overdue yet: covers intervals longer than the grid and the asynchronous sensor clock), `1` substitute (packet overdue).

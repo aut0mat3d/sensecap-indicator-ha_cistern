@@ -4,6 +4,7 @@
  */
 
 #include "esp_attr.h"
+#include "esp_random.h"
 #include "lora_model.h"
 #include "radio.h"
 #include <stdint.h>
@@ -100,6 +101,18 @@ static void add_duplicate_frame(uint32_t dev_addr, uint16_t fcnt) {
 
 static lora_tx_frame_t g_tx_queue[MAX_TX_QUEUE_SIZE];
 static bool            g_tx_in_progress = false;
+static uint32_t        s_tx_start_ms = 0;        /* start of the running transmission */
+static uint32_t        s_radio_recover_count = 0; /* TX / RX watchdog recoveries since boot */
+/* Time broadcast requested by another task (SNTP); 0 = none. Consumed by the LoRa task, which owns
+ * the TX queue and the SX1262. */
+static volatile uint32_t s_pending_time_bcast_utc = 0;
+
+/* No driver TX timeout timer exists (TimerStart is not ported): a transmission that reports no
+ * TxDone within this time is aborted (SF12 / 64 bytes need ~2.5 s on air). */
+#define LORA_TX_WATCHDOG_MS     8000
+/* Outside of a transmission the SX1262 must be in RX; checked with GetStatus at this period */
+#define LORA_RX_CHECK_PERIOD_MS 2000
+#define SX126X_CHIP_MODE_RX     5
 
 static void lora_model_task(void *pvParameters) {
     while (1) {
@@ -514,7 +527,9 @@ static void lora_model_restore_rx(void) {
 
 /* ── Standalone Time Broadcast Enqueue Helper ─────────────────────────── */
 
-bool lora_model_enqueue_time_broadcast(uint32_t utc_timestamp) {
+/* Runs in the LoRa task only (TX queue owner). Jitter comes from the ESP32 RNG: Radio.Random()
+ * would switch the SX1262 to STDBY_RC with all radio IRQs disabled until the next RX/TX setup. */
+static bool enqueue_time_broadcast(uint32_t utc_timestamp) {
     if (!g_rf_cfg.mesh.enabled || utc_timestamp < 1700000000) return false;
 
     int slot = -1;
@@ -535,13 +550,20 @@ bool lora_model_enqueue_time_broadcast(uint32_t utc_timestamp) {
     memcpy(&frame->raw_payload[4], &utc_timestamp, 4);
 
     frame->payload_len = 8;
-    frame->target_timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS + 100 + (Radio.Random() % 500);
+    frame->target_timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS + 100 + (esp_random() % 500);
     frame->iq_inverted = false;
     frame->tx_power_dbm = 14;
     frame->msg_type = TX_TYPE_P2P_RETRANSMIT;
     frame->valid = true;
 
     ESP_LOGI(TAG, "Enqueued Standalone P2P Time Broadcast (UTC: %lu)", (unsigned long)utc_timestamp);
+    return true;
+}
+
+bool lora_model_enqueue_time_broadcast(uint32_t utc_timestamp) {
+    if (!g_rf_cfg.mesh.enabled || utc_timestamp < 1700000000) return false;
+    /* Only hand the request over; the LoRa task enqueues it on its next cycle (<= 10 ms) */
+    __atomic_store_n(&s_pending_time_bcast_utc, utc_timestamp, __ATOMIC_RELEASE);
     return true;
 }
 
@@ -679,7 +701,7 @@ static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) 
         /* Propagate Mesh Frame if TTL > 1 */
         if (g_rf_cfg.mesh.enabled && ttl > 1) {
             // 1500 ms base delay ensures RX1 downlink is done; max 2800 ms ensures finish before packet 2
-            uint32_t retransmit_delay = 1500 + (Radio.Random() % 1300);
+            uint32_t retransmit_delay = 1500 + (esp_random() % 1300);
             uint32_t retransmit_ts = now_ms + retransmit_delay;
             lora_model_enqueue_retransmit(rx_dev_addr, fcnt, fport, ttl - 1, decrypted_tlv, tlv_len, retransmit_ts);
         }
@@ -803,7 +825,7 @@ static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) 
                          matched->device_name, fport, matched->reaction.trigger_prefix);
 
                 /* 1. Calculate random CLAIM delay between 30 ms and 700 ms */
-                uint32_t claim_delay = 30 + (Radio.Random() % 670);
+                uint32_t claim_delay = 30 + (esp_random() % 670);
                 uint32_t claim_ts = now_ms + claim_delay;
 
                 /* 2. Enqueue P2P CLAIM broadcast */
@@ -821,14 +843,14 @@ static void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) 
         if (g_rf_cfg.mesh.enabled && matched && frm_len > 0) {
             if (g_rf_cfg.mesh.broadcast_ttl > 0) {
                 // 1500 ms base delay ensures RX1 downlink is done; max 2800 ms ensures finish before packet 2
-                uint32_t retransmit_delay = 1500 + (Radio.Random() % 1300);
+                uint32_t retransmit_delay = 1500 + (esp_random() % 1300);
                 uint32_t retransmit_ts = now_ms + retransmit_delay;
                 lora_model_enqueue_retransmit(rx_dev_addr, fcnt, fport, g_rf_cfg.mesh.broadcast_ttl, &payload[9], frm_len, retransmit_ts);
             } else if (g_rf_cfg.time_cfg.p2p_sync_enabled) {
                 /* If Retransmit is disabled (TTL=0), send a standalone time broadcast if we have a valid time */
                 uint32_t current_utc = (uint32_t)time(NULL);
                 if (current_utc >= 1700000000) {
-                    lora_model_enqueue_time_broadcast(current_utc);
+                    enqueue_time_broadcast(current_utc);
                 }
             }
         }
@@ -1002,7 +1024,10 @@ void lora_model_update(void) {
     }
 
     if (g_radio_active) {
-        /* Direct SX1262 Hardware IRQ Register Inspection (Raw RF Diagnostic) */
+        /* SX1262 IRQ handling, only in this task (the DIO1 interrupt only sets IrqFired).
+         * The register is also polled, because the DIO1 edge goes through the IO expander and can
+         * be missed; RadioIrqProcess() reads, clears and dispatches exactly what it handles. */
+        extern volatile bool IrqFired;
         uint16_t irq = SX126xGetIrqStatus();
         if (irq != 0) {
             ESP_LOGI(TAG, "RAW SX1262 IRQ: 0x%04X | Preamble:%d | SyncOk:%d | HdrOk:%d | HdrErr:%d | CrcErr:%d | RxDone:%d",
@@ -1014,16 +1039,41 @@ void lora_model_update(void) {
                      (irq & 0x0040) ? 1 : 0,  /* Bit 6: CRC Error */
                      (irq & 0x0002) ? 1 : 0   /* Bit 1: RX Done */
             );
+        }
+        if (irq != 0 || IrqFired) {
+            IrqFired = true;
+            Radio.IrqProcess();
+        }
 
-            /* Clear hardware IRQ flags to capture next RF event */
+        /* TX watchdog: TxDone never arrived -> abort and return to RX */
+        if (g_tx_in_progress && now_ms - s_tx_start_ms > LORA_TX_WATCHDOG_MS) {
+            s_radio_recover_count++;
+            ESP_LOGE(TAG, "TX watchdog: no TxDone after %u ms (IRQ 0x%04X), back to RX (recovery #%lu)",
+                     (unsigned)(now_ms - s_tx_start_ms), SX126xGetIrqStatus(), (unsigned long)s_radio_recover_count);
+            Radio.Standby();
             SX126xClearIrqStatus(0xFFFF);
+            g_tx_in_progress = false;
+            lora_model_restore_rx();
+        }
 
-            /* Trigger driver event processing if RxDone or Error fired */
-            if (irq & (0x0002 | 0x0020 | 0x0040)) {
-                extern bool IrqFired;
-                IrqFired = true;
-                Radio.IrqProcess();
+        /* RX watchdog: outside of a transmission the chip must be receiving */
+        static uint32_t last_rx_check = 0;
+        if (!g_tx_in_progress && now_ms - last_rx_check >= LORA_RX_CHECK_PERIOD_MS) {
+            last_rx_check = now_ms;
+            RadioStatus_t st = SX126xGetStatus();
+            if (st.Fields.ChipMode != SX126X_CHIP_MODE_RX) {
+                s_radio_recover_count++;
+                ESP_LOGW(TAG, "RX watchdog: SX1262 in chip mode %u instead of RX, restarting RX (recovery #%lu)",
+                         (unsigned)st.Fields.ChipMode, (unsigned long)s_radio_recover_count);
+                SX126xClearIrqStatus(0xFFFF);
+                lora_model_restore_rx();
             }
+        }
+
+        /* Time broadcast handed over by another task (SNTP sync) */
+        uint32_t pending_utc = __atomic_exchange_n(&s_pending_time_bcast_utc, 0, __ATOMIC_ACQ_REL);
+        if (pending_utc != 0) {
+            enqueue_time_broadcast(pending_utc);
         }
 
         /* Process TX Queue if no transmission is active */
@@ -1067,6 +1117,7 @@ void lora_model_update(void) {
                          frame->msg_type, (unsigned long)frame->dev_addr, frame->iq_inverted);
 
                 g_tx_in_progress = true;
+                s_tx_start_ms = now_ms;
 
                 uint8_t bw_idx = 0;
                 if (g_rf_cfg.rf_bandwidth_khz >= 500) bw_idx = 2;

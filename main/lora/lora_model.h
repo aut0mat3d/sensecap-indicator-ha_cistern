@@ -337,10 +337,13 @@ bool lora_model_enqueue_retransmit(uint32_t dev_addr, uint16_t fcnt, uint8_t fpo
 void lora_model_purge_downlink_for_devaddr(uint32_t dev_addr);
 
 /**
- * @brief Prepares and enqueues a Standalone P2P Time Broadcast frame.
- * 
+ * @brief Requests a Standalone P2P Time Broadcast frame.
+ *
+ * Safe to call from any task: the request is handed over to the LoRa task, which owns the TX queue
+ * and the SX1262 and enqueues the frame on its next cycle. A newer request replaces a pending one.
+ *
  * @param utc_timestamp Current UTC Unix timestamp.
- * @return true if successfully enqueued.
+ * @return true if the request was accepted (mesh enabled, valid timestamp).
  */
 bool lora_model_enqueue_time_broadcast(uint32_t utc_timestamp);
 
