@@ -111,7 +111,7 @@ typedef struct {
     lv_color_t alarm_color;     // Alarm bar color (default: 0xE74C3C)
     
     /* Callback */
-    lv_event_cb_t click_cb;     // Click handler for config subpage
+    lv_event_cb_t click_cb;     // Tap anywhere on the widget (chart and dividers are not clickable)
     void* user_data;            // User data for callback
     
     /* Internal - Do not modify directly */

@@ -96,7 +96,7 @@
       "tolerance_sec": 15,
       "max_estimated_count": 3,
       "quality": { "solid_pct": 66, "min_pct": 10, "use_estimated": false },
-      "retention": { "single": 144, "hours": 48, "days": 32, "weeks": 0, "months": 0, "years": 0 }
+      "retention": { "single": 2016, "hours": 48, "days": 32, "weeks": 0, "months": 0, "years": 0 }
     },
     "battery_soc": {
       "expected_interval_sec": 86400,

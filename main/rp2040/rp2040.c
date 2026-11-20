@@ -584,11 +584,20 @@ static bool _packet_handle(uint8_t* p_data, size_t len) {
 
                 const chart_data_point_t *pts = (const chart_data_point_t *)&p_data[9];
 
+                /* Optional trailer (LTTB mode): extremes of the whole window after the points */
+                chart_window_extremes_t extremes;
+                const chart_window_extremes_t *p_extremes = NULL;
+                size_t pts_end = 9 + (size_t)count * sizeof(chart_data_point_t);
+                if ((size_t)len >= pts_end + sizeof(chart_window_extremes_t)) {
+                    memcpy(&extremes, &p_data[pts_end], sizeof(extremes));
+                    p_extremes = &extremes;
+                }
+
                 ESP_LOGI(TAG, "UART Rx: RES_CHART_DATA Zone %u: status=%u, count=%u, step=%lu s",
                          req_id, status, count, (unsigned long)actual_interval);
 
                 /* Forward directly into the FIFO scheduler */
-                chart_query_scheduler_on_response(req_id, status, actual_interval, count, pts);
+                chart_query_scheduler_on_response(req_id, status, actual_interval, count, pts, p_extremes);
 
                 if (s_chart_data_cb) {
                     s_chart_data_cb(req_id, status, actual_interval, pts, count);

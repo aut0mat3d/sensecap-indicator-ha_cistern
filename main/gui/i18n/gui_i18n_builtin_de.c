@@ -40,6 +40,7 @@ const i18n_entry_t g_i18n_builtin_de[] = {
     {"telemetry.volume",    "Volumen:"},
     {"telemetry.depth",     "Tiefe:"},
     {"telemetry.flow",      "Durchfluss:"},
+    {"telemetry.flowrate",  "Durchfluss:"},
     {"telemetry.temp",      "Temperatur:"},
     {"telemetry.humidity",  "Feuchtigkeit:"},
     {"telemetry.battery",   "Batterie:"},
@@ -115,6 +116,9 @@ const i18n_entry_t g_i18n_builtin_de[] = {
     {"trend.24h",           "24 Std"},
     {"trend.7d",            "7 Tage"},
     {"trend.31d",           "31 Tage"},
+    {"trend.1m",            "1 Monat"},
+    {"trend.max",           "max"},
+    {"trend.min",           "min"},
 
     /* End-of-table sentinel */
     {NULL, NULL}

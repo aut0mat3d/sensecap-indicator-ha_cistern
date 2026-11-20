@@ -96,7 +96,8 @@ typedef struct {
     uint8_t source_key_count;             /// Number of source keys used
     calc_type_t calculation;               /// Type of calculation
     geometry_config_t geometry;           /// Geometry config (for volume calculations)
-    uint32_t interval_sec;                 /// 0 = on new data, >0 = fixed interval
+    uint32_t interval_sec;                 /// 0 = on new data; >0 = at most one computation per local
+                                          /// raster slot of interval_sec (first packet of each slot)
     char output_key[32];                  /// Key for the computed output (e.g., "volume")
     char unit[16];                        /// Unit of the output
     float corr_factor;                    /// Correction factor (default: 1.0)
@@ -110,6 +111,8 @@ typedef struct {
     float last_values[MAX_SOURCE_KEYS];     /// Last values for each source key
     uint32_t last_timestamps[MAX_SOURCE_KEYS]; /// Timestamps for each source key
     bool has_last_value[MAX_SOURCE_KEYS]; /// Flag for each source key availability
+    uint32_t last_slot;                    /// Raster slot (interval_sec) of the last computation
+    bool has_slot;                         /// last_slot is valid
 } virtual_decoder_state_t;
 
 // ============================================================================
@@ -142,6 +145,14 @@ void virtual_decoder_clear_outputs(void);
  * @return true on success
  */
 bool virtual_decoder_register(const virtual_decoder_config_t* config);
+
+/**
+ * @brief Expected update interval of a key of a device: for a virtual key the larger of its
+ *        interval_sec and the interval of its sources (several sources: the most frequent one
+ *        triggers), for a decoder key the device report interval.
+ * @param report_interval_sec Transmit interval of the device (report_interval_sec).
+ */
+uint32_t virtual_decoder_effective_interval(uint32_t dev_addr, const char* key, uint32_t report_interval_sec);
 
 /**
  * @brief Process a measurement through virtual decoders and compute outputs.

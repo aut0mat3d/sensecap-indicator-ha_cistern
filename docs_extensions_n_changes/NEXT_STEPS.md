@@ -3,12 +3,13 @@
 Living document: status, running verifications, next feature and backlog. Update it at the end of a
 session; remove items once they are committed and verified.
 
-Last update: 2026-11-19. Base: `d976c94` (first beta revision); the fixes below are committed on top
-of it ("fix: radio ownership, touch read errors ...") and still under field verification.
+Last update: 2026-11-20. **Beta 2** (commit "feat: beta 2 ..."): the fixes of section 1 are verified, the
+detail page of section 3 is verified on the test unit, `interval_sec` (3.4) still needs its field test. The outdated upstream
+`TASKS.md` and the archived `docs_extensions_n_changes/old/` were removed (git history keeps them).
 
 ---
 
-## 1. Fixes under verification (committed 2026-11-19)
+## 1. Fixes of 2026-11-19 (committed, verified 2026-11-20)
 
 | Area | Files | What / why |
 |---|---|---|
@@ -39,99 +40,72 @@ grep -anE "watchdog|touch read errors [1-9]" ~/sensecap_*.log
 Night 2026-11-18 → 19 (slave): 0 touch read errors, no ghost seen, 2 RX watchdog hits (the SNTP case above),
 no freeze.
 
+**Verified 2026-11-20** (slave with all fixes incl. RNG, log 19.11. ~09:30 → 20.11. 09:16, ~23.7 h):
+0 watchdog hits across 23 hourly time broadcasts, 0 touch read errors, no ghost touch, no missed P2P
+packet while observed. The master (old firmware) had ghost touches on the `vert_graph` the same night.
+→ Fixes count as proven; flash the master too. Optional beta tag possible (backlog).
+
 ---
 
-## 3. Next feature: flowrate trend page (user request 2026-11-19)
+## 3. Flow rate / level detail page (beta 2, 2026-11-20)
 
-### 3.1 Goal
+### 3.1 Spec (user, 2026-11-20; replaces the 2026-11-19 draft with the list widget)
 
-Tap on the `vert_graph` in `cistern_view` opens a full-screen page (like the battery icon → detail page)
-with a trend graph of `flowrate` of the cistern device.
+* Tap on the `horiz_bargraph` ("Verlauf Pegel") in `cistern_view` opens a full-screen page (like the
+  battery page). The `vert_graph` tap keeps opening the thresholds.
+* Two `trend_graph`s of 10 × 4 cells: `flowrate` on top, `depth` below, same time range. Ranges
+  24 h (default), 7 days, 1 month. No list (the `autocompact_listview` idea is dropped).
+* Both Y axes automatic (flowrate signed, mostly 0.0, range unknown). Dashed lines at the window
+  maximum / minimum.
+* Touch zones per graph: head line = next range (both graphs), plot = drag cursor with time + value
+  (both graphs show the same time), X label row = dead zone.
 
-* Ranges: **24 h (default)**, 1 week, 1 month.
-* Values are positive or negative (sign: negative = net outflow, derivative of `volume`), magnitude
-  unknown → Y axis must auto-zoom.
-* Purpose: find the warning sweet spot by observation. Typical state is ~0 (cistern full, inflow >
-  draw). In winter two taps run permanently against freezing: too much must be noticed. Later: daily
-  draw peaks of 4 households, recovery periods, summer shortage.
-* Below the graph a scrollable list of the drawn data points (date, time, value), compacted
-  (runs of identical values merged into a range, estimated values filtered) → new generic widget
-  `autocompact_listview`, sized in grid cells.
+### 3.2 Implementation
 
-### 3.2 Findings in the current code
+| Part | Files |
+|---|---|
+| Window extremes: LTTB pass 1 tracks min / max of every record; `0x3C` trailer `chart_window_extremes_t` (9 B) in LTTB mode | `rp2040/src/data_storage.cpp/.hpp`, `rp2040/src/main.cpp` |
+| Parser accepts the trailer (length check, older RP2040 firmware still works); scheduler stores it per slot, `chart_query_scheduler_get_window_extremes()`, fallback from the points | `main/rp2040/rp2040.c/.h`, `main/rp2040/chart_query_scheduler.c/.h` |
+| `calc_derivative`: no value (instead of a fake 0.0) for the first sample after boot / reload and for non-increasing timestamps | `rp2040/src/virtual_decoder.cpp` |
+| `trend_graph`: touch zones, cursor + coupling callbacks, automatic scale (zero inclusion, minimum span, nice step), zero line, extreme lines, unit | `main/gui/trend_graph.c/.h`, `main/gui/docs/trend_graph_readme.md` |
+| `key_detail_view_show_ex()`: one key (unchanged battery page, 31 days) or two coupled keys | `main/display/key_detail_view.c/.h` |
+| Wiring: `on_horiz_graph_clicked` (flowrate with 0 in the scale); Y span from the data only, no per-key constants | `main/display/cistern_view.c` |
+| `horiz_bargraph`: chart and zone dividers no longer swallow the tap | `main/gui/horiz_bargraph.c` |
+| i18n `telemetry.flowrate`, `trend.1m`, `trend.max`, `trend.min` (EN + DE) | `main/gui/i18n/gui_i18n_builtin_*.c` |
+| `archive.depth.retention.single` 144 → 2016 (same resolution as flowrate) | `sdcontent/devices/Wasser_Hochbehaelter.json`, `Guest_Wasser_Hochbehaelter.json`; **test unit SD: user** |
 
-1. **`flowrate` archive: done 2026-11-19** (`single` 2016 = 7 days raw, `hours` 48, `days` 32) in
-   `sdcontent/devices/Wasser_Hochbehaelter.json` and on the test unit's SD card. History starts from
-   that day. Before, `archive` only had `depth` and `battery_soc`.
-   Proposal (24 h raw at 5 min = 288 records, week from hours, month from days):
-   ```json
-   "flowrate": { "tolerance_sec": 15, "max_estimated_count": 0,
-                 "retention": { "single": 288, "hours": 192, "days": 62, "weeks": 0, "months": 0, "years": 0 } }
-   ```
-   Limits checked 2026-11-19 (see `OVERVIEW_SDCARD.md`, retention limits): max 65535 per level, disk
-   is no issue, cost is chart query time. User keeps hours 48 / days 32 and wants more raw values;
-   recommendation `single` = 2016 (7 days), 8928 (31 days) only after measuring the query time.
-   The test unit's SD card is updated by the user (`SDbackup/` stays untouched).
-2. **vert_graph tap is taken:** `cistern_view.c` `on_vert_graph_clicked()` opens
-   `device_config_controller_open_thresholds(CISTERN_DEV_ADDR)`. **Decision needed:** e.g. tap →
-   flowrate page and a "thresholds" button on that page, or long press → thresholds.
-3. **`key_detail_view` is already generic** (`key_detail_view_show(dev_addr, key)`): trend graph 10 x 5
-   cells, presets 24 h / 7 d / 31 d, threshold lines from `thresholds[]`, Y scale from `limits[key]`,
-   media color. Gaps:
-   * Initial preset is hard-coded to 31 d (`configure_trend`: `preset_idx = 2`) → make it a parameter
-     (options struct or `key_detail_view_show_ex`).
-   * Lower part shows 5 info rows; the flowrate page wants the list there → layout variant
-     (e.g. trend 10 x 4 + list 10 x 4, or trend 10 x 5 + list 10 x 3; content area is 10 x 8 cells,
-     `GRID_CONTENT_Y_OFFSET` 64).
-4. **Auto scale is not suited to small signed values** (`trend_graph.c` `compute_scale`): margin is at
-   least an absolute `1.0`, so a trickle of -0.05 m³/h on a -1.05 .. 1.0 axis is a flat line. Needed:
-   relative margin with a unit-independent minimum span, **0 always inside the range**, a zero line,
-   rounded ("nice") min/max labels; flat 0 data must not divide by zero.
-5. **Aggregates carry min/max:** hour/day records store `avg/min/max`, `chart_data_point_t` has
-   `value_min/value_max`, the graph draws only `value` (= avg). For week/month a min/max band or
-   whiskers keep short draw peaks visible that averaging would hide. Decide per page or per widget flag.
-6. **Derivative quality** (`rp2040/src/virtual_decoder.cpp` `calc_derivative`):
-   * The first value after boot / reload returns `0.0` → a fake 0 point is published and archived.
-     It should produce no value instead.
-   * `virtual_decoder.flowrate.interval_sec` is parsed nowhere → either implement a smoothing window
-     (rate over N seconds) or remove it from the schema / docs.
-   * Resolution: rate step = level resolution × tank area / report interval (5 min). Check whether the
-     trickle of two taps is above that step at all; otherwise a longer window is required.
-   * Existing threshold `alarm_frate`: danger at -2.0 m³/h falling, hysteresis 0.4, damping 2.
-7. LTTB delivers ≤ 100 points per window (`CHART_SUB_MAX_POINTS`); the 24 h preset (step 3600 × 24)
-   gives ~14 min buckets over 5 min raw records, so the list has at most ~100 source rows and needs
-   no own query: it can read `trend_graph_t.points` after each update.
+Both MCUs build. Verified on the test unit 2026-11-20: Y scaling to the window min / max, cursor,
+coupled ranges; battery page unchanged incl. cursor.
 
-### 3.3 `autocompact_listview` widget (proposal)
+### 3.3 Verification on the device (slave first; it then also gets the RNG fix of §1)
 
-* Generic LVGL widget in `main/gui/` + `main/gui/docs/autocompact_listview_readme.md`, placed on the
-  48 px grid (`x/y/width/height` in cells via `GRID_*`), minimum size e.g. 4 x 2 cells, row height
-  from the font.
-* Input: array of `chart_data_point_t` (time, value, min/max, flags) + unit + decimals; the widget does
-  the compaction, the caller does not.
-* Compaction rules (configurable):
-  * consecutive points whose values are equal at display precision → one row
-    `from – to   value   (n)`;
-  * `DATA_FLAG_ESTIMATED` hidden (or shown dimmed, option);
-  * `DATA_FLAG_NO_DATA` / gap markers → one row "no data from – to";
-  * alarm flags colored with the theme warning / danger color.
-* Time format by window: 24 h → `HH:MM`, day change as a separator row; week / month → `dd.mm. HH:MM`
-  or `dd.mm.` for daily points; local time (`tz_offset`).
-* Newest first; scrollable; updates keep the scroll position when the user has scrolled.
-* Later option: tap a row → highlight the point in the trend graph.
-* i18n: new strings in `gui_i18n_builtin_en.c` and `_de.c`.
+* Tap level history → page with both graphs, 24 h; head tap switches both 24 h → 7 days → 1 month;
+  a tap on the X label row of the upper graph does nothing.
+* Flow rate ~0: symmetric axis around 0 with zero line; min / max lines match the extremes.
+* Drag the cursor: both graphs show time + value at the same time; gone 10 s after the last touch.
+* `vert_graph` tap still opens the thresholds; battery page unchanged (31 days, info rows).
+* Log: `RES_CHART_DATA` without "length too short"; note the 7-day query time (raw level) before
+  raising `single` further.
+* After a reboot: no 0.0 as first flowrate value in archive / MQTT.
 
-### 3.4 Suggested order
+### 3.4 Open points
 
-1. Decide the vert_graph tap / thresholds access (3.2.2) and the page layout (3.2.3).
-2. ~~`archive.flowrate`~~ done (cistern and Guest file). After some days, measure the 7-day trend
-   query time (raw level) before raising `single` further.
-3. RP2040 `calc_derivative`: no fake 0 after boot, decide `interval_sec`.
-4. `trend_graph` auto scale for signed small values + zero line (+ optional min/max band); update
-   `main/gui/docs/trend_graph_readme.md`.
-5. `key_detail_view`: initial preset parameter + layout variant with list.
-6. `autocompact_listview` widget + readme.
-7. Wire it up in `cistern_view.c`; build both MCUs; test on the slave first.
+* **Flow rate resolution (log 2026-11-19/20, 24 h):** depth arrives in whole cm (119 / 120 / 121),
+  tank 2 × 2 m → 1 cm = 40 l. One step per 5 min report = **480 l/h** (`flowrate` ±0.48 m³/h; 276 × 0.00,
+  5 × -0.48, 4 × +0.48 = level jitter by 1 cm). A trickle of tens of l/h is invisible per report.
+  The step is level resolution × area / time span: report interval 60 min → 40 l/h, a rate over 6 h →
+  6.7 l/h.
+* **`interval_sec` implemented 2026-11-20** (beta 2, field test pending): one computation per local
+  raster slot, first packet of the slot triggers, no intermediate values; sensor slower than the raster
+  → every packet computes (warning at load). Effective interval feeds archive `expected_interval_sec`
+  default and HA `expire_after`. The cistern keeps `interval_sec: 0` (user decision). Details:
+  `OVERVIEW_SDCARD.md`. To test: a device with e.g. `"interval_sec": 3600` on a derivative → one value
+  per local hour, archive without gaps, HA not "unavailable".
+* Unit: the cistern files configure `m³/h`; `"unit": "l/h"` works as well (units table: `l` = liter).
+* While the cistern overflows (depth at max) the net flow is 0 regardless of the draw: the level
+  derivative only shows draw when inflow < draw.
+* Existing threshold `alarm_frate`: danger at -2.0 m³/h falling, hysteresis 0.4, damping 2: tune it
+  from the observations on the new page.
 
 ---
 

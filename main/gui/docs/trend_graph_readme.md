@@ -3,15 +3,39 @@
 `trend_graph` is a generic long-term trend widget: a point-supported line chart on a real time axis
 for one data point (`dev_addr` + `key`). The RP2040 reduces the archived values of the shown window
 to at most 100 representative points (Largest-Triangle-Three-Buckets, LTTB), so spikes and dips stay
-visible even on a 31-day range. Used by the detail page (`main/display/key_detail_view.c`).
+visible even on a 31-day range. Used by the detail page (`main/display/key_detail_view.c`), which can
+show two coupled graphs (e.g. flow rate and level of a cistern).
 
 ## Overview
 
 - **Time axis, not an index axis:** every point is placed at its timestamp. Oldest left, newest
   right ("now" on the right edge). Periods without data stay empty, data gaps break the line.
 - **Presets:** up to 4 time ranges (`label`, `step_sec`, `point_count`; window = step × points).
-  A tap on the widget cycles to the next preset, the head line shows e.g. `31 Tage 3/3`.
-  With a single preset a tap does nothing and the counter is omitted.
+  A tap on the head line cycles to the next preset, the head line shows e.g. `31 Tage 3/3`.
+  With a single preset the tap does nothing and the counter is omitted.
+- **Touch zones** (top to bottom):
+
+  | Zone | Height | Action |
+  |---|---|---|
+  | Head line (incl. top border) | 34 px | tap = next preset, then `preset_changed_cb` |
+  | Plot | rest | press / drag = cursor: snaps to the nearest visible point, vertical line + ring, the head line shows `dd.mm. HH:MM   value unit`; `cursor_cb` on every new point |
+  | X label row + bottom border | 26 px | dead zone: a slightly missed tap never reaches a widget below |
+
+  The cursor disappears `TREND_GRAPH_CURSOR_HIDE_MS` (10 s) after the last touch and on a preset change;
+  it follows its timestamp when new data arrives.
+- **Automatic Y scale** (`min_val == max_val`): derived from the data only: range of the points **and**
+  the window extremes, optional 0 inside (`auto_include_zero`, signed rates), +10 % margin, then rounded
+  outwards to a 1 / 2 / 5 × 10ⁿ step. Labels: max, min and `0` (if the zero line has room); decimals
+  follow the step. Flat data (one value in the whole window) gets ±10 % of its value, or ±1 around 0,
+  never a division by zero.
+- **Zero line** whenever 0 lies inside the scale.
+- **Window extremes** (`show_extremes`): dashed lines with `max …` / `min …` labels at the minimum /
+  maximum of **all** archived values of the window. The RP2040 computes them over every record (hour /
+  day records with their min / max), so short draw peaks stay visible although LTTB selected another
+  point or the hour average hides them.
+- **Coupling:** a page can link two graphs: `preset_changed_cb` → `trend_graph_set_preset()` of the
+  other, `cursor_cb` → `trend_graph_show_cursor_at()` of the other. Neither API function calls the
+  callbacks again, so there is no loop.
 - **One scheduler slot:** the widget owns exactly one `chart_query_scheduler` subscription in
   `CHART_QUERY_MODE_LTTB`; switching the preset re-targets it and triggers one immediate query.
 - **Calendar frame follows the clock:** the frame `[now - window, now]` moves every 60 s; the data
@@ -84,12 +108,16 @@ trend_graph_destroy(&s_trend);   /* releases the scheduler slot, timer and LVGL 
 | `zone_id` | Scheduler zone id; 0 = `TREND_GRAPH_DEFAULT_ZONE` (100, distinct from page zones 0..3). Use different ids if a page shows several trend graphs of the same key |
 | `presets[]`, `preset_count`, `preset_idx` | Time ranges (1..4) and the initial one |
 | `min_val`, `max_val` | Y scale; `min == max` = automatic |
+| `auto_include_zero` | Automatic scale always contains 0 (signed values) |
+| `show_extremes` | Dashed window min / max lines |
+| `unit`, `decimals` | Unit and decimals of cursor / extreme values (`decimals` 0 = one more than the scale labels, max 3); `trend_graph_set_unit()` sets the unit later |
 | `alarm_min`, `alarm_max`, `alarm_flags` | Levels for the RP2040 point coloring (0 = off); `CHART_ALARM_MIN/MAX_IS_WARNING` selects warning instead of danger |
 | `lines[]`, `line_count` | Horizontal level lines (`GUI_ALARM_NONE` = neutral grey) |
 | `point_color` | Normal point / line color; black (all zero) = default blue |
+| `preset_changed_cb`, `cursor_cb`, `user_data` | Optional touch callbacks (coupling) |
 
 Read-only state: `sub_id`, `custom_range`, `frame_start`, `frame_end`, `expected_step`,
-`point_count`, `points[]`.
+`point_count`, `points[]`, `have_extremes`, `win_min`, `win_max`, `cursor_active`, `cursor_ts`.
 
 ## API
 
@@ -97,10 +125,13 @@ Read-only state: `sub_id`, `custom_range`, `frame_start`, `frame_end`, `expected
 |---|---|
 | `trend_graph_init(g)` | Create the widget, subscribe and request the initial preset. Returns 0 or -1 |
 | `trend_graph_set_preset(g, idx)` | Select a preset and request its data |
-| `trend_graph_next_preset(g)` | Next preset (wraps; no-op with one preset) — also bound to a tap |
+| `trend_graph_next_preset(g)` | Next preset (wraps; no-op with one preset) — also bound to a tap on the head line |
 | `trend_graph_set_custom_range(g, start, end)` | Show any window `[start, end[` (UTC), LTTB-reduced, no periodic refresh until a preset is selected again |
 | `trend_graph_set_scale(g, min, max)` | Change the Y scale and redraw |
 | `trend_graph_set_lines(g, lines, count)` | Replace the level lines |
+| `trend_graph_set_unit(g, unit)` | Unit of cursor / extreme values |
+| `trend_graph_show_cursor_at(g, ts)` | Show the cursor at the point nearest to `ts` (no `cursor_cb`) |
+| `trend_graph_hide_cursor(g)` | Hide the cursor |
 | `trend_graph_destroy(g)` | Unsubscribe, stop the timer, delete the objects |
 
 ## Data path
@@ -108,7 +139,7 @@ Read-only state: `sub_id`, `custom_range`, `frame_start`, `frame_end`, `expected
 ```
 trend_graph ─► chart_query_scheduler (slot, CHART_QUERY_MODE_LTTB, 100 points, interval = window / 100)
             ─► 0x3B GET_CHART_DATA (byte 45 = 1) ─► RP2040 data_storage_query_lttb()
-            ◄─ 0x3C RES_CHART_DATA (step = bucket width, ≤ 100 chart_data_point_t)
+            ◄─ 0x3C RES_CHART_DATA (step = bucket width, ≤ 100 chart_data_point_t, window extremes)
 ```
 
 - The RP2040 splits the window into `CHART_LTTB_BUCKETS(100)` = 66 time buckets, so the answer has
@@ -118,6 +149,8 @@ trend_graph ─► chart_query_scheduler (slot, CHART_QUERY_MODE_LTTB, 100 point
   hour 1.5 h, day 1.5 d, never less than one bucket) are separated by a `DATA_FLAG_NO_DATA` marker,
   which breaks the line. Hourly data in a 24 h window therefore stays connected.
 - Alarm flags come from the bucket minimum / maximum (episodes inside a bucket stay visible).
+- The window extremes (`chart_window_extremes_t` trailer) cover every record of the window; without
+  the trailer (older RP2040 firmware) the scheduler takes them from the received points.
 - The widget polls the scheduler every 500 ms. An answer whose bucket width differs from
   `expected_step` belongs to the previously selected preset and is dropped.
 - Protocol details: [OVERVIEW_DATAFLOW.md §5](../../../docs_extensions_n_changes/overview/OVERVIEW_DATAFLOW.md).
@@ -126,22 +159,25 @@ trend_graph ─► chart_query_scheduler (slot, CHART_QUERY_MODE_LTTB, 100 point
 
 ```
 ┌──────────────────────────────────────────────┐
-│ head line: [title]  label  n/N               │  26 px
+│ head line: [title]  label  n/N  | cursor     │  26 px   touch: next preset
 │ y_max ┌──────────────────────────────────┐   │
-│       │ level lines, line segments,      │   │  plot (custom drawn, LV_EVENT_DRAW_POST)
+│       │ - - - - - - - - - - - - max 0.12 │   │
+│   0   │ zero / level lines, segments,    │   │  plot (custom drawn, LV_EVENT_DRAW_POST)
+│       │ points, cursor     min -0.30     │   │  touch: cursor
 │ y_min └──────────────────────────────────┘   │
-│        start date            end date (now)  │  18 px
+│        start date            end date (now)  │  18 px   dead zone
 └──────────────────────────────────────────────┘
   40 px Y label column
 ```
 
 X labels show `dd.mm. HH:MM` for windows below 2 days, `dd.mm.` otherwise (local time).
-The Y labels use one decimal for ranges below 10.
+With a fixed scale the Y labels use one decimal for ranges below 10; the automatic scale derives the
+decimals from its step.
 
 ## Notes
 
-- Memory: the `trend_graph_t` holds a copy of up to 100 points (~900 B); the scheduler slot buffer
-  lives in PSRAM.
+- Memory: the `trend_graph_t` holds a copy of up to 100 points (~900 B); keep it in PSRAM
+  (`EXT_RAM_BSS_ATTR`) like `key_detail_view` does. The scheduler slot buffer lives in PSRAM too.
 - Without valid time (no SNTP / P2P time yet) the frame is empty and the X labels show `--`.
 - Daily values appear only after the first daily aggregation (local midnight); until then the
   7 / 31 day presets are filled from the hourly and raw levels.

@@ -525,8 +525,9 @@ void lorasensors_push_globals(PacketSerial &ps, bool valid_cfg) {
  *        ESP32 table matches the SD card after every reload.
  *
  * Per key the ESP32 gets the HA "expire_after" time: the explicit "expire_after_sec", otherwise
- * 2 x expected interval + 60 s (expected interval of the archive channel, else the device
- * report interval; same staleness rule as the GUI). Units are not sent: the ESP32 takes them from
+ * 2 x expected interval + 60 s (expected interval of the archive channel, else the effective
+ * interval of the key: report interval, or the interval_sec raster of a virtual key; same
+ * staleness rule as the GUI). Units are not sent: the ESP32 takes them from
  * the telemetry values, so discovery and published values always agree.
  */
 static void lorasensors_send_mqtt_cfg(size_t dev_idx) {
@@ -548,7 +549,9 @@ static void lorasensors_send_mqtt_cfg(size_t dev_idx) {
 
         uint32_t expire = k.expire_after_sec;
         if (expire == 0) {
-            uint32_t expected = (cfg && cfg->roundtrip_interval > 0) ? cfg->roundtrip_interval : dev.report_interval_sec;
+            uint32_t expected = (cfg && cfg->roundtrip_interval > 0)
+                ? cfg->roundtrip_interval
+                : virtual_decoder_effective_interval(dev.dev_addr, k.key, dev.report_interval_sec);
             if (expected == 0) expected = 300;
             expire = 2 * expected + 60;
         }
@@ -1205,6 +1208,12 @@ bool lorasensors_load_all(SdFat32 &sd) {
 
                             if (vd.calculation != CALC_NONE && vd.source_key_count > 0) {
                                 virtual_decoder_register(&vd);
+                                if (vd.interval_sec > 0 && vd.interval_sec < dev.report_interval_sec) {
+                                    LogSerial.printf("RP2040 Warning: %s '%s': interval_sec=%lu < report_interval_sec=%lu, "
+                                                     "computed with every packet\r\n", dev.device_name, vd.output_key,
+                                                     (unsigned long)vd.interval_sec,
+                                                     (unsigned long)dev.report_interval_sec);
+                                }
                                 DBG_LORA_PRINTF("Registered virtual decoder '%s' (sources: %u, type: %d) for device '%s' (0x%08lX)",
                                                 vd.output_key, vd.source_key_count, vd.calculation, dev.device_name,
                                                 (unsigned long)dev.dev_addr);

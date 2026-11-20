@@ -12,6 +12,7 @@
 #include "littlefs_driver.hpp"
 #include "archive_store.hpp"
 #include "debug_log.hpp"
+#include "virtual_decoder.hpp"
 #include <ArduinoJson.h>
 #include <string.h>
 #include <strings.h>
@@ -310,8 +311,12 @@ static void register_device_archive(SdFat32* sd, JsonObjectConst device, const c
         }
 
         /* Expected update interval of this key: keys sent with every packet (depth) follow the
-         * device transmit interval; sporadic keys (battery_soc) override it */
-        uint32_t raw_interval = arc["expected_interval_sec"] | report_interval;
+         * device transmit interval; virtual keys with interval_sec follow their raster (the
+         * virtual decoders are registered before the archive); sporadic keys (battery_soc)
+         * override it with expected_interval_sec */
+        uint32_t default_interval = virtual_decoder_effective_interval(
+            (uint32_t)strtoul(dev_addr, nullptr, 16), key, report_interval);
+        uint32_t raw_interval = arc["expected_interval_sec"] | default_interval;
         config.roundtrip_interval = sanitize_roundtrip_interval(raw_interval, config.channel_key);
         config.storage_interval = (config.roundtrip_interval > 300) ? 300 : config.roundtrip_interval;
         config.tolerance_sec = arc["tolerance_sec"] | 15;
@@ -1443,6 +1448,9 @@ typedef struct {
     size_t   out_capacity;
     float    alarm_min, alarm_max;
     uint8_t  alarm_flags;
+    /* Pass 1: extremes of all records in the window (also the ones LTTB does not select) */
+    bool     have_extremes;
+    float    win_min, win_max;
 } lttb_ctx_t;
 
 /* Unpack one archive record of the current level into time / value / extremes / estimated */
@@ -1525,6 +1533,9 @@ static bool lttb_visit(const void* record, void* ctx) {
     if (b >= c->m) return true;
 
     if (c->pass == 1) {
+        if (!c->have_extremes || vmin < c->win_min) c->win_min = vmin;
+        if (!c->have_extremes || vmax > c->win_max) c->win_max = vmax;
+        c->have_extremes = true;
         lttb_bucket_t* bk = &s_lttb_buckets[b];
         if (bk->n == 0 || vmin < bk->vmin) bk->vmin = vmin;
         if (bk->n == 0 || vmax > bk->vmax) bk->vmax = vmax;
@@ -1600,9 +1611,11 @@ chart_data_point_t* data_storage_query_lttb(
     float alarm_max,
     uint8_t alarm_flags,
     uint32_t* actual_interval_sec,
-    size_t* count
+    size_t* count,
+    chart_window_extremes_t* extremes
 ) {
     *count = 0;
+    if (extremes) memset(extremes, 0, sizeof(*extremes));
     if (!channel_key || !littlefs_driver_is_mounted() || end_timestamp <= start_timestamp || max_points == 0) {
         return nullptr;
     }
@@ -1631,6 +1644,11 @@ chart_data_point_t* data_storage_query_lttb(
     /* Pass 1: bucket statistics */
     c.pass = 1;
     lttb_scan(channel, &c, start_timestamp, end_timestamp);
+    if (extremes && c.have_extremes) {
+        extremes->min = c.win_min;
+        extremes->max = c.win_max;
+        extremes->valid = 1;
+    }
 
     c.last_nonempty = -1;
     int32_t next = -1;

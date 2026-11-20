@@ -688,9 +688,10 @@ static void handle_packet(const uint8_t* buffer, size_t size)
 */
             uint32_t actual_interval = interval_sec;
             size_t pt_count = 0;
+            chart_window_extremes_t extremes = {};
             chart_data_point_t *pts = (query_mode == CHART_QUERY_MODE_LTTB)
                 ? data_storage_query_lttb(channel_key, start_ts, end_ts, max_points, alarm_min, alarm_max,
-                                          alarm_flags, &actual_interval, &pt_count)
+                                          alarm_flags, &actual_interval, &pt_count, &extremes)
                 : data_storage_query_chart(channel_key, start_ts, end_ts, interval_sec, max_points, alarm_min,
                                            alarm_max, alarm_flags, &actual_interval, &pt_count);
 /*
@@ -704,8 +705,10 @@ static void handle_packet(const uint8_t* buffer, size_t size)
              * [3..6]: actual_interval (uint32_t)
              * [7..8]: count (uint16_t)
              * [9..]: chart_data_point_t array (count * 9 Bytes)
+             * LTTB mode only, after the points: chart_window_extremes_t (9 Bytes: min, max, valid),
+             *   the extremes of all records in the window (receivers without it ignore the tail)
              */
-            static uint8_t res_buf[9 + LTTB_MAX_POINTS * sizeof(chart_data_point_t)];
+            static uint8_t res_buf[9 + LTTB_MAX_POINTS * sizeof(chart_data_point_t) + sizeof(chart_window_extremes_t)];
             res_buf[0] = static_cast<uint8_t>(PKT_TYPE_RES_CHART_DATA);
             res_buf[1] = req_id;
             res_buf[2] = (pts && pt_count > 0) ? 0 : 1;
@@ -721,6 +724,10 @@ static void handle_packet(const uint8_t* buffer, size_t size)
                     memcpy(&res_buf[payload_size], pts, bytes_to_copy);
                     payload_size += bytes_to_copy;
                 }
+            }
+            if (query_mode == CHART_QUERY_MODE_LTTB && payload_size == 9 + safe_count * sizeof(chart_data_point_t)) {
+                memcpy(&res_buf[payload_size], &extremes, sizeof(extremes));
+                payload_size += sizeof(extremes);
             }
 
             uart_link_send(res_buf, payload_size);

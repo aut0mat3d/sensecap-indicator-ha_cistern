@@ -57,7 +57,7 @@ Keep these documents in sync when changing architecture, protocol or JSON schema
 │   └── esp_lcd/           patched copy of ESP-IDF v5.4 esp_lcd (RGB restart fix), see esp_lcd/CISTERN_PATCH.md
 ├── rp2040/                RP2040 firmware (PlatformIO): code in rp2040/src and rp2040/include
 ├── sdcontent/             reference content of SD partition 1 (tracked in git, dummy keys only)
-├── docs_extensions_n_changes/   architecture docs (overview/ is current; old/ is archived)
+├── docs_extensions_n_changes/   architecture docs (overview/) and the handoff NEXT_STEPS.md
 ├── SDbackup/              PRIVATE backup of a test unit SD card - never read into commits, never modify
 └── tmp/                   private experiments - never modify, never commit
 ```

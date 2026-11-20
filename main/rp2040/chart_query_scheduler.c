@@ -211,6 +211,7 @@ int8_t chart_query_scheduler_subscribe(uint32_t dev_addr, const char *key, uint8
     sub->new_data_ready = false;
     sub->data_count = 0;
     sub->data_step = 0;
+    memset(&sub->data_extremes, 0, sizeof(sub->data_extremes));
     sub->last_queried_bucket = 0;
 
     xSemaphoreGive(s_sched_mutex);
@@ -293,8 +294,20 @@ bool chart_query_scheduler_consume_data(int8_t sub_id, chart_data_point_t *out_p
     return true;
 }
 
+/* Window extremes from the received points (responses without trailer, e.g. GRID mode) */
+static void _extremes_from_points(chart_window_extremes_t *out, const chart_data_point_t *pts, uint16_t count) {
+    memset(out, 0, sizeof(*out));
+    for (uint16_t i = 0; i < count; i++) {
+        if (pts[i].flags & DATA_FLAG_NO_DATA) continue;
+        if (!out->valid || pts[i].value < out->min) out->min = pts[i].value;
+        if (!out->valid || pts[i].value > out->max) out->max = pts[i].value;
+        out->valid = 1;
+    }
+}
+
 void chart_query_scheduler_on_response(uint8_t req_id, uint8_t status, uint32_t step,
-                                       uint16_t count, const chart_data_point_t *pts) {
+                                       uint16_t count, const chart_data_point_t *pts,
+                                       const chart_window_extremes_t *extremes) {
     if (!s_sched_mutex) return;
 
     xSemaphoreTake(s_sched_mutex, portMAX_DELAY);
@@ -315,6 +328,11 @@ void chart_query_scheduler_on_response(uint8_t req_id, uint8_t status, uint32_t 
                     sub->data_count = copy_pts;
                 } else {
                     sub->data_count = 0;
+                }
+                if (extremes) {
+                    sub->data_extremes = *extremes;
+                } else {
+                    _extremes_from_points(&sub->data_extremes, sub->data_buffer, sub->data_count);
                 }
 
                 /* Signal data availability to widget layer */
@@ -470,6 +488,19 @@ void chart_query_scheduler_unsubscribe(int8_t sub_id) {
 uint32_t chart_query_scheduler_get_data_step(int8_t sub_id) {
     if (sub_id < 0 || sub_id >= CHART_SCHEDULER_MAX_SUBSCRIPTIONS) return 0;
     return s_subs[sub_id].data_step;
+}
+
+bool chart_query_scheduler_get_window_extremes(int8_t sub_id, float *out_min, float *out_max) {
+    if (sub_id < 0 || sub_id >= CHART_SCHEDULER_MAX_SUBSCRIPTIONS || !s_sched_mutex) return false;
+    xSemaphoreTake(s_sched_mutex, portMAX_DELAY);
+    const chart_subscription_t *sub = &s_subs[sub_id];
+    bool ok = sub->sub_id >= 0 && sub->data_extremes.valid;
+    if (ok) {
+        if (out_min) *out_min = sub->data_extremes.min;
+        if (out_max) *out_max = sub->data_extremes.max;
+    }
+    xSemaphoreGive(s_sched_mutex);
+    return ok;
 }
 
 void chart_query_scheduler_set_query_mode(int8_t sub_id, uint8_t query_mode) {

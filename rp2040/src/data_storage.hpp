@@ -225,6 +225,13 @@ typedef struct __attribute__((packed)) {
     uint8_t  flags;      ///< Bitmask of DATA_FLAG_*
 } chart_data_point_t;
 
+/* Extremes of the whole LTTB window, sent as trailer of RES_CHART_DATA (same layout on the ESP32) */
+typedef struct __attribute__((packed)) {
+    float   min;
+    float   max;
+    uint8_t valid;       ///< 0 = no record in the window
+} chart_window_extremes_t;
+
 chart_data_point_t* data_storage_query_chart(
     const char* channel_key,
     uint32_t start_timestamp,
@@ -249,6 +256,8 @@ chart_data_point_t* data_storage_query_chart(
  * minimum / maximum of the bucket, so an episode is marked even if another point is chosen.
  *
  * @param actual_interval_sec Out: bucket width in seconds.
+ * @param extremes Out (optional): minimum / maximum of all records in the window (hour / day
+ *                 records contribute their min / max), independent of the selected points.
  * @return Malloc'd array (caller frees) or nullptr.
  */
 chart_data_point_t* data_storage_query_lttb(
@@ -260,7 +269,8 @@ chart_data_point_t* data_storage_query_lttb(
     float alarm_max,
     uint8_t alarm_flags,
     uint32_t* actual_interval_sec,
-    size_t* count
+    size_t* count,
+    chart_window_extremes_t* extremes
 );
 
 

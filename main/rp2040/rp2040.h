@@ -74,6 +74,14 @@ typedef struct __attribute__((packed)) {
     uint8_t  flags;
 } chart_data_point_t;
 
+/* Extremes of the whole LTTB window: optional trailer of RES_CHART_DATA after the points
+ * (same layout on the RP2040). Covers every record of the window, not only the selected points. */
+typedef struct __attribute__((packed)) {
+    float   min;
+    float   max;
+    uint8_t valid;       /* 0 = no record in the window */
+} chart_window_extremes_t;
+
 typedef void (*chart_data_callback_t)(uint8_t req_id, uint8_t status, uint32_t actual_interval, 
                                       const chart_data_point_t *points, uint16_t count);
 

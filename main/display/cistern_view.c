@@ -36,6 +36,7 @@ static const char *TAG = "cistern-view";
 #define CISTERN_DEV_ADDR               0x05975DC9
 #define CISTERN_KEY_DEPTH              "depth"
 #define CISTERN_KEY_BATTERY            "battery_soc"
+#define CISTERN_KEY_FLOWRATE           "flowrate"
 #define CISTERN_FALLBACK_MIN_DEPTH_CM  0.0f
 #define CISTERN_FALLBACK_MAX_DEPTH_CM  140.0f
 
@@ -391,6 +392,21 @@ static void cistern_create_battery_icon(void) {
     s_battery_icon_created = (battery_icon_init(&s_battery_icon) == 0);
 }
 
+/* Level history tapped: flow rate and level trend page, last 24 h */
+static void on_horiz_graph_clicked(lv_event_t *e) {
+    (void)e;
+    key_detail_opts_t opts = {
+        .dev_addr = CISTERN_DEV_ADDR,
+        .trends = {
+            { .key = CISTERN_KEY_FLOWRATE, .include_zero = true },
+            { .key = CISTERN_KEY_DEPTH, .include_zero = false },
+        },
+        .trend_count = 2,
+        .preset_idx = KEY_DETAIL_PRESET_24H,
+    };
+    key_detail_view_show_ex(&opts);
+}
+
 static void on_vert_graph_clicked(lv_event_t *e) {
     ESP_LOGI(TAG, "Level graph clicked! Opening device configuration controller...");
     device_config_controller_open_thresholds(CISTERN_DEV_ADDR);
@@ -540,6 +556,7 @@ int cistern_view_init(void) {
     s_horiz_graph.max_value = max_depth_cm;
     s_horiz_graph.bar_color = lv_color_hex(0x3498DB);
     s_horiz_graph.chart_type = HORIZ_BARGRAPH_TYPE_BAR;
+    s_horiz_graph.click_cb = on_horiz_graph_clicked;
     horiz_bargraph_init(&s_horiz_graph);
 
     /* Configure 4 zones: 7 (days) + 12 (2h) + 11 (5min) + 1 (live) = 31 bars */

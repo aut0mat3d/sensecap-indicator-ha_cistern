@@ -14,6 +14,7 @@
 #include "media_standards.h"
 #include "rp2040.h"
 #include "view_data.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include <math.h>
 #include <stdio.h>
@@ -36,7 +37,7 @@ enum { ROW_VALUE = 0, ROW_UPDATED, ROW_STATUS, ROW_INTERVAL, ROW_DEVICE };
 typedef struct {
     bool          open;
     uint32_t      dev_addr;
-    char          key[24];
+    char          key[24];               ///< Key of the info rows (single key page)
     char          unit[12];
     bool          has_value;
     float         value;
@@ -46,12 +47,15 @@ typedef struct {
     lv_obj_t     *root;
     lv_obj_t     *lbl_values[DETAIL_ROW_COUNT];
     lv_timer_t   *timer;
-    trend_graph_t trend;
+    uint8_t       trend_count;
+    trend_graph_t trends[KEY_DETAIL_MAX_TRENDS];
+    char          trend_titles[KEY_DETAIL_MAX_TRENDS][32];
     esp_event_handler_instance_t telem_handler;
     esp_event_handler_instance_t last_value_handler;
 } detail_view_t;
 
-static detail_view_t s_view;
+/* PSRAM: holds the point buffers of both trend graphs (~2 KB) */
+EXT_RAM_BSS_ATTR static detail_view_t s_view;
 
 /* i18n text with the trailing ':' of label keys removed */
 static void label_without_colon(const char *i18n_key, const char *fallback, char *out, size_t len) {
@@ -72,7 +76,7 @@ static void format_interval(uint32_t sec, char *out, size_t len) {
 /* ── Info rows (LVGL lock held) ────────────────────────────────────────── */
 
 static void render_info(void) {
-    if (!s_view.root) return;
+    if (!s_view.root || s_view.trend_count != 1) return;
     char buf[48];
     time_t now = time(NULL);
 
@@ -131,7 +135,15 @@ static void render_info(void) {
 static void telemetry_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
     if (id != VIEW_EVENT_LORA_TELEMETRY || !data) return;
     const struct view_data_lora_telemetry *t = (const struct view_data_lora_telemetry *)data;
-    if (t->dev_addr != s_view.dev_addr || strcmp(t->key, s_view.key) != 0 || t->context == 2) return;
+    if (!s_view.open || t->dev_addr != s_view.dev_addr || t->context == 2) return;
+
+    /* Unit of the trend graphs (cursor / extreme values) */
+    if (t->unit[0]) {
+        for (uint8_t i = 0; i < s_view.trend_count; i++) {
+            if (strcmp(t->key, s_view.trends[i].key) == 0) trend_graph_set_unit(&s_view.trends[i], t->unit);
+        }
+    }
+    if (s_view.trend_count != 1 || strcmp(t->key, s_view.key) != 0) return;
 
     float v;
     if (t->val_type == LORA_VAL_TYPE_FLOAT) v = t->val.f_val;
@@ -153,7 +165,14 @@ static void telemetry_handler(void *arg, esp_event_base_t base, int32_t id, void
 static void last_value_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
     if (id != VIEW_EVENT_ARCHIVE_LAST_VALUE || !data) return;
     const struct view_data_last_value *lv = (const struct view_data_last_value *)data;
-    if (lv->dev_addr != s_view.dev_addr || strcmp(lv->key, s_view.key) != 0 || !lv->valid) return;
+    if (!s_view.open || lv->dev_addr != s_view.dev_addr || !lv->valid) return;
+
+    if (lv->unit[0]) {
+        for (uint8_t i = 0; i < s_view.trend_count; i++) {
+            if (strcmp(lv->key, s_view.trends[i].key) == 0) trend_graph_set_unit(&s_view.trends[i], lv->unit);
+        }
+    }
+    if (s_view.trend_count != 1 || strcmp(lv->key, s_view.key) != 0) return;
 
     lv_port_sem_take();
     if (s_view.open) {
@@ -166,7 +185,7 @@ static void last_value_handler(void *arg, esp_event_base_t base, int32_t id, voi
         }
         /* Percent values without configured limits: fixed 0..100 % scale */
         if (!s_view.has_limits && strcmp(s_view.unit, "%") == 0) {
-            trend_graph_set_scale(&s_view.trend, 0.0f, 100.0f);
+            trend_graph_set_scale(&s_view.trends[0], 0.0f, 100.0f);
         }
         render_info();
     }
@@ -184,9 +203,27 @@ static void back_clicked_cb(lv_event_t *e) {
     key_detail_view_hide();
 }
 
+/* ── Coupling of the trend graphs (LVGL context) ──────────────────────── */
+
+/* One graph switched the range by touch: the others follow */
+static void trend_preset_changed(trend_graph_t *graph, uint8_t preset_idx, void *user_data) {
+    (void)user_data;
+    for (uint8_t i = 0; i < s_view.trend_count; i++) {
+        if (&s_view.trends[i] != graph) trend_graph_set_preset(&s_view.trends[i], preset_idx);
+    }
+}
+
+/* Cursor moved by touch: the others show their value at the same time */
+static void trend_cursor_moved(trend_graph_t *graph, uint32_t timestamp, void *user_data) {
+    (void)user_data;
+    for (uint8_t i = 0; i < s_view.trend_count; i++) {
+        if (&s_view.trends[i] != graph) trend_graph_show_cursor_at(&s_view.trends[i], timestamp);
+    }
+}
+
 /* ── Trend configuration from the device config ───────────────────────── */
 
-static void configure_trend(trend_graph_t *tg, lora_device_config_t *dev) {
+static void configure_trend(trend_graph_t *tg, lora_device_config_t *dev, uint8_t preset_idx, bool use_limits) {
     tg->preset_count = 3;
     strlcpy(tg->presets[0].label, gui_i18n_get("trend.24h"), sizeof(tg->presets[0].label));
     tg->presets[0].step_sec = 3600;
@@ -194,15 +231,16 @@ static void configure_trend(trend_graph_t *tg, lora_device_config_t *dev) {
     strlcpy(tg->presets[1].label, gui_i18n_get("trend.7d"), sizeof(tg->presets[1].label));
     tg->presets[1].step_sec = 86400;
     tg->presets[1].point_count = 7;
-    strlcpy(tg->presets[2].label, gui_i18n_get("trend.31d"), sizeof(tg->presets[2].label));
+    /* 31 days: "1 month" on the coupled page, "31 days" on the single key page */
+    strlcpy(tg->presets[2].label, gui_i18n_get(use_limits ? "trend.31d" : "trend.1m"), sizeof(tg->presets[2].label));
     tg->presets[2].step_sec = 86400;
     tg->presets[2].point_count = 31;
-    tg->preset_idx = 2;
+    tg->preset_idx = (preset_idx < tg->preset_count) ? preset_idx : KEY_DETAIL_PRESET_1M;
 
     if (!dev) return;
 
     /* Y scale from limits[key] (otherwise automatic, or 0..100 % once the unit is known) */
-    for (uint8_t l = 0; l < dev->limit_count; l++) {
+    for (uint8_t l = 0; use_limits && l < dev->limit_count; l++) {
         if (dev->limits[l].valid && strcmp(dev->limits[l].key, tg->key) == 0) {
             tg->min_val = dev->limits[l].val_min;
             tg->max_val = dev->limits[l].val_max;
@@ -242,14 +280,21 @@ static void configure_trend(trend_graph_t *tg, lora_device_config_t *dev) {
 
 /* ── Public API ───────────────────────────────────────────────────────── */
 
-void key_detail_view_show(uint32_t dev_addr, const char *key) {
-    if (!key) return;
+void key_detail_view_show_ex(const key_detail_opts_t *opts) {
+    if (!opts || opts->trend_count == 0 || opts->trend_count > KEY_DETAIL_MAX_TRENDS) return;
+    for (uint8_t i = 0; i < opts->trend_count; i++) {
+        if (!opts->trends[i].key || !opts->trends[i].key[0]) return;
+    }
     if (s_view.open) key_detail_view_hide();
+
+    uint32_t dev_addr = opts->dev_addr;
+    bool single = (opts->trend_count == 1);
 
     lv_port_sem_take();
     memset(&s_view, 0, sizeof(s_view));
     s_view.dev_addr = dev_addr;
-    strlcpy(s_view.key, key, sizeof(s_view.key));
+    s_view.trend_count = opts->trend_count;
+    strlcpy(s_view.key, opts->trends[0].key, sizeof(s_view.key));
     lora_device_config_t *dev = lora_model_get_device_by_addr(dev_addr);
 
     /* Opaque full screen modal (radius 0: lv_port skips rendering the page underneath) */
@@ -263,7 +308,7 @@ void key_detail_view_show(uint32_t dev_addr, const char *key) {
     lv_obj_set_style_border_width(s_view.root, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(s_view.root, 0, LV_PART_MAIN);
 
-    /* Top bar: back button + "<device>: <key>" */
+    /* Top bar: back button + "<device>: <key>[ / <key>]" */
     /* Same height as the global header, so the content uses the common 48 px grid below it */
     lv_obj_t *bar = lv_obj_create(s_view.root);
     lv_obj_set_size(bar, 480, GRID_CONTENT_Y_OFFSET);
@@ -290,64 +335,92 @@ void key_detail_view_show(uint32_t dev_addr, const char *key) {
     lv_obj_set_style_text_font(lbl_back, &ui_font_font0, LV_PART_MAIN);
     lv_obj_center(lbl_back);
 
-    char key_label[32];
     char i18n_key[48];
-    snprintf(i18n_key, sizeof(i18n_key), "telemetry.%s", key);
-    label_without_colon(i18n_key, key, key_label, sizeof(key_label));
-    char title[64];
-    snprintf(title, sizeof(title), "%s: %s", (dev && dev->device_name[0]) ? dev->device_name : "?", key_label);
+    for (uint8_t i = 0; i < s_view.trend_count; i++) {
+        snprintf(i18n_key, sizeof(i18n_key), "telemetry.%s", opts->trends[i].key);
+        label_without_colon(i18n_key, opts->trends[i].key, s_view.trend_titles[i], sizeof(s_view.trend_titles[i]));
+    }
+    char title[96];
+    snprintf(title, sizeof(title), "%s: %s%s%s", (dev && dev->device_name[0]) ? dev->device_name : "?",
+             s_view.trend_titles[0], single ? "" : " / ", single ? "" : s_view.trend_titles[1]);
     lv_obj_t *lbl_title = lv_label_create(bar);
     lv_label_set_text(lbl_title, title);
     lv_obj_set_style_text_font(lbl_title, &ui_font_font0, LV_PART_MAIN);
     lv_obj_set_style_text_color(lbl_title, DETAIL_VALUE_COLOR, LV_PART_MAIN);
 
-    /* Trend graph */
-    trend_graph_t *tg = &s_view.trend;
-    /* Grid: full width, 5 rows (10 x 5 cells = 480 x 240) */
-    tg->parent = s_view.root;
-    tg->x = GRID_COORD_X(0);
-    tg->y = GRID_COORD_Y(0);
-    tg->width = GRID_SPAN_W(10);
-    tg->height = GRID_SPAN_H(5);
-    tg->dev_addr = dev_addr;
-    strlcpy(tg->key, key, sizeof(tg->key));
-    configure_trend(tg, dev);
-    if (trend_graph_init(tg) != 0) {
-        ESP_LOGE(TAG, "Trend graph for 0x%08lX.%s could not be created", (unsigned long)dev_addr, key);
+    /* Trend graphs: single key 10 x 5 cells, two keys 10 x 4 cells each (content area 10 x 8) */
+    uint8_t rows = single ? 5 : 4;
+    for (uint8_t i = 0; i < s_view.trend_count; i++) {
+        trend_graph_t *tg = &s_view.trends[i];
+        tg->parent = s_view.root;
+        tg->x = GRID_COORD_X(0);
+        tg->y = GRID_COORD_Y(i * rows);
+        tg->width = GRID_SPAN_W(10);
+        tg->height = GRID_SPAN_H(rows);
+        tg->dev_addr = dev_addr;
+        strlcpy(tg->key, opts->trends[i].key, sizeof(tg->key));
+        tg->auto_include_zero = opts->trends[i].include_zero;
+        configure_trend(tg, dev, opts->preset_idx, single);
+        if (!single) {
+            /* Each graph names its key; the head line also shows the cursor readout */
+            tg->title = s_view.trend_titles[i];
+            tg->show_extremes = true;
+            tg->preset_changed_cb = trend_preset_changed;
+            tg->cursor_cb = trend_cursor_moved;
+        }
+        if (trend_graph_init(tg) != 0) {
+            ESP_LOGE(TAG, "Trend graph for 0x%08lX.%s could not be created", (unsigned long)dev_addr, tg->key);
+        }
     }
 
-    /* Info rows */
-    static const char *const row_keys[DETAIL_ROW_COUNT] = {
-        "detail.value", "detail.updated", "detail.status", "detail.interval", "detail.device"
-    };
-    for (int r = 0; r < DETAIL_ROW_COUNT; r++) {
-        int32_t y = GRID_COORD_Y(5) + 8 + r * 30;
-        lv_obj_t *lbl = lv_label_create(s_view.root);
-        lv_label_set_text(lbl, gui_i18n_get(row_keys[r]));
-        lv_obj_set_style_text_font(lbl, &ui_font_font0, LV_PART_MAIN);
-        lv_obj_set_style_text_color(lbl, DETAIL_LABEL_COLOR, LV_PART_MAIN);
-        lv_obj_set_pos(lbl, 16, y);
+    /* Info rows (single key page) */
+    if (single) {
+        static const char *const row_keys[DETAIL_ROW_COUNT] = {
+            "detail.value", "detail.updated", "detail.status", "detail.interval", "detail.device"
+        };
+        for (int r = 0; r < DETAIL_ROW_COUNT; r++) {
+            int32_t y = GRID_COORD_Y(5) + 8 + r * 30;
+            lv_obj_t *lbl = lv_label_create(s_view.root);
+            lv_label_set_text(lbl, gui_i18n_get(row_keys[r]));
+            lv_obj_set_style_text_font(lbl, &ui_font_font0, LV_PART_MAIN);
+            lv_obj_set_style_text_color(lbl, DETAIL_LABEL_COLOR, LV_PART_MAIN);
+            lv_obj_set_pos(lbl, 16, y);
 
-        s_view.lbl_values[r] = lv_label_create(s_view.root);
-        lv_obj_set_style_text_font(s_view.lbl_values[r], &ui_font_font0, LV_PART_MAIN);
-        lv_obj_set_style_text_color(s_view.lbl_values[r], DETAIL_VALUE_COLOR, LV_PART_MAIN);
-        lv_obj_set_pos(s_view.lbl_values[r], 230, y);
+            s_view.lbl_values[r] = lv_label_create(s_view.root);
+            lv_obj_set_style_text_font(s_view.lbl_values[r], &ui_font_font0, LV_PART_MAIN);
+            lv_obj_set_style_text_color(s_view.lbl_values[r], DETAIL_VALUE_COLOR, LV_PART_MAIN);
+            lv_obj_set_pos(s_view.lbl_values[r], 230, y);
+        }
+        char dev_txt[48];
+        snprintf(dev_txt, sizeof(dev_txt), "0x%08lX", (unsigned long)dev_addr);
+        lv_label_set_text(s_view.lbl_values[ROW_DEVICE], dev_txt);
     }
-    char dev_txt[48];
-    snprintf(dev_txt, sizeof(dev_txt), "0x%08lX", (unsigned long)dev_addr);
-    lv_label_set_text(s_view.lbl_values[ROW_DEVICE], dev_txt);
 
     s_view.open = true;
     render_info();
-    s_view.timer = lv_timer_create(timer_cb, DETAIL_TIMER_MS, NULL);
+    if (single) s_view.timer = lv_timer_create(timer_cb, DETAIL_TIMER_MS, NULL);
     lv_port_sem_give();
 
     esp_event_handler_instance_register_with(view_event_handle, VIEW_EVENT_BASE, VIEW_EVENT_LORA_TELEMETRY,
                                              telemetry_handler, NULL, &s_view.telem_handler);
     esp_event_handler_instance_register_with(view_event_handle, VIEW_EVENT_BASE, VIEW_EVENT_ARCHIVE_LAST_VALUE,
                                              last_value_handler, NULL, &s_view.last_value_handler);
-    rp2040_request_last_value(dev_addr, key);
-    ESP_LOGI(TAG, "Detail page opened for 0x%08lX.%s", (unsigned long)dev_addr, key);
+    for (uint8_t i = 0; i < s_view.trend_count; i++) {
+        rp2040_request_last_value(dev_addr, opts->trends[i].key);
+    }
+    ESP_LOGI(TAG, "Detail page opened for 0x%08lX.%s (%u graph(s))", (unsigned long)dev_addr, s_view.key,
+             (unsigned)s_view.trend_count);
+}
+
+void key_detail_view_show(uint32_t dev_addr, const char *key) {
+    if (!key) return;
+    key_detail_opts_t opts = {
+        .dev_addr = dev_addr,
+        .trends = { { .key = key } },
+        .trend_count = 1,
+        .preset_idx = KEY_DETAIL_PRESET_1M,
+    };
+    key_detail_view_show_ex(&opts);
 }
 
 void key_detail_view_hide(void) {
@@ -364,7 +437,9 @@ void key_detail_view_hide(void) {
         s_view.last_value_handler = NULL;
     }
 
-    trend_graph_destroy(&s_view.trend);
+    for (uint8_t i = 0; i < s_view.trend_count; i++) {
+        trend_graph_destroy(&s_view.trends[i]);
+    }
 
     lv_port_sem_take();
     s_view.open = false;

@@ -184,6 +184,7 @@ int horiz_bargraph_init(horiz_bargraph_t *graph) {
 
     /* 4. Chart Widget */
     graph->chart = lv_chart_create(graph->container);
+    lv_obj_remove_flag(graph->chart, LV_OBJ_FLAG_CLICKABLE); /* taps reach the container (click_cb) */
     lv_obj_set_size(graph->chart, chart_w, chart_h);
     lv_obj_set_pos(graph->chart, 0, chart_top_offset);
 
@@ -367,6 +368,7 @@ void horiz_bargraph_set_zones(horiz_bargraph_t *graph, const horiz_bargraph_zone
                 if (!graph->zone_dividers[z]) {
                     graph->zone_dividers[z] = lv_obj_create(graph->container);
                     lv_obj_remove_flag(graph->zone_dividers[z], LV_OBJ_FLAG_SCROLLABLE);
+                    lv_obj_remove_flag(graph->zone_dividers[z], LV_OBJ_FLAG_CLICKABLE);
                     lv_obj_set_style_radius(graph->zone_dividers[z], 0, LV_PART_MAIN);
                     lv_obj_set_style_border_width(graph->zone_dividers[z], 0, LV_PART_MAIN);
                     lv_obj_set_style_bg_color(graph->zone_dividers[z], lv_color_hex(0x555555), LV_PART_MAIN);

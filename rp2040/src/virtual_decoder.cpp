@@ -26,6 +26,13 @@
 #include <string.h>
 #include <math.h>
 #include <strings.h>
+#include <time.h>
+
+/* Timestamps below this are not synchronized (no raster for interval_sec) */
+#define VD_MIN_VALID_UTC 1700000000UL
+/* Longest source chain followed by virtual_decoder_effective_interval (depth -> volume -> flowrate
+ * is 2); also stops a cyclic configuration, bounded work even with several sources per decoder */
+#define VD_MAX_CHAIN_DEPTH 6
 
 // ============================================================================
 // Static State
@@ -62,6 +69,25 @@ static virtual_decoder_t* find_virtual_decoder(uint32_t dev_addr, const char* ou
         }
     }
     return nullptr;
+}
+
+/* Local UTC offset at ts in seconds (POSIX TZ of the C runtime, same rule as the daily aggregation) */
+static int32_t local_utc_offset(uint32_t ts) {
+    time_t t = (time_t)ts;
+    struct tm g_tm, l_tm;
+    gmtime_r(&t, &g_tm);
+    localtime_r(&t, &l_tm);
+    long day_diff = l_tm.tm_mday - g_tm.tm_mday;
+    if (day_diff > 1) day_diff = -1;
+    else if (day_diff < -1) day_diff = 1;
+    return (int32_t)(day_diff * 86400 + (l_tm.tm_hour - g_tm.tm_hour) * 3600 + (l_tm.tm_min - g_tm.tm_min) * 60);
+}
+
+/* Index of the local raster slot of ts (e.g. interval 3600 = local hour, 86400 = local day) */
+static uint32_t raster_slot(uint32_t ts, uint32_t interval_sec) {
+    int64_t local = (int64_t)ts + local_utc_offset(ts);
+    if (local < 0) local = 0;
+    return (uint32_t)(local / interval_sec);
 }
 
 static void store_vd_output(uint32_t dev_addr, const char* key, const char* unit, float value, uint32_t timestamp) {
@@ -225,23 +251,30 @@ static float calc_volume(const geometry_config_t& geo, float depth_cm) {
 // Derivative Calculation with Unit & Time-Base Conversion
 // ============================================================================
 
-static float calc_derivative(virtual_decoder_t* decoder, float current_value, 
-                             uint32_t current_timestamp, uint8_t source_index, const char* source_unit) {
+/*
+ * Rate of change of a source value between two packets.
+ * Returns false (no value) for the first sample after boot / reload, which only becomes the
+ * baseline, and for identical or backwards timestamps: a fake 0.0 would be published and
+ * archived as a real measurement.
+ */
+static bool calc_derivative(virtual_decoder_t* decoder, float current_value,
+                            uint32_t current_timestamp, uint8_t source_index, const char* source_unit,
+                            float* out_rate) {
     virtual_decoder_state_t* state = &decoder->state;
 
-    // First value: store as historical baseline and return 0
+    // First value: store as historical baseline, no rate yet
     if (!state->has_last_value[source_index]) {
         state->last_values[source_index] = current_value;
         state->last_timestamps[source_index] = current_timestamp;
         state->has_last_value[source_index] = true;
-        return 0.0f;
+        return false;
     }
 
     uint32_t time_diff_sec = 0;
     if (current_timestamp > state->last_timestamps[source_index]) {
         time_diff_sec = current_timestamp - state->last_timestamps[source_index];
     } else {
-        return 0.0f; // Identical or backwards timestamps: no derivation possible
+        return false; // Identical or backwards timestamps: no derivation possible
     }
 
     float delta = current_value - state->last_values[source_index];
@@ -262,7 +295,8 @@ static float calc_derivative(virtual_decoder_t* decoder, float current_value,
     state->last_values[source_index] = current_value;
     state->last_timestamps[source_index] = current_timestamp;
 
-    return rate * decoder->config.corr_factor;
+    *out_rate = rate * decoder->config.corr_factor;
+    return true;
 }
 
 // ============================================================================
@@ -322,14 +356,31 @@ static bool process_virtual_decoders(uint32_t dev_addr, uint32_t fcnt,
             }
             if (!all_available) continue;
 
+            /*
+             * interval_sec > 0: at most one computation per local raster slot, triggered by the first
+             * packet in a new slot (no values are invented between packets). A device that transmits
+             * less often than interval_sec puts every packet into a new slot, which is the same as
+             * "on new data". Without valid time there is no raster: compute on every packet.
+             */
+            bool gated = decoder->config.interval_sec > 0 && timestamp >= VD_MIN_VALID_UTC;
+            uint32_t slot = gated ? raster_slot(timestamp, decoder->config.interval_sec) : 0;
+            if (gated && decoder->state.has_slot && slot == decoder->state.last_slot) {
+                decoder_processed[i] = true; /* slot already computed: wait for the next one */
+                continue;
+            }
+
             float result = 0.0f;
             bool should_compute = true;
             uint32_t result_ts = timestamp;
 
             switch (decoder->config.calculation) {
                 case CALC_DERIVATIVE: {
-                    if (decoder->config.source_key_count > 0) {
-                        result = calc_derivative(decoder, source_values[0], source_timestamps[0], 0, source_units[0]);
+                    if (decoder->config.source_key_count > 0 &&
+                        !calc_derivative(decoder, source_values[0], source_timestamps[0], 0, source_units[0],
+                                         &result)) {
+                        /* Baseline only: nothing to publish / archive, do not retry in this pass */
+                        should_compute = false;
+                        decoder_processed[i] = true;
                     }
                     break;
                 }
@@ -386,6 +437,12 @@ static bool process_virtual_decoders(uint32_t dev_addr, uint32_t fcnt,
                     break;
             }
 
+            /* The slot is used, also by a derivative that only stored its baseline */
+            if (gated) {
+                decoder->state.last_slot = slot;
+                decoder->state.has_slot = true;
+            }
+
             if (!should_compute || isnan(result) || isinf(result)) continue;
 
             // Store result in global blackboard for cascading dependent decoders
@@ -437,6 +494,7 @@ void virtual_decoder_clear_outputs(void) {
     g_vd_output_count = 0;
     for (size_t i = 0; i < g_virtual_decoder_count; i++) {
         for (uint8_t j = 0; j < MAX_SOURCE_KEYS; j++) g_virtual_decoders[i].state.has_last_value[j] = false;
+        g_virtual_decoders[i].state.has_slot = false;
     }
 }
 
@@ -455,6 +513,28 @@ bool virtual_decoder_register(const virtual_decoder_config_t* config) {
     memset(&decoder->state, 0, sizeof(decoder->state));
     decoder->enabled = true;
     return true;
+}
+
+static uint32_t effective_interval(uint32_t dev_addr, const char* key, uint32_t report_interval_sec,
+                                   uint8_t depth) {
+    const virtual_decoder_t* d = find_virtual_decoder(dev_addr, key);
+    /* Decoder key, or a chain too long / cyclic */
+    if (!d || depth >= VD_MAX_CHAIN_DEPTH) return report_interval_sec;
+
+    /* The decoder runs whenever one of its sources updates: the most frequent source counts */
+    uint32_t iv = 0;
+    for (uint8_t j = 0; j < d->config.source_key_count; j++) {
+        uint32_t s = effective_interval(dev_addr, d->config.source_keys[j], report_interval_sec, depth + 1);
+        if (iv == 0 || s < iv) iv = s;
+    }
+    if (iv == 0) iv = report_interval_sec;
+    if (d->config.interval_sec > iv) iv = d->config.interval_sec;
+    return iv;
+}
+
+uint32_t virtual_decoder_effective_interval(uint32_t dev_addr, const char* key, uint32_t report_interval_sec) {
+    if (!key) return report_interval_sec;
+    return effective_interval(dev_addr, key, report_interval_sec, 0);
 }
 
 bool virtual_decoder_process(uint32_t dev_addr, uint32_t fcnt, const char* key,

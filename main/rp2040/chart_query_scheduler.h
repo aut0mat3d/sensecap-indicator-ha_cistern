@@ -47,6 +47,7 @@ typedef struct {
     bool               new_data_ready;  /* True when new archive data was received from RP2040 */
     uint16_t           data_count;      /* Number of valid points in data_buffer */
     uint32_t           data_step;       /* Bucket interval of the data in data_buffer (from the response) */
+    chart_window_extremes_t data_extremes; /* Window min / max belonging to data_buffer */
     chart_data_point_t data_buffer[CHART_SUB_MAX_POINTS]; /* RAM point buffer */
 } chart_subscription_t;
 
@@ -121,9 +122,12 @@ bool chart_query_scheduler_consume_data(int8_t sub_id, chart_data_point_t *out_p
  * @param step Step size in seconds.
  * @param count Number of received points.
  * @param pts Pointer to array of data points.
+ * @param extremes Window extremes from the response trailer, NULL if the response had none
+ *                 (then they are taken from the received points).
  */
 void chart_query_scheduler_on_response(uint8_t req_id, uint8_t status, uint32_t step,
-                                       uint16_t count, const chart_data_point_t *pts);
+                                       uint16_t count, const chart_data_point_t *pts,
+                                       const chart_window_extremes_t *extremes);
 
 /**
  * @brief Periodic worker called every second (handles wall-clock grid triggers, FIFO dispatch, and timeouts).
@@ -163,6 +167,14 @@ void chart_query_scheduler_unsubscribe(int8_t sub_id);
  *        Lets a widget drop a late answer that belongs to a previous step setting.
  */
 uint32_t chart_query_scheduler_get_data_step(int8_t sub_id);
+
+/**
+ * @brief Minimum / maximum of all archived values in the window of the data last delivered to a
+ *        subscription (LTTB mode: computed by the RP2040 over every record, so short peaks that the
+ *        point selection skipped are included).
+ * @return false if unknown or the window had no data.
+ */
+bool chart_query_scheduler_get_window_extremes(int8_t sub_id, float *out_min, float *out_max);
 
 #ifdef __cplusplus
 }

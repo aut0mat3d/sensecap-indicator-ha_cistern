@@ -50,7 +50,7 @@ Listener nodes (no keys) ignore direct sensor uplinks and only accept the master
 widget ─► chart_query_scheduler_subscribe(dev_addr, key, zone, step, points, ...)
 scheduler (bucket boundary crossed) ─► 0x3B GET_CHART_DATA ─► RP2040 data_storage_query_chart()   (mode GRID)
                                                               └► RP2040 data_storage_query_lttb()   (mode LTTB)
-RP2040 ─► 0x3C RES_CHART_DATA (req_id, status, step, count, chart_data_point_t[]) ─► chart callback ─► widget
+RP2040 ─► 0x3C RES_CHART_DATA (req_id, status, step, count, chart_data_point_t[] [, extremes]) ─► scheduler ─► widget
 ```
 `cistern_view.c` subscribes 3 zones for `depth`: 7 × 86400 s, 12 × 7200 s, 11 × 300 s (zone 3 = live value).
 The scheduler has 24 subscription slots of up to 100 points each (`CHART_SUB_MAX_POINTS`), held in PSRAM.
@@ -67,6 +67,11 @@ The scheduler has 24 subscription slots of up to 100 points each (`CHART_SUB_MAX
   `DATA_FLAG_NO_DATA` marker separates records further apart than the expected spacing of their level
   (raw: update interval + tolerance, hour 1.5 h, day 1.5 d, never less than one bucket). Alarm flags come
   from the bucket minimum / maximum as in GRID mode; `DATA_FLAG_ESTIMATED` from the selected record.
+  The answer carries a 9-byte trailer after the points, `chart_window_extremes_t` (`min` f32, `max` f32,
+  `valid` u8): minimum / maximum of **every** record in the window (hour / day records contribute their
+  min / max), so short peaks that the point selection skipped are known. The ESP32 parser accepts it only
+  if the packet is long enough (older RP2040 firmware: the scheduler takes the extremes from the points);
+  `chart_query_scheduler_get_window_extremes()` hands it to `trend_graph` (dashed min / max lines).
 
 **Alarm coloring of history bars:** the archive stores values and quality flags only, no alarm state.
 Each query carries the current alarm levels of the key and their severities; the RP2040 marks a
@@ -119,7 +124,7 @@ Rule: a page may take longer to fill, but neither MCU may stall. No side sends l
 | `0x39` | RES_FILE_DATA | R→E | status, chunk_len (uint16), total size (uint32), offset (uint32), data (max 512 B); the ESP32 requests the next offset until the file is complete |
 | `0x3A` | CMD_SYNC_TIME | E→R | utc_ts(4) + flags(1) |
 | `0x3B` | CMD_GET_CHART_DATA | E→R | req_id, dev_addr, key, start, end, step, pts, alarm_min, alarm_max, alarm flags (byte 44, `CHART_ALARM_MIN/MAX_IS_WARNING`), query mode (byte 45, `CHART_QUERY_MODE_GRID/LTTB`, §5) |
-| `0x3C` | RES_CHART_DATA | R→E | req_id, status, step, count, points[] |
+| `0x3C` | RES_CHART_DATA | R→E | req_id, status, step, count, points[]; LTTB mode: + window extremes (min f32, max f32, valid u8, §5) |
 | `0x3D` | CMD_GET_TIME | E→R | – |
 | `0x3E` | RES_TIME | R→E | last_utc(4) |
 | `0x3F` | PUSH_LORA_DEV | R→E | one device config |

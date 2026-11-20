@@ -45,7 +45,8 @@ Application-specific settings therefore never belong in a decoder file.
   "report_interval_sec": 300,           // configured transmit interval of the sensor (60..86400, default 300):
                                         // ESP32 offline watchdog + default expected interval of archived keys
   "offsets": { "<key>": { "value": 50, "unit": "mm" } },
-  "virtual_decoder": { "<out_key>": { "source_key": "depth", "type"|"calculation": "...", ... } },
+  "virtual_decoder": { "<out_key>": { "source_key": "depth", "type"|"calculation": "...", ...,
+                       "interval_sec": 0 } },   // 0 = compute on every new packet (default); see below
   "thresholds": [ { "id", "key", "severity", "value_percent"|"value_threshold", "direction", "damping", "hysteresis[_percent]", "buzzer_mode" } ],
   "limits": { "<key>": { "val_min", "val_max", "cap_min", "cap_max" } },
   "display_config": { "unit_system": "metric", "volume_unit": "m3" },
@@ -58,7 +59,8 @@ Application-specific settings therefore never belong in a decoder file.
   "archive": {                           // optional, per key; keys without entry are not archived
     "<key>": {
       "expected_interval_sec": 86400,    // optional: update interval of this key if it differs from
-                                         // report_interval_sec (e.g. battery_soc once a day)
+                                         // report_interval_sec (e.g. battery_soc once a day); virtual keys
+                                         // with interval_sec default to their effective raster
       "tolerance_sec": 15,               // jitter tolerance (default 15; P2P adds a fixed 6 s allowance)
       "max_estimated_count": 3,          // max substitute values after a missed packet (default 0 = never)
       "quality": { "solid_pct": 66, "min_pct": 10, "use_estimated": false },   // defaults shown
@@ -112,6 +114,23 @@ Retention limits (code-verified, `data_storage.cpp` parse / `compute_keep_entrie
   (31 days) a 31-day window reads ~20 segments (~80 KB) from the SD card. The cost is bounded by the
   window, not by the retention. The ESP32 waits at most `CHART_QUERY_TIMEOUT_MS` (2500 ms) per answer.
 * Useful values for a 5-minute grid: 288 = 24 h, 2016 = 7 days, 8928 = 31 days.
+
+`virtual_decoder.<key>.interval_sec` (`virtual_decoder.cpp`, `process_virtual_decoders`):
+* `0`: computed with every packet that updates a source (default).
+* `> 0`: at most one computation per **local raster slot** of `interval_sec` (3600 = local hour,
+  86400 = local day, POSIX TZ of the RP2040), triggered by the first packet inside a new slot. Packets
+  in between update nothing; no intermediate values are invented (a fixed grid for SCADA is the job
+  of the archive with its hold / estimated flags).
+* `derivative`: the baseline is the source value of the previous computation, the rate uses the real
+  time difference (e.g. 3605 s). The resolution improves with the window: level step × area /
+  `interval_sec` (1 cm × 4 m² over 3600 s = 40 l/h instead of 480 l/h over 300 s). The first packet
+  after boot / reload only stores the baseline (no value).
+* Sensor transmits less often than `interval_sec`: every packet lies in a new slot, so the key is
+  computed with every packet (= `0`); a warning is logged when the device is loaded.
+* Without valid time there is no raster; every packet computes.
+* Effective update interval of a virtual key = max(`interval_sec`, interval of its most frequent
+  source). It is the default `expected_interval_sec` of its archive channel and the base of the HA
+  `expire_after` (2 × interval + 60 s), so hourly keys are not reported stale or as gaps.
 
 Current limits of the engine (until the NTTW rework):
 * Each level is aggregated from the next finer one. A disabled finer level that is needed as a source is kept as a small staging level: `raw` with 2 hours of buckets when hourly is active (at least the hold span interval + tolerance, so the newest real value survives for the cold-start restore even for hourly keys), `hour` with at least 26 entries when daily is active (covers 25-hour DST days).
